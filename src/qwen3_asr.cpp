@@ -1,5 +1,7 @@
 #include "qwen3_asr.h"
+#include "audio_utils.h"
 #include "timing.h"
+#include "logger.h"
 
 #include <cstdio>
 #include <cstring>
@@ -7,12 +9,29 @@
 #include <chrono>
 #include <algorithm>
 #include <fstream>
+#include <cctype>
 
 namespace qwen3_asr {
 
 static int64_t get_time_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static std::string extract_language_prefix(const std::string & text) {
+    std::string parsed_lang, parsed_text;
+    std::tie(parsed_lang, parsed_text) = parse_asr_output(text);
+    
+    if (!parsed_lang.empty()) {
+        return "language " + parsed_lang;
+    }
+    return "";
+}
+
+static std::string extract_text_content(const std::string & text) {
+    std::string parsed_lang, parsed_text;
+    std::tie(parsed_lang, parsed_text) = parse_asr_output(text);
+    return parsed_text;
 }
 
 Qwen3ASR::Qwen3ASR() = default;
@@ -36,7 +55,7 @@ bool Qwen3ASR::load_model(const std::string & model_path) {
     model_loaded_ = true;
     
     int64_t t_end = get_time_ms();
-    fprintf(stderr, "Model loaded in %lld ms\n", (long long)(t_end - t_start));
+    LOG_INFO("Model loaded in {} ms", (long long)(t_end - t_start));
     
     return true;
 }
@@ -95,7 +114,7 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     result.t_mel_ms = get_time_ms() - t_mel_start;
     
     if (params.print_progress) {
-        fprintf(stderr, "Mel spectrogram: [%d, %d]\n", mel.n_mel, mel.n_len);
+        LOG_INFO("Mel spectrogram: [{}, {}]", mel.n_mel, mel.n_len);
     }
     
     int64_t t_encode_start = get_time_ms();
@@ -113,58 +132,89 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     int32_t n_audio_frames = audio_features.size() / text_hparams.hidden_size;
     
     if (params.print_progress) {
-        fprintf(stderr, "Audio features: [%d, %d]\n", n_audio_frames, text_hparams.hidden_size);
+        LOG_INFO("Audio features: [{}, {}]", n_audio_frames, text_hparams.hidden_size);
     }
     
-    std::vector<int32_t> input_tokens = build_input_tokens(n_audio_frames, params.language);
+    std::vector<int32_t> input_tokens = build_input_tokens(n_audio_frames, params.context, params.language);
     
     if (params.print_progress) {
-        fprintf(stderr, "Input tokens: %zu\n", input_tokens.size());
+        LOG_INFO("Input tokens: {}", input_tokens.size());
+    }
+    
+    if (params.debug_input) {
+        LOG_INFO("=== DEBUG: Input tokens ({}) ===", input_tokens.size());
+        std::string decoded_input;
+        for (size_t i = 0; i < input_tokens.size(); ++i) {
+            int32_t t = input_tokens[i];
+            std::string token_str = decoder_.decode_token(t);
+            decoded_input += token_str;
+            if (i < 20 || i >= input_tokens.size() - 10) {
+                LOG_INFO("  [{:4}] {:8} | {}", i, t, token_str);
+            } else if (i == 20) {
+                LOG_INFO("  ... (skipping {} tokens)", input_tokens.size() - 30);
+            }
+        }
+        LOG_INFO("  Decoded input: {}", decoded_input);
     }
     
     int64_t t_decode_start = get_time_ms();
     std::vector<int32_t> output_tokens;
-    if (!decode_greedy(input_tokens, audio_features, n_audio_frames, params, output_tokens)) {
+    std::vector<float> output_confs;
+    if (!decode_greedy(input_tokens, audio_features, n_audio_frames, params, output_tokens, output_confs)) {
         result.error_msg = "Decoding failed: " + error_msg_;
         return result;
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
     
+    if (params.debug_output) {
+        LOG_INFO("=== DEBUG: Output tokens ({}) ===", output_tokens.size());
+        std::string decoded_output;
+        for (size_t i = 0; i < output_tokens.size(); ++i) {
+            int32_t t = output_tokens[i];
+            std::string token_str = decoder_.decode_token(t);
+            decoded_output += token_str;
+            if (i < 30 || i >= output_tokens.size() - 10) {
+                LOG_INFO("  [{:4}] {:8} | {} | conf={:.4f}", i, t, token_str, output_confs[i]);
+            } else if (i == 30) {
+                LOG_INFO("  ... (skipping {} tokens)", output_tokens.size() - 40);
+            }
+        }
+        LOG_INFO("  Decoded output: {}", decoded_output);
+    }
+    
     result.tokens = output_tokens;
+    result.token_confidences = output_confs;
     result.text = decoder_.decode_tokens(output_tokens);
+    result.text_prefix = extract_language_prefix(result.text);
+    result.text_content = extract_text_content(result.text);
+    
+    for (int32_t tok : output_tokens) {
+        result.token_strings.push_back(decoder_.decode_token(tok));
+    }
+    
     result.success = true;
     
     result.t_total_ms = get_time_ms() - t_total_start;
     
     if (params.print_timing) {
-        fprintf(stderr, "\nTiming:\n");
-        fprintf(stderr, "  Mel spectrogram: %lld ms\n", (long long)result.t_mel_ms);
-        fprintf(stderr, "  Audio encoding:  %lld ms\n", (long long)result.t_encode_ms);
-        fprintf(stderr, "  Text decoding:   %lld ms\n", (long long)result.t_decode_ms);
-        fprintf(stderr, "  Total:           %lld ms\n", (long long)result.t_total_ms);
-        fprintf(stderr, "  Tokens generated: %zu\n", output_tokens.size());
+        LOG_INFO("Timing:");
+        LOG_INFO("  Mel spectrogram: {} ms", (long long)result.t_mel_ms);
+        LOG_INFO("  Audio encoding:  {} ms", (long long)result.t_encode_ms);
+        LOG_INFO("  Text decoding:   {} ms", (long long)result.t_decode_ms);
+        LOG_INFO("  Total:           {} ms", (long long)result.t_total_ms);
+        LOG_INFO("  Tokens generated: {}", output_tokens.size());
     }
     
     return result;
 }
 
 std::vector<int32_t> Qwen3ASR::build_input_tokens(int32_t n_audio_frames,
+                                                   const std::string & context,
                                                    const std::string & language) {
     const auto & cfg = decoder_.get_config();
     
     std::vector<int32_t> tokens;
-    tokens.reserve(n_audio_frames + 20);
-    
-    // Chat template format:
-    // <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|>...<|audio_end|><|im_end|>\n<|im_start|>assistant\n
-    
-    // Token IDs from Qwen3 tokenizer:
-    // <|im_start|> = 151644
-    // <|im_end|> = 151645
-    // system = 8948
-    // user = 872
-    // assistant = 77091
-    // \n = 198
+    tokens.reserve(n_audio_frames + 100);
     
     const int32_t im_start = 151644;
     const int32_t im_end = 151645;
@@ -173,42 +223,53 @@ std::vector<int32_t> Qwen3ASR::build_input_tokens(int32_t n_audio_frames,
     const int32_t assistant_token = 77091;
     const int32_t newline = 198;
     
-    // <|im_start|>system\n<|im_end|>\n
     tokens.push_back(im_start);
     tokens.push_back(system_token);
     tokens.push_back(newline);
+    
+    if (!context.empty()) {
+        std::vector<int32_t> context_tokens = decoder_.tokenize(context);
+        for (int32_t t : context_tokens) {
+            tokens.push_back(t);
+        }
+    }
+    
     tokens.push_back(im_end);
     tokens.push_back(newline);
     
-    // <|im_start|>user\n
     tokens.push_back(im_start);
     tokens.push_back(user_token);
     tokens.push_back(newline);
     
-    // <|audio_start|><|audio_pad|>...<|audio_end|>
     tokens.push_back(cfg.audio_start_token_id);
     for (int32_t i = 0; i < n_audio_frames; ++i) {
         tokens.push_back(cfg.audio_pad_token_id);
     }
     tokens.push_back(cfg.audio_end_token_id);
     
-    // <|im_end|>\n<|im_start|>assistant\n
     tokens.push_back(im_end);
     tokens.push_back(newline);
     tokens.push_back(im_start);
     tokens.push_back(assistant_token);
     tokens.push_back(newline);
     
-    (void)language;
+    if (!language.empty()) {
+        std::string lang_prompt = "language " + language + "\n";
+        std::vector<int32_t> lang_tokens = decoder_.tokenize(lang_prompt);
+        for (int32_t t : lang_tokens) {
+            tokens.push_back(t);
+        }
+    }
     
     return tokens;
 }
 
 bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
-                              const std::vector<float> & audio_features,
-                              int32_t n_audio_frames,
-                              const transcribe_params & params,
-                              std::vector<int32_t> & output_tokens) {
+                               const std::vector<float> & audio_features,
+                               int32_t n_audio_frames,
+                               const transcribe_params & params,
+                               std::vector<int32_t> & output_tokens,
+                               std::vector<float> & output_confs) {
     const auto & cfg = decoder_.get_config();
     
     int32_t n_ctx_needed = input_tokens.size() + params.max_tokens;
@@ -219,9 +280,14 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
     
     std::vector<float> logits;
     
-    // Audio pad tokens start after: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>
-    // That's 8 tokens before the first audio_pad
-    int32_t audio_start_pos = 9;
+    int32_t audio_start_pos = 0;
+    
+    if (params.context.empty()) {
+        audio_start_pos = 9;
+    } else {
+        std::vector<int32_t> context_tokens = decoder_.tokenize(params.context);
+        audio_start_pos = 9 + static_cast<int32_t>(context_tokens.size());
+    }
     
     {
         QWEN3_TIMER("decode.initial_forward");
@@ -237,10 +303,12 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
     int32_t vocab_size = cfg.vocab_size;
     int32_t n_input = input_tokens.size();
     
-    int32_t next_token = sample_greedy(logits.data(), vocab_size);
+    auto [next_token, next_conf] = sample_greedy_with_conf(logits.data(), vocab_size);
     
     output_tokens.clear();
+    output_confs.clear();
     output_tokens.push_back(next_token);
+    output_confs.push_back(next_conf);
     
     if (progress_callback_) {
         progress_callback_(1, params.max_tokens);
@@ -262,8 +330,11 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
             }
         }
         
-        next_token = sample_greedy(logits.data(), vocab_size);
+        auto [tok, conf] = sample_greedy_with_conf(logits.data(), vocab_size);
+        next_token = tok;
+        next_conf = conf;
         output_tokens.push_back(next_token);
+        output_confs.push_back(next_conf);
         
         n_past += 1;
         
@@ -272,29 +343,41 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
         }
         
         if (params.print_progress && output_tokens.size() % 10 == 0) {
-            fprintf(stderr, "Generated %zu tokens...\n", output_tokens.size());
+            int percent = static_cast<int>(output_tokens.size() * 100 / params.max_tokens);
+            LOG_INFO("Decoding {}/{} tokens ({}%)", output_tokens.size(), params.max_tokens, percent);
         }
     }
     
     if (output_tokens.back() == cfg.eos_token_id) {
         output_tokens.pop_back();
+        output_confs.pop_back();
     }
     
     return true;
 }
 
-int32_t Qwen3ASR::sample_greedy(const float * logits, int32_t vocab_size) {
-    int32_t max_idx = 0;
-    float max_val = logits[0];
-    
+std::pair<int32_t, float> Qwen3ASR::sample_greedy_with_conf(const float * logits, int32_t vocab_size) {
+    float max_logit = logits[0];
     for (int32_t i = 1; i < vocab_size; ++i) {
-        if (logits[i] > max_val) {
-            max_val = logits[i];
+        max_logit = std::max(max_logit, logits[i]);
+    }
+    
+    float sum_exp = 0.0f;
+    for (int32_t i = 0; i < vocab_size; ++i) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    
+    int32_t max_idx = 0;
+    float max_conf = expf(logits[0] - max_logit) / sum_exp;
+    for (int32_t i = 1; i < vocab_size; ++i) {
+        float conf = expf(logits[i] - max_logit) / sum_exp;
+        if (conf > max_conf) {
+            max_conf = conf;
             max_idx = i;
         }
     }
     
-    return max_idx;
+    return {max_idx, max_conf};
 }
 
 void Qwen3ASR::set_progress_callback(progress_callback_t callback) {

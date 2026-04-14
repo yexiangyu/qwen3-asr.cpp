@@ -1,5 +1,6 @@
 #include "forced_aligner.h"
 #include "mel_spectrogram.h"
+#include "logger.h"
 
 #include <cstdio>
 #include <cstring>
@@ -928,6 +929,8 @@ struct ggml_cgraph * ForcedAligner::build_decoder_graph(
     const float * audio_embd, int32_t n_audio,
     int32_t audio_start_pos) {
     
+    (void)tokens;
+    
     const auto & hp = model_.hparams;
     const int n_head = hp.text_attention_heads;
     const int n_kv_head = hp.text_kv_heads;
@@ -1090,6 +1093,8 @@ bool ForcedAligner::forward_decoder(
     const float * audio_embd, int32_t n_audio,
     int32_t audio_start_pos,
     std::vector<float> & output) {
+    
+    (void)tokens;
     
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
@@ -1303,6 +1308,45 @@ std::vector<int32_t> ForcedAligner::extract_timestamp_classes(
     }
     
     return timestamp_classes;
+}
+
+std::vector<std::tuple<int32_t, float>> ForcedAligner::extract_timestamp_classes_with_conf(
+    const std::vector<float> & logits,
+    const std::vector<int32_t> & tokens,
+    int32_t timestamp_token_id,
+    int32_t n_classes) {
+    
+    std::vector<std::tuple<int32_t, float>> result;
+    
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == timestamp_token_id) {
+            const float * logit_ptr = logits.data() + i * n_classes;
+            
+            float max_logit = logit_ptr[0];
+            for (int32_t c = 1; c < n_classes; ++c) {
+                max_logit = std::max(max_logit, logit_ptr[c]);
+            }
+            
+            float sum_exp = 0.0f;
+            for (int32_t c = 0; c < n_classes; ++c) {
+                sum_exp += expf(logit_ptr[c] - max_logit);
+            }
+            
+            int32_t best_class = 0;
+            float best_conf = expf(logit_ptr[0] - max_logit) / sum_exp;
+            for (int32_t c = 1; c < n_classes; ++c) {
+                float conf = expf(logit_ptr[c] - max_logit) / sum_exp;
+                if (conf > best_conf) {
+                    best_conf = conf;
+                    best_class = c;
+                }
+            }
+            
+            result.emplace_back(best_class, best_conf);
+        }
+    }
+    
+    return result;
 }
 
 std::vector<int32_t> ForcedAligner::build_input_tokens(
@@ -1557,8 +1601,141 @@ bool ForcedAligner::load_korean_dict(const std::string & dict_path) {
         }
     }
 
-    fprintf(stderr, "Korean dictionary loaded: %zu words\n", model_.ko_dict.size());
+    LOG_INFO("Korean dictionary loaded: {} words", model_.ko_dict.size());
     return true;
+}
+
+static uint32_t utf8_to_codepoint(const std::string & s, size_t & i) {
+    if (i >= s.size()) return 0;
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    uint32_t cp = 0;
+    if ((c & 0x80) == 0) {
+        cp = c;
+        i += 1;
+    } else if ((c & 0xE0) == 0xC0) {
+        if (i + 1 < s.size()) {
+            cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3F);
+            i += 2;
+        } else { i += 1; }
+    } else if ((c & 0xF0) == 0xE0) {
+        if (i + 2 < s.size()) {
+            cp = ((c & 0x0F) << 12) | ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 6)
+                 | (static_cast<unsigned char>(s[i + 2]) & 0x3F);
+            i += 3;
+        } else { i += 1; }
+    } else if ((c & 0xF8) == 0xF0) {
+        if (i + 3 < s.size()) {
+            cp = ((c & 0x07) << 18) | ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 12)
+                 | ((static_cast<unsigned char>(s[i + 2]) & 0x3F) << 6)
+                 | (static_cast<unsigned char>(s[i + 3]) & 0x3F);
+            i += 4;
+        } else { i += 1; }
+    } else {
+        i += 1;
+    }
+    return cp;
+}
+
+static bool is_cjk_char(uint32_t code) {
+    return (0x4E00 <= code && code <= 0x9FFF)
+        || (0x3400 <= code && code <= 0x4DBF)
+        || (0x20000 <= code && code <= 0x2A6DF)
+        || (0x2A700 <= code && code <= 0x2B73F)
+        || (0x2B740 <= code && code <= 0x2B81F)
+        || (0x2B820 <= code && code <= 0x2CEAF)
+        || (0xF900 <= code && code <= 0xFAFF);
+}
+
+static bool is_kept_char(uint32_t code) {
+    if (code == '\'') return true;
+    if (code < 0x80) {
+        if (('A' <= code && code <= 'Z') || ('a' <= code && code <= 'z') ||
+            ('0' <= code && code <= '9')) return true;
+        if (code == '.' || code == '!' || code == '?') return true;
+        return false;
+    }
+    if (code == 0x3002) return true;
+    if (code == 0xFF01) return true;
+    if (code == 0xFF1F) return true;
+    if (0x4E00 <= code && code <= 0x9FFF) return true;
+    if (0x3400 <= code && code <= 0x4DBF) return true;
+    if (0xAC00 <= code && code <= 0xD7AF) return true;
+    if (0x3040 <= code && code <= 0x30FF) return true;
+    return false;
+}
+
+static std::string clean_token(const std::string & token) {
+    std::string result;
+    size_t i = 0;
+    while (i < token.size()) {
+        size_t start = i;
+        uint32_t cp = utf8_to_codepoint(token, i);
+        if (is_kept_char(cp)) {
+            result += token.substr(start, i - start);
+        }
+    }
+    return result;
+}
+
+static bool is_end_punctuation(uint32_t cp) {
+    return cp == '.' || cp == '!' || cp == '?' || cp == 0x3002 || cp == 0xFF01 || cp == 0xFF1F;
+}
+
+static std::vector<std::string> split_segment_with_cjk(const std::string & seg) {
+    std::vector<std::string> tokens;
+    std::string buf;
+    size_t i = 0;
+    while (i < seg.size()) {
+        size_t start = i;
+        uint32_t cp = utf8_to_codepoint(seg, i);
+        if (is_cjk_char(cp)) {
+            if (!buf.empty()) {
+                std::string cleaned = clean_token(buf);
+                if (!cleaned.empty()) tokens.push_back(cleaned);
+                buf.clear();
+            }
+            std::string cjk_char = seg.substr(start, i - start);
+            std::string cleaned = clean_token(cjk_char);
+            if (!cleaned.empty()) tokens.push_back(cleaned);
+        } else if (is_end_punctuation(cp)) {
+            if (!buf.empty()) {
+                std::string cleaned = clean_token(buf);
+                if (!cleaned.empty()) tokens.push_back(cleaned);
+                buf.clear();
+            }
+            std::string punct = seg.substr(start, i - start);
+            tokens.push_back(punct);
+        } else {
+            buf += seg.substr(start, i - start);
+        }
+    }
+    if (!buf.empty()) {
+        std::string cleaned = clean_token(buf);
+        if (!cleaned.empty()) tokens.push_back(cleaned);
+    }
+    return tokens;
+}
+
+static std::vector<std::string> tokenize_space_lang(const std::string & text) {
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
+                                    text[i] == '\n' || text[i] == '\r')) ++i;
+        if (i >= text.size()) break;
+        size_t start = i;
+        while (i < text.size() && text[i] != ' ' && text[i] != '\t' &&
+               text[i] != '\n' && text[i] != '\r') ++i;
+        std::string seg = text.substr(start, i - start);
+        std::string cleaned_seg = clean_token(seg);
+        if (!cleaned_seg.empty()) {
+            auto sub_tokens = split_segment_with_cjk(cleaned_seg);
+            for (const auto & t : sub_tokens) {
+                tokens.push_back(t);
+            }
+        }
+    }
+    return tokens;
 }
 
 std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
@@ -1573,17 +1750,10 @@ std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
 
     if (language == "korean" && !model_.ko_dict.empty()) {
         raw_words = tokenize_korean(text, model_.ko_dict);
+    } else if (language == "chinese" || language == "japanese") {
+        raw_words = tokenize_space_lang(text);
     } else {
-        size_t i = 0;
-        while (i < text.size()) {
-            while (i < text.size() && (text[i] == ' ' || text[i] == '\t' ||
-                                        text[i] == '\n' || text[i] == '\r')) ++i;
-            if (i >= text.size()) break;
-            size_t start = i;
-            while (i < text.size() && text[i] != ' ' && text[i] != '\t' &&
-                   text[i] != '\n' && text[i] != '\r') ++i;
-            raw_words.push_back(text.substr(start, i - start));
-        }
+        raw_words = tokenize_space_lang(text);
     }
 
     for (size_t w = 0; w < raw_words.size(); ++w) {
@@ -1597,7 +1767,7 @@ std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
             if (it != model_.token_to_id.end()) {
                 tokens.push_back(it->second);
             } else {
-                fprintf(stderr, "BPE tokenizer: unknown subword token '%s'\n", sw.c_str());
+                LOG_WARN("BPE tokenizer: unknown subword token '{}'", sw);
             }
         }
 
@@ -1609,7 +1779,8 @@ std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
 }
 
 alignment_result ForcedAligner::align(const std::string & audio_path, const std::string & text,
-                                       const std::string & language) {
+                                       const std::string & language,
+                                       const align_params & params) {
     alignment_result result;
     
     if (!model_loaded_) {
@@ -1630,11 +1801,12 @@ alignment_result ForcedAligner::align(const std::string & audio_path, const std:
         return result;
     }
     
-    return align(samples.data(), samples.size(), text, language);
+    return align(samples.data(), samples.size(), text, language, params);
 }
 
 alignment_result ForcedAligner::align(const float * samples, int n_samples, const std::string & text,
-                                       const std::string & language) {
+                                       const std::string & language,
+                                       const align_params & params) {
     alignment_result result;
     int64_t t_total_start = get_time_ms();
     
@@ -1644,6 +1816,10 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
     }
     
     float audio_duration = static_cast<float>(n_samples) / QWEN_SAMPLE_RATE;
+    
+    if (params.print_progress) {
+        LOG_INFO("Stage 1/3: Computing mel spectrogram...");
+    }
     
     int64_t t_mel_start = get_time_ms();
     MelFilters mel_filters;
@@ -1656,6 +1832,10 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
     }
     result.t_mel_ms = get_time_ms() - t_mel_start;
     
+    if (params.print_progress) {
+        LOG_INFO("Stage 2/3: Encoding audio features...");
+    }
+    
     int64_t t_encode_start = get_time_ms();
     std::vector<float> audio_features;
     if (!encode_audio(mel.data.data(), mel.n_mel, mel.n_len, audio_features)) {
@@ -1664,9 +1844,12 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
     }
     result.t_encode_ms = get_time_ms() - t_encode_start;
     
+    if (params.print_progress) {
+        LOG_INFO("Stage 3/3: Running decoder...");
+    }
+    
     int32_t n_audio_frames = audio_features.size() / model_.hparams.text_hidden_size;
     
-    // Compute pad count using HF's _get_feat_extract_output_lengths formula
     int32_t n_audio_pads = get_feat_extract_output_lengths(mel.n_len);
     
     std::vector<std::string> words;
@@ -1700,9 +1883,13 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
     }
     
     // 2 timestamps per word: ts[2i] = start, ts[2i+1] = end
+    std::vector<aligned_word> all_words;
     for (size_t i = 0; i < words.size(); ++i) {
         aligned_word aw;
         aw.word = words[i];
+        aw.conf_word = 0.0f;
+        aw.conf_start_time = 0.0f;
+        aw.conf_end_time = 0.0f;
         
         size_t start_idx = i * 2;
         size_t end_idx = i * 2 + 1;
@@ -1710,9 +1897,254 @@ alignment_result ForcedAligner::align(const float * samples, int n_samples, cons
         aw.start = (start_idx < timestamps.size()) ? timestamps[start_idx] : 0.0f;
         aw.end = (end_idx < timestamps.size()) ? timestamps[end_idx] : audio_duration;
         
-        result.words.push_back(aw);
+        all_words.push_back(aw);
     }
     
+    result.utterances = aggregate_utterances(all_words);
+    result.success = true;
+    result.t_total_ms = get_time_ms() - t_total_start;
+    
+    return result;
+}
+
+std::vector<int32_t> ForcedAligner::build_char_to_token_map(
+    const std::vector<std::string> & token_strings,
+    const std::string & text) {
+    
+    std::vector<int32_t> char_to_token;
+    
+    auto get_utf8_char_len = [](unsigned char c) -> size_t {
+        if ((c & 0x80) == 0) return 1;
+        if ((c & 0xE0) == 0xC0) return 2;
+        if ((c & 0xF0) == 0xE0) return 3;
+        if ((c & 0xF8) == 0xF0) return 4;
+        return 1;
+    };
+    
+    size_t text_byte_idx = 0;
+    
+    for (size_t tok_idx = 0; tok_idx < token_strings.size(); ++tok_idx) {
+        const std::string & tok_str = token_strings[tok_idx];
+        size_t tok_byte_idx = 0;
+        
+        while (tok_byte_idx < tok_str.size()) {
+            size_t tok_char_len = get_utf8_char_len(static_cast<unsigned char>(tok_str[tok_byte_idx]));
+            if (text_byte_idx < text.size()) {
+                char_to_token.push_back(static_cast<int32_t>(tok_idx));
+                text_byte_idx += get_utf8_char_len(static_cast<unsigned char>(text[text_byte_idx]));
+            }
+            tok_byte_idx += tok_char_len;
+        }
+    }
+    
+    return char_to_token;
+}
+
+static bool is_cjk_word(const std::string & word) {
+    if (word.empty()) return false;
+    size_t i = 0;
+    uint32_t cp = utf8_to_codepoint(word, i);
+    return is_cjk_char(cp);
+}
+
+static bool is_punctuation_word(const std::string & word) {
+    if (word.empty()) return false;
+    size_t i = 0;
+    uint32_t cp = utf8_to_codepoint(word, i);
+    return is_end_punctuation(cp);
+}
+
+std::vector<aligned_utterance> ForcedAligner::aggregate_utterances(
+    const std::vector<aligned_word> & words) {
+    
+    static const std::vector<std::string> end_puncts = {"。", "！", "？", ".", "!", "?"};
+    
+    std::vector<aligned_utterance> utterances;
+    if (words.empty()) return utterances;
+    
+    aligned_utterance current_utt;
+    current_utt.start = words[0].start;
+    
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (!current_utt.text.empty()) {
+            if (!is_cjk_word(words[i].word) && !is_cjk_word(current_utt.words.back().word) &&
+                !is_punctuation_word(words[i].word) && !is_punctuation_word(current_utt.words.back().word)) {
+                current_utt.text += " ";
+            }
+        }
+        current_utt.words.push_back(words[i]);
+        current_utt.text += words[i].word;
+        
+        bool is_end = false;
+        for (const auto & p : end_puncts) {
+            if (words[i].word == p) { is_end = true; break; }
+        }
+        
+        if (is_end || i == words.size() - 1) {
+            current_utt.end = words[i].end;
+            utterances.push_back(current_utt);
+            current_utt = aligned_utterance();
+            if (i + 1 < words.size()) {
+                current_utt.start = words[i + 1].start;
+            }
+        }
+    }
+    
+    return utterances;
+}
+
+alignment_result ForcedAligner::align_with_asr_tokens(
+    const std::string & audio_path,
+    const std::string & text,
+    const std::vector<int32_t> & asr_tokens,
+    const std::vector<float> & asr_token_confs,
+    const std::vector<std::string> & asr_token_strings,
+    const std::string & language,
+    const align_params & params) {
+    
+    (void)asr_tokens;
+    
+    alignment_result result;
+    
+    if (!model_loaded_) {
+        result.error_msg = "Model not loaded";
+        return result;
+    }
+    
+    std::vector<float> samples;
+    int sample_rate;
+    
+    if (!load_wav(audio_path, samples, sample_rate)) {
+        result.error_msg = "Failed to load audio file: " + audio_path;
+        return result;
+    }
+    
+    if (sample_rate != QWEN_SAMPLE_RATE) {
+        result.error_msg = "Audio must be 16kHz, got " + std::to_string(sample_rate) + " Hz";
+        return result;
+    }
+    
+    return align_with_asr_tokens(samples.data(), samples.size(), text,
+                                  asr_tokens, asr_token_confs, asr_token_strings, language, params);
+}
+
+alignment_result ForcedAligner::align_with_asr_tokens(
+    const float * samples, int n_samples,
+    const std::string & text,
+    const std::vector<int32_t> & asr_tokens,
+    const std::vector<float> & asr_token_confs,
+    const std::vector<std::string> & asr_token_strings,
+    const std::string & language,
+    const align_params & params) {
+    
+    (void)asr_tokens;
+    
+    alignment_result result;
+    int64_t t_total_start = get_time_ms();
+    
+    if (!model_loaded_) {
+        result.error_msg = "Model not loaded";
+        return result;
+    }
+    
+    float audio_duration = static_cast<float>(n_samples) / QWEN_SAMPLE_RATE;
+    
+    if (params.print_progress) {
+        LOG_INFO("Stage 1/3: Computing mel spectrogram...");
+    }
+    
+    int64_t t_mel_start = get_time_ms();
+    MelFilters mel_filters;
+    generate_mel_filters(mel_filters, QWEN_N_MELS, QWEN_N_FFT, QWEN_SAMPLE_RATE);
+    
+    MelSpectrogram mel;
+    if (!log_mel_spectrogram(samples, n_samples, mel_filters, mel, 4)) {
+        result.error_msg = "Failed to compute mel spectrogram";
+        return result;
+    }
+    result.t_mel_ms = get_time_ms() - t_mel_start;
+    
+    if (params.print_progress) {
+        LOG_INFO("Stage 2/3: Encoding audio features...");
+    }
+    
+    int64_t t_encode_start = get_time_ms();
+    std::vector<float> audio_features;
+    if (!encode_audio(mel.data.data(), mel.n_mel, mel.n_len, audio_features)) {
+        result.error_msg = "Failed to encode audio: " + error_msg_;
+        return result;
+    }
+    result.t_encode_ms = get_time_ms() - t_encode_start;
+    
+    if (params.print_progress) {
+        LOG_INFO("Stage 3/3: Running decoder...");
+    }
+    
+    int32_t n_audio_frames = audio_features.size() / model_.hparams.text_hidden_size;
+    int32_t n_audio_pads = get_feat_extract_output_lengths(mel.n_len);
+    
+    std::vector<std::string> chars;
+    std::vector<int32_t> text_tokens = tokenize_with_timestamps(text, chars, language);
+    
+    std::vector<int32_t> input_tokens = build_input_tokens(text_tokens, n_audio_pads);
+    int32_t audio_start_pos = find_audio_start_pos(input_tokens);
+    
+    int64_t t_decode_start = get_time_ms();
+    std::vector<float> logits;
+    if (!forward_decoder(input_tokens.data(), input_tokens.size(),
+                         audio_features.data(), n_audio_frames,
+                         audio_start_pos, logits)) {
+        result.error_msg = "Decoder forward pass failed: " + error_msg_;
+        return result;
+    }
+    result.t_decode_ms = get_time_ms() - t_decode_start;
+    
+    std::vector<std::tuple<int32_t, float>> ts_with_conf = extract_timestamp_classes_with_conf(
+        logits, input_tokens, model_.hparams.timestamp_token_id, model_.hparams.classify_num);
+    
+    std::vector<int32_t> ts_classes;
+    std::vector<float> ts_confs;
+    for (const auto & [cls, conf] : ts_with_conf) {
+        ts_classes.push_back(cls);
+        ts_confs.push_back(conf);
+    }
+    
+    std::vector<int32_t> fixed_classes = fix_timestamp_classes(ts_classes);
+    std::vector<float> timestamps = classes_to_timestamps(fixed_classes);
+    
+    for (size_t i = 0; i < timestamps.size(); ++i) {
+        if (timestamps[i] > audio_duration) {
+            timestamps[i] = audio_duration;
+        }
+    }
+    
+    std::vector<int32_t> char_to_token = build_char_to_token_map(asr_token_strings, text);
+    
+    std::vector<aligned_word> all_words;
+    for (size_t i = 0; i < chars.size(); ++i) {
+        aligned_word w;
+        w.word = chars[i];
+        
+        size_t start_idx = i * 2;
+        size_t end_idx = i * 2 + 1;
+        
+        w.start = (start_idx < timestamps.size()) ? timestamps[start_idx] : 0.0f;
+        w.end = (end_idx < timestamps.size()) ? timestamps[end_idx] : audio_duration;
+        
+        w.conf_start_time = (start_idx < ts_confs.size()) ? ts_confs[start_idx] : 0.0f;
+        w.conf_end_time = (end_idx < ts_confs.size()) ? ts_confs[end_idx] : 0.0f;
+        
+        if (i < char_to_token.size() && char_to_token[i] >= 0 &&
+            static_cast<size_t>(char_to_token[i]) < asr_token_confs.size()) {
+            w.conf_word = asr_token_confs[char_to_token[i]];
+        } else {
+            w.conf_word = 0.0f;
+        }
+        
+        all_words.push_back(w);
+    }
+    
+    result.utterances = aggregate_utterances(all_words);
     result.success = true;
     result.t_total_ms = get_time_ms() - t_total_start;
     

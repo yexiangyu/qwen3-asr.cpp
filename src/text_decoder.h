@@ -8,6 +8,7 @@
 #include <map>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 
 namespace qwen3_asr {
 
@@ -143,6 +144,8 @@ public:
     
     std::string decode_tokens(const std::vector<int32_t> & tokens) const;
     
+    std::vector<int32_t> tokenize(const std::string & text) const;
+    
     bool forward_debug(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
                        std::vector<float> & output,
                        std::map<std::string, std::vector<float>> & debug_tensors);
@@ -170,6 +173,8 @@ private:
     text_decoder_state state_;
     std::string error_msg_;
     std::vector<std::string> vocab_;
+    std::unordered_map<std::string, int32_t> token_to_id_;
+    std::unordered_map<std::string, int> bpe_ranks_;
 };
 
 // Free model resources

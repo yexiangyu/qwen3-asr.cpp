@@ -12,16 +12,27 @@
 
 namespace qwen3_asr {
 
-// Word with timestamp information
+// Word with timestamp information and confidence
 struct aligned_word {
     std::string word;
-    float start;  // Start time in seconds
-    float end;    // End time in seconds
+    float start;              // Start time in seconds
+    float end;                // End time in seconds
+    float conf_word;          // Token confidence from ASR
+    float conf_start_time;    // Start timestamp confidence from aligner
+    float conf_end_time;      // End timestamp confidence from aligner
+};
+
+// Utterance (sentence-level segment)
+struct aligned_utterance {
+    float start;
+    float end;
+    std::string text;
+    std::vector<aligned_word> words;
 };
 
 // Alignment result
 struct alignment_result {
-    std::vector<aligned_word> words;
+    std::vector<aligned_utterance> utterances;
     bool success = false;
     std::string error_msg;
     
@@ -30,6 +41,12 @@ struct alignment_result {
     int64_t t_encode_ms = 0;
     int64_t t_decode_ms = 0;
     int64_t t_total_ms = 0;
+};
+
+// Alignment parameters
+struct align_params {
+    bool print_progress = false;
+    bool print_timing = true;
 };
 
 // ForcedAligner-specific hyperparameters
@@ -204,11 +221,33 @@ public:
     // Load model from GGUF file
     bool load_model(const std::string & model_path);
     
+    // Original align interface (without ASR token confidence)
     alignment_result align(const std::string & audio_path, const std::string & text,
-                           const std::string & language = "");
+                           const std::string & language = "",
+                           const align_params & params = align_params());
     
     alignment_result align(const float * samples, int n_samples, const std::string & text,
-                           const std::string & language = "");
+                           const std::string & language = "",
+                           const align_params & params = align_params());
+    
+    // New align interface with ASR token information
+    alignment_result align_with_asr_tokens(
+        const std::string & audio_path,
+        const std::string & text,
+        const std::vector<int32_t> & asr_tokens,
+        const std::vector<float> & asr_token_confs,
+        const std::vector<std::string> & asr_token_strings,
+        const std::string & language = "",
+        const align_params & params = align_params());
+    
+    alignment_result align_with_asr_tokens(
+        const float * samples, int n_samples,
+        const std::string & text,
+        const std::vector<int32_t> & asr_tokens,
+        const std::vector<float> & asr_token_confs,
+        const std::vector<std::string> & asr_token_strings,
+        const std::string & language = "",
+        const align_params & params = align_params());
     
     // Get error message
     const std::string & get_error() const { return error_msg_; }
@@ -253,6 +292,22 @@ private:
         const float * audio_embd, int32_t n_audio,
         int32_t audio_start_pos,
         std::vector<float> & output);
+    
+    // Extract timestamp classes with confidence from logits
+    std::vector<std::tuple<int32_t, float>> extract_timestamp_classes_with_conf(
+        const std::vector<float> & logits,
+        const std::vector<int32_t> & tokens,
+        int32_t timestamp_token_id,
+        int32_t n_classes);
+    
+    // Build char to token mapping
+    std::vector<int32_t> build_char_to_token_map(
+        const std::vector<std::string> & token_strings,
+        const std::string & text);
+    
+    // Aggregate words into utterances based on end punctuation
+    std::vector<aligned_utterance> aggregate_utterances(
+        const std::vector<aligned_word> & words);
     
     // LIS-based timestamp correction (ported from HF fix_timestamp)
     std::vector<int32_t> fix_timestamp_classes(const std::vector<int32_t> & data);

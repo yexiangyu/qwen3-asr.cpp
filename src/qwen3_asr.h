@@ -13,26 +13,31 @@ namespace qwen3_asr {
 
 // Transcription parameters
 struct transcribe_params {
-    // Maximum number of tokens to generate
     int32_t max_tokens = 1024;
     
-    // Language code (optional, for prompting)
     std::string language = "";
     
-    // Number of threads for mel computation
+    std::string context = "";
+    
     int32_t n_threads = 4;
     
-    // Print progress during transcription
     bool print_progress = false;
     
-    // Print timing information
     bool print_timing = true;
+    
+    bool debug_input = false;
+    
+    bool debug_output = false;
 };
 
 // Transcription result
 struct transcribe_result {
-    std::string text;
-    std::vector<int32_t> tokens;
+    std::string text;                          // 完整转录文本（含 "language Chinese ..." 前缀）
+    std::string text_prefix;                   // 前缀部分（如 "language Chinese"）
+    std::string text_content;                  // 实际内容部分（去除前缀）
+    std::vector<int32_t> tokens;               // BPE token IDs
+    std::vector<float> token_confidences;      // 每个 token 的 softmax confidence
+    std::vector<std::string> token_strings;    // 每个 token 解码后的字符串
     bool success = false;
     std::string error_msg;
     
@@ -86,7 +91,8 @@ private:
                                            const transcribe_params & params);
     
     // Build input token sequence for audio
-    std::vector<int32_t> build_input_tokens(int32_t n_audio_frames, 
+    std::vector<int32_t> build_input_tokens(int32_t n_audio_frames,
+                                             const std::string & context,
                                              const std::string & language);
     
     // Greedy decoding loop
@@ -94,10 +100,11 @@ private:
                        const std::vector<float> & audio_features,
                        int32_t n_audio_frames,
                        const transcribe_params & params,
-                       std::vector<int32_t> & output_tokens);
+                       std::vector<int32_t> & output_tokens,
+                       std::vector<float> & output_confidences);
     
-    // Sample next token (greedy: argmax)
-    int32_t sample_greedy(const float * logits, int32_t vocab_size);
+    // Sample next token with confidence (greedy: argmax + softmax)
+    std::pair<int32_t, float> sample_greedy_with_conf(const float * logits, int32_t vocab_size);
     
     // Components
     AudioEncoder encoder_;

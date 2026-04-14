@@ -16,6 +16,7 @@ It performs speech recognition and forced alignment with word-level timestamps.
 - `src/audio_encoder.cpp/h` — Audio feature encoder with Metal GPU backend
 - `src/mel_spectrogram.cpp/h` — Mel spectrogram computation (vDSP/Accelerate optimized)
 - `src/audio_injection.cpp/h` — Audio embedding injection into token sequence
+- `src/audio_utils.cpp/h` — Audio processing utilities (normalization, chunking, repetition fix, output parsing)
 - `src/gguf_loader.cpp/h` — GGUF model file loading with mmap
 
 ### Model Architecture
@@ -37,6 +38,11 @@ It performs speech recognition and forced alignment with word-level timestamps.
 - **Flash attention** (`ggml_flash_attn_ext`) for decode speedup
 - **Weight tying** (token_embd = output weight) to save memory
 - **Korean word splitting** ported from soynlp LTokenizer with bundled dictionary
+- **Chinese/Japanese tokenization** matches Python implementation: CJK chars split individually, Latin sequences preserved (e.g., "我是AI工程师" → ["我", "是", "AI", "工", "程", "师"])
+- **Audio normalization** (`float_range_normalize`): handles peak > 1.0 (int-scaled audio) by normalizing to [-1, 1]
+- **Audio chunking** (`split_audio_into_chunks`): low-energy boundary detection for smart splitting of long audio
+- **Repetition detection** (`detect_and_fix_repetitions`): fixes character and pattern repeats in ASR output
+- **ASR output parsing** (`parse_asr_output`): handles `<asr_text>` tag, empty audio, forced language, and repetition fix
 
 ### Build System
 

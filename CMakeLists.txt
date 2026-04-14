@@ -5,11 +5,41 @@ project(qwen3-asr-ggml VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# spdlog (header-only via FetchContent)
+include(FetchContent)
+FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG v1.15.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(spdlog)
+
 # Compiler flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
+    
+    if(APPLE)
+        # Apple Silicon optimizations
+        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+        set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+        
+        # Enable LTO for Release builds
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+        if(LTO_SUPPORTED)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        endif()
+    else()
+        # Generic Linux/Unix optimizations
+        set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
+        set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+    endif()
+endif()
+
+# Default to Release build if not specified
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
 # Timing instrumentation option
@@ -24,6 +54,23 @@ find_package(Threads REQUIRED)
 # GGML library paths
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 set(GGML_BUILD_DIR "${GGML_DIR}/build")
+
+# Logger library
+add_library(logger STATIC
+    src/logger.cpp
+)
+target_include_directories(logger PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(logger PUBLIC spdlog::spdlog_header_only)
+
+# Audio utils library
+add_library(audio_utils STATIC
+    src/audio_utils.cpp
+)
+target_include_directories(audio_utils PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 # Mel spectrogram library
 add_library(mel_spectrogram STATIC
@@ -101,6 +148,8 @@ target_link_libraries(qwen3_asr PUBLIC
     audio_encoder
     text_decoder
     audio_injection
+    audio_utils
+    logger
     Threads::Threads
 )
 
@@ -117,9 +166,11 @@ target_link_directories(forced_aligner PUBLIC
 )
 target_link_libraries(forced_aligner PUBLIC
     mel_spectrogram
+    audio_utils
     ggml
     ggml-base
     ggml-cpu
+    logger
     Threads::Threads
 )
 
@@ -130,6 +181,7 @@ add_executable(qwen3-asr-cli
 target_link_libraries(qwen3-asr-cli PRIVATE
     qwen3_asr
     forced_aligner
+    logger
 )
 
 # Test executable for mel spectrogram
@@ -274,14 +326,117 @@ target_link_libraries(test_encoder_no_chunk PRIVATE
     Threads::Threads
 )
 
-# Install targets
-install(TARGETS mel_spectrogram audio_encoder text_decoder audio_injection qwen3_asr forced_aligner qwen3-asr-cli
-    ARCHIVE DESTINATION lib
-    RUNTIME DESTINATION bin
+# ============================================================================
+# Shared Library (C API)
+# ============================================================================
+
+set(QWEN3ASR_ALL_SOURCES
+    src/qwen3asr_c_api.cpp
+    src/qwen3_asr.cpp
+    src/forced_aligner.cpp
+    src/mel_spectrogram.cpp
+    src/audio_encoder.cpp
+    src/text_decoder.cpp
+    src/audio_injection.cpp
+    src/audio_utils.cpp
+    src/gguf_loader.cpp
+    src/logger.cpp
 )
-install(FILES src/mel_spectrogram.h src/audio_encoder.h src/gguf_loader.h src/text_decoder.h src/audio_injection.h src/qwen3_asr.h src/forced_aligner.h
+
+add_library(qwen3asr SHARED ${QWEN3ASR_ALL_SOURCES})
+
+target_include_directories(qwen3asr PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+    ${spdlog_SOURCE_DIR}/include
+)
+
+target_link_directories(qwen3asr PRIVATE
+    ${GGML_BUILD_DIR}/src
+)
+
+target_link_libraries(qwen3asr PRIVATE
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+
+# Link all available backends - GGML scheduler will auto-select at runtime
+if(APPLE)
+    # macOS: Metal + CPU
+    target_link_directories(qwen3asr PRIVATE
+        ${GGML_BUILD_DIR}/src
+        ${GGML_BUILD_DIR}/src/ggml-metal
+    )
+    target_link_libraries(qwen3asr PRIVATE
+        ggml-metal
+        "-framework Metal"
+        "-framework Foundation"
+        "-framework Accelerate"
+    )
+elseif(WIN32)
+    # Windows: CUDA (if available) + CPU
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_link_directories(qwen3asr PRIVATE ${GGML_BUILD_DIR}/src)
+        target_link_libraries(qwen3asr PRIVATE ggml-cuda CUDA::cudart)
+        message(STATUS "GGML CUDA backend: enabled")
+    endif()
+elseif(UNIX AND NOT APPLE)
+    # Linux: CUDA/Vulkan (if available) + CPU
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_link_directories(qwen3asr PRIVATE ${GGML_BUILD_DIR}/src)
+        target_link_libraries(qwen3asr PRIVATE ggml-cuda CUDA::cudart)
+        message(STATUS "GGML CUDA backend: enabled")
+    endif()
+endif()
+
+# Common platform settings
+if(WIN32)
+    target_compile_definitions(qwen3asr PRIVATE QWEN3ASR_EXPORTS)
+    set_target_properties(qwen3asr PROPERTIES
+        OUTPUT_NAME "qwen3asr"
+        WINDOWS_EXPORT_ALL_SYMBOLS ON
+    )
+elseif(APPLE)
+    set_target_properties(qwen3asr PROPERTIES
+        OUTPUT_NAME "qwen3asr"
+        MACOSX_RPATH ON
+        INSTALL_RPATH "@loader_path"
+    )
+else()
+    set_target_properties(qwen3asr PROPERTIES
+        OUTPUT_NAME "qwen3asr"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
+
+# Install targets
+install(TARGETS qwen3asr mel_spectrogram audio_encoder text_decoder audio_injection qwen3_asr forced_aligner qwen3-asr-cli
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
+    ARCHIVE DESTINATION lib
+)
+install(FILES src/qwen3asr_c_api.h src/mel_spectrogram.h src/audio_encoder.h src/gguf_loader.h src/text_decoder.h src/audio_injection.h src/qwen3_asr.h src/forced_aligner.h
     DESTINATION include
 )
+
+# C API test
+add_executable(test_c_api tests/test_c_api.cpp)
+target_link_libraries(test_c_api PRIVATE qwen3asr)
+
+if(APPLE)
+    set_target_properties(test_c_api PROPERTIES
+        BUILD_RPATH "${GGML_BUILD_DIR}/src;${GGML_BUILD_DIR}/src/ggml-metal"
+        INSTALL_RPATH "@executable_path/../lib"
+    )
+elseif(UNIX AND NOT APPLE)
+    set_target_properties(test_c_api PROPERTIES
+        BUILD_RPATH "${GGML_BUILD_DIR}/src"
+    )
+endif()
 
 # CTest support
 enable_testing()
@@ -300,6 +455,23 @@ add_test(NAME text_decoder_test
 add_test(NAME audio_injection_test
     COMMAND test_injection
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# Test tokenization
+add_executable(test_tokenization
+    tests/test_tokenization.cpp
+)
+target_link_libraries(test_tokenization PRIVATE
+    Threads::Threads
+)
+
+# Test audio utils
+add_executable(test_audio_utils
+    tests/test_audio_utils.cpp
+)
+target_link_libraries(test_audio_utils PRIVATE
+    audio_utils
+    Threads::Threads
 )
 
 # Test conv1 output

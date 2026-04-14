@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -31,7 +32,7 @@ struct GlobalCache {
     double hann_window[QWEN_N_FFT];
     float hann_window_f[QWEN_N_FFT];
 
-    GlobalCache() {
+    void init() {
         fill_sin_cos_table();
         fill_hann_window(QWEN_N_FFT, true, hann_window);
         for (int i = 0; i < QWEN_N_FFT; i++) {
@@ -56,10 +57,21 @@ struct GlobalCache {
 };
 
 static GlobalCache global_cache;
+static std::once_flag global_cache_init_flag;
+
+static void init_global_cache() {
+    global_cache.init();
+}
+
+static GlobalCache& get_global_cache() {
+    std::call_once(global_cache_init_flag, init_global_cache);
+    return global_cache;
+}
 
 // Naive DFT for non-power-of-2 sizes
 static void dft(const float* in, int N, float* out) {
     const int sin_cos_step = SIN_COS_N_COUNT / N;
+    auto& cache = get_global_cache();
 
     for (int k = 0; k < N; k++) {
         float re = 0;
@@ -67,8 +79,8 @@ static void dft(const float* in, int N, float* out) {
 
         for (int n = 0; n < N; n++) {
             int idx = (k * n * sin_cos_step) % SIN_COS_N_COUNT;
-            re += in[n] * global_cache.cos_vals[idx];
-            im -= in[n] * global_cache.sin_vals[idx];
+            re += in[n] * cache.cos_vals[idx];
+            im -= in[n] * cache.sin_vals[idx];
         }
 
         out[k * 2 + 0] = re;
@@ -106,11 +118,12 @@ static void fft(float* in, int N, float* out) {
     float* odd_fft = even_fft + N;
     fft(odd, half_N, odd_fft);
 
+    auto& cache = get_global_cache();
     const int sin_cos_step = SIN_COS_N_COUNT / N;
     for (int k = 0; k < half_N; k++) {
         int idx = k * sin_cos_step;
-        float re = global_cache.cos_vals[idx];
-        float im = -global_cache.sin_vals[idx];
+        float re = cache.cos_vals[idx];
+        float im = -cache.sin_vals[idx];
 
         float re_odd = odd_fft[2 * k + 0];
         float im_odd = odd_fft[2 * k + 1];
@@ -525,7 +538,8 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
     int n_fft = filters.n_fft;
 
 #ifdef __APPLE__
-    const float* hann_f = global_cache.hann_window_f;
+    auto& cache = get_global_cache();
+    const float* hann_f = cache.hann_window_f;
 
     std::vector<float> W_cos(n_fft * frame_size);
     std::vector<float> W_sin(n_fft * frame_size);
@@ -567,7 +581,8 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
     }
 
 #else
-    const double* hann = global_cache.hann_window;
+    auto& cache = get_global_cache();
+    const double* hann = cache.hann_window;
 
     std::vector<double> temp_data(mel.n_mel * compute_frames);
 
