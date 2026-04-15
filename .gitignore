@@ -40,6 +40,9 @@ __pycache__/
 .venv/
 venv/
 .python-version
+main.py
+pyproject.toml
+uv.lock
 
 # Build artifacts
 compile_commands.json
