@@ -485,3 +485,55 @@ target_link_libraries(test_conv1 PRIVATE
     audio_encoder
     Threads::Threads
 )
+
+# ============================================================================
+# HTTP Server (optional)
+# ============================================================================
+
+option(QWEN3_ASR_HTTP_SERVER "Build HTTP server" ON)
+
+if(QWEN3_ASR_HTTP_SERVER)
+    # ASIO (required by Crow)
+    FetchContent_Declare(
+        asio
+        GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+        GIT_TAG asio-1-28-1
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(asio)
+    
+    # Add ASIO include directory to target
+    add_library(asio_header INTERFACE)
+    target_include_directories(asio_header INTERFACE "${asio_SOURCE_DIR}/asio/include")
+    
+    # Crow HTTP framework
+    FetchContent_Declare(
+        crow
+        GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
+        GIT_TAG v1.3.2
+        GIT_SHALLOW TRUE
+    )
+    set(CROW_ENABLE_TESTS OFF CACHE BOOL "Disable Crow tests")
+    FetchContent_MakeAvailable(crow)
+    
+    # HTTP server executable
+    add_executable(qwen3-asr-server
+        src/http_server/server.cpp
+        src/http_server/align_handler.cpp
+    )
+    target_include_directories(qwen3-asr-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${crow_SOURCE_DIR}/include
+        "${asio_SOURCE_DIR}/asio/include"
+    )
+    target_link_libraries(qwen3-asr-server PRIVATE
+        qwen3asr
+        logger
+        asio_header
+        Crow::Crow
+        Threads::Threads
+    )
+    
+    # Install target
+    install(TARGETS qwen3-asr-server DESTINATION bin)
+endif()

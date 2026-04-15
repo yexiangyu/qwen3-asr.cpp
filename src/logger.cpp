@@ -6,6 +6,12 @@
 namespace qwen3_asr {
 
 void init_logger() {
+    auto existing_logger = spdlog::get("qwen3_asr");
+    if (existing_logger) {
+        spdlog::set_default_logger(existing_logger);
+        return;
+    }
+    
     auto console_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
     console_sink->set_pattern("%^%l%$: %v");
     
