@@ -12,14 +12,19 @@ tests/reference/*.bin
 tests/reference/*.json
 tests/reference/transcript.txt
 
-# Audio files
+# Audio/Video files
 *.wav
 *.mp3
 *.flac
+*.mp4
+*.avi
+*.mkv
 
 # IDE
 .idea/
 .vscode/
+.clangd/
+.clangd
 *.swp
 *.swo
 *~
@@ -34,6 +39,11 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.python-version
+
+# Build artifacts
+compile_commands.json
 
 # Sisyphus working files
 .sisyphus/notepads/
+.cache/

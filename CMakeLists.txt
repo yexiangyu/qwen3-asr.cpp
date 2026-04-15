@@ -516,17 +516,17 @@ if(QWEN3_ASR_HTTP_SERVER)
     set(CROW_ENABLE_TESTS OFF CACHE BOOL "Disable Crow tests")
     FetchContent_MakeAvailable(crow)
     
-    # HTTP server executable (align)
-    add_executable(qwen3-asr-server
-        src/http_server/server.cpp
+    # Align HTTP server executable
+    add_executable(qwen3-align-server
+        src/http_server/align_server.cpp
         src/http_server/align_handler.cpp
     )
-    target_include_directories(qwen3-asr-server PRIVATE
+    target_include_directories(qwen3-align-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${crow_SOURCE_DIR}/include
         "${asio_SOURCE_DIR}/asio/include"
     )
-    target_link_libraries(qwen3-asr-server PRIVATE
+    target_link_libraries(qwen3-align-server PRIVATE
         qwen3asr
         logger
         asio_header
@@ -534,17 +534,17 @@ if(QWEN3_ASR_HTTP_SERVER)
         Threads::Threads
     )
     
-    # ASR HTTP server executable
-    add_executable(qwen3-asr-asr-server
-        src/http_server/asr_server.cpp
-        src/http_server/asr_handler.cpp
+    # Transcribe HTTP server executable
+    add_executable(qwen3-transcribe-server
+        src/http_server/transcribe_server.cpp
+        src/http_server/transcribe_handler.cpp
     )
-    target_include_directories(qwen3-asr-asr-server PRIVATE
+    target_include_directories(qwen3-transcribe-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${crow_SOURCE_DIR}/include
         "${asio_SOURCE_DIR}/asio/include"
     )
-    target_link_libraries(qwen3-asr-asr-server PRIVATE
+    target_link_libraries(qwen3-transcribe-server PRIVATE
         qwen3asr
         logger
         asio_header
@@ -553,5 +553,5 @@ if(QWEN3_ASR_HTTP_SERVER)
     )
     
     # Install targets
-    install(TARGETS qwen3-asr-server qwen3-asr-asr-server DESTINATION bin)
+    install(TARGETS qwen3-align-server qwen3-transcribe-server DESTINATION bin)
 endif()
