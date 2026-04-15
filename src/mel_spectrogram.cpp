@@ -89,7 +89,7 @@ static void dft(const float* in, int N, float* out) {
 }
 
 // Cooley-Tukey FFT (recursive, in-place)
-static void fft(float* in, int N, float* out) {
+static void fft(const float* in, int N, float* out) {
     if (N == 1) {
         out[0] = in[0];
         out[1] = 0;
@@ -104,19 +104,19 @@ static void fft(float* in, int N, float* out) {
     }
 
     // Split into even and odd
-    float* even = in + N;
+    std::vector<float> even(half_N);
     for (int i = 0; i < half_N; ++i) {
         even[i] = in[2 * i];
     }
-    float* even_fft = out + 2 * N;
-    fft(even, half_N, even_fft);
+    std::vector<float> even_fft(N);
+    fft(even.data(), half_N, even_fft.data());
 
-    float* odd = even;
+    std::vector<float> odd(half_N);
     for (int i = 0; i < half_N; ++i) {
         odd[i] = in[2 * i + 1];
     }
-    float* odd_fft = even_fft + N;
-    fft(odd, half_N, odd_fft);
+    std::vector<float> odd_fft(N);
+    fft(odd.data(), half_N, odd_fft.data());
 
     auto& cache = get_global_cache();
     const int sin_cos_step = SIN_COS_N_COUNT / N;
@@ -431,74 +431,13 @@ void generate_mel_filters(MelFilters& filters, int n_mels, int n_fft, int sample
 // Log Mel Spectrogram Computation
 // ============================================================================
 
-static void log_mel_spectrogram_worker(int ith, const float* hann, 
-                                        const std::vector<float>& samples,
-                                        int n_samples, int frame_size, int frame_step,
-                                        int n_threads, const MelFilters& filters,
-                                        MelSpectrogram& mel) {
-    std::vector<float> fft_in(frame_size * 2, 0.0f);
-    std::vector<float> fft_out(frame_size * 2 * 2 * 2);
-
-    int n_fft = filters.n_fft;
-    int i = ith;
-
-    // Calculate FFT only when fft_in are not all zero
-    for (; i < std::min(n_samples / frame_step + 1, mel.n_len); i += n_threads) {
-        const int offset = i * frame_step;
-
-        // Apply Hann window
-        for (int j = 0; j < std::min(frame_size, n_samples - offset); j++) {
-            fft_in[j] = hann[j] * samples[offset + j];
-        }
-
-        // Fill the rest with zeros
-        if (n_samples - offset < frame_size) {
-            std::fill(fft_in.begin() + (n_samples - offset), fft_in.end(), 0.0f);
-        }
-
-        // FFT
-        fft(fft_in.data(), frame_size, fft_out.data());
-
-        // Calculate modulus^2 of complex numbers
-        for (int j = 0; j < n_fft; j++) {
-            fft_out[j] = fft_out[2 * j + 0] * fft_out[2 * j + 0] + 
-                         fft_out[2 * j + 1] * fft_out[2 * j + 1];
-        }
-
-        // Mel spectrogram
-        for (int j = 0; j < mel.n_mel; j++) {
-            double sum = 0.0;
-            // Unrolled loop for performance
-            int k = 0;
-            for (k = 0; k < n_fft - 3; k += 4) {
-                sum += fft_out[k + 0] * filters.data[j * n_fft + k + 0] +
-                       fft_out[k + 1] * filters.data[j * n_fft + k + 1] +
-                       fft_out[k + 2] * filters.data[j * n_fft + k + 2] +
-                       fft_out[k + 3] * filters.data[j * n_fft + k + 3];
-            }
-            // Handle remainder
-            for (; k < n_fft; k++) {
-                sum += fft_out[k] * filters.data[j * n_fft + k];
-            }
-            sum = log10(std::max(sum, 1e-10));
-            mel.data[j * mel.n_len + i] = static_cast<float>(sum);
-        }
-    }
-
-    // Fill remaining frames with log10(1e-10)
-    double sum = log10(1e-10);
-    for (; i < mel.n_len; i += n_threads) {
-        for (int j = 0; j < mel.n_mel; j++) {
-            mel.data[j * mel.n_len + i] = static_cast<float>(sum);
-        }
-    }
-}
-
 bool log_mel_spectrogram(const float* samples, int n_samples,
                          const MelFilters& filters, MelSpectrogram& mel,
                          int n_threads) {
     const int frame_size = QWEN_N_FFT;
     const int frame_step = QWEN_HOP_LENGTH;
+    const int n_fft = filters.n_fft;
+    const int n_mel = filters.n_mel;
 
     // Center padding: n_fft//2 on each side (matches HuggingFace/librosa center=True)
     int pad_amount = frame_size / 2;
@@ -528,92 +467,115 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
     }
 
     int total_frames = (static_cast<int>(samples_padded.size()) - frame_size) / frame_step + 1;
+    int compute_frames = total_frames;
 
-    mel.n_mel = filters.n_mel;
+    mel.n_mel = n_mel;
     mel.n_len = total_frames - 1;
     mel.n_len_org = mel.n_len;
     mel.data.resize(mel.n_mel * mel.n_len);
 
-    int compute_frames = total_frames;
-    int n_fft = filters.n_fft;
-
-#ifdef __APPLE__
     auto& cache = get_global_cache();
     const float* hann_f = cache.hann_window_f;
 
-    std::vector<float> W_cos(n_fft * frame_size);
-    std::vector<float> W_sin(n_fft * frame_size);
-    for (int k = 0; k < n_fft; k++) {
-        for (int n = 0; n < frame_size; n++) {
-            float angle = static_cast<float>(2.0 * M_PI * k * n / frame_size);
-            W_cos[k * frame_size + n] = cosf(angle);
-            W_sin[k * frame_size + n] = sinf(angle);
+    // Step 1: Compute power spectrum for all frames
+    // power_all[n_fft × compute_frames] - column-major for BLAS
+    std::vector<float> power_all(n_fft * compute_frames, 0.0f);
+
+    // Process frames in parallel
+    std::vector<std::thread> threads;
+    int frames_per_thread = (compute_frames + n_threads - 1) / n_threads;
+
+    auto process_frames = [&](int start_frame, int end_frame) {
+        std::vector<float> fft_in(frame_size * 2, 0.0f);
+        std::vector<float> fft_out(frame_size * 2 * 2 * 2);
+
+        for (int i = start_frame; i < end_frame; i++) {
+            const int offset = i * frame_step;
+
+            // Apply Hann window
+            for (int j = 0; j < std::min(frame_size, (int)samples_padded.size() - offset); j++) {
+                fft_in[j] = hann_f[j] * samples_padded[offset + j];
+            }
+
+            // Fill the rest with zeros
+            int valid_len = std::min(frame_size, (int)samples_padded.size() - offset);
+            if (valid_len < frame_size) {
+                std::fill(fft_in.begin() + valid_len, fft_in.end(), 0.0f);
+            }
+
+            // FFT
+            fft(fft_in.data(), frame_size, fft_out.data());
+
+            // Calculate modulus^2 of complex numbers -> power spectrum
+            for (int j = 0; j < n_fft; j++) {
+                power_all[j * compute_frames + i] = 
+                    fft_out[2 * j + 0] * fft_out[2 * j + 0] + 
+                    fft_out[2 * j + 1] * fft_out[2 * j + 1];
+            }
+        }
+    };
+
+    for (int t = 0; t < n_threads; t++) {
+        int start = t * frames_per_thread;
+        int end = std::min(start + frames_per_thread, compute_frames);
+        if (start < compute_frames) {
+            threads.emplace_back(process_frames, start, end);
         }
     }
 
-    std::vector<float> windowed(frame_size);
-    std::vector<float> dft_re(n_fft);
-    std::vector<float> dft_im(n_fft);
-    std::vector<float> power(n_fft);
-
-    std::vector<double> temp_data(mel.n_mel * compute_frames);
-
-    for (int i = 0; i < compute_frames; i++) {
-        const int offset = i * frame_step;
-
-        vDSP_vmul(hann_f, 1, &samples_padded[offset], 1, windowed.data(), 1, frame_size);
-
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, n_fft, frame_size,
-                    1.0f, W_cos.data(), frame_size, windowed.data(), 1,
-                    0.0f, dft_re.data(), 1);
-        cblas_sgemv(CblasRowMajor, CblasNoTrans, n_fft, frame_size,
-                    -1.0f, W_sin.data(), frame_size, windowed.data(), 1,
-                    0.0f, dft_im.data(), 1);
-
-        DSPSplitComplex split = { dft_re.data(), dft_im.data() };
-        vDSP_zvmags(&split, 1, power.data(), 1, n_fft);
-
-        for (int j = 0; j < mel.n_mel; j++) {
-            float dot;
-            vDSP_dotpr(power.data(), 1, &filters.data[j * n_fft], 1, &dot, n_fft);
-            temp_data[j * compute_frames + i] = log10(std::max(static_cast<double>(dot), 1e-10));
-        }
+    for (auto& th : threads) {
+        th.join();
     }
 
+    // Step 2: Apply mel filterbank using BLAS GEMM
+    // mel_output (n_mel × compute_frames) = mel_filters (n_mel × n_fft) @ power_all (n_fft × compute_frames)
+    // C = alpha * A * B + beta * C
+    // Row-major: C = A @ B where A is (n_mel × n_fft), B is (n_fft × compute_frames)
+    std::vector<float> mel_output(n_mel * compute_frames, 0.0f);
+
+#ifdef HAVE_BLAS
+#ifdef __APPLE__
+    // Apple Accelerate framework
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                n_mel, compute_frames, n_fft,
+                1.0f,
+                filters.data.data(), n_fft,
+                power_all.data(), compute_frames,
+                0.0f,
+                mel_output.data(), compute_frames);
 #else
-    auto& cache = get_global_cache();
-    const double* hann = cache.hann_window;
-
-    std::vector<double> temp_data(mel.n_mel * compute_frames);
-
-    for (int i = 0; i < compute_frames; i++) {
-        const int offset = i * frame_step;
-
-        std::vector<double> fft_in_d(frame_size, 0.0);
-        for (int j = 0; j < frame_size; j++) {
-            fft_in_d[j] = hann[j] * static_cast<double>(samples_padded[offset + j]);
-        }
-
-        std::vector<double> power(n_fft);
-        for (int k = 0; k < n_fft; k++) {
-            double re = 0.0, im = 0.0;
-            for (int n = 0; n < frame_size; n++) {
-                double angle = 2.0 * M_PI * k * n / frame_size;
-                re += fft_in_d[n] * cos(angle);
-                im -= fft_in_d[n] * sin(angle);
-            }
-            power[k] = re * re + im * im;
-        }
-
-        for (int j = 0; j < mel.n_mel; j++) {
-            double sum = 0.0;
+    // Generic BLAS (OpenBLAS, MKL, etc.)
+    // Note: Most BLAS implementations use column-major by default
+    // We use column-major layout: C^T = B^T @ A^T
+    // mel_output^T (compute_frames × n_mel) = power_all^T (compute_frames × n_fft) @ filters^T (n_fft × n_mel)
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                compute_frames, n_mel, n_fft,
+                1.0f,
+                power_all.data(), compute_frames,
+                filters.data.data(), n_fft,
+                0.0f,
+                mel_output.data(), compute_frames);
+#endif
+#else
+    // Naive implementation (no BLAS)
+    for (int j = 0; j < n_mel; j++) {
+        for (int i = 0; i < compute_frames; i++) {
+            float sum = 0.0f;
             for (int k = 0; k < n_fft; k++) {
-                sum += power[k] * static_cast<double>(filters.data[j * n_fft + k]);
+                sum += power_all[k * compute_frames + i] * filters.data[j * n_fft + k];
             }
-            temp_data[j * compute_frames + i] = log10(std::max(sum, 1e-10));
+            mel_output[j * compute_frames + i] = sum;
         }
     }
 #endif
+
+    // Step 3: Log10, clamping and normalization
+    std::vector<double> temp_data(mel.n_mel * compute_frames);
+    for (int j = 0; j < n_mel; j++) {
+        for (int i = 0; i < compute_frames; i++) {
+            temp_data[j * compute_frames + i] = log10(std::max(static_cast<double>(mel_output[j * compute_frames + i]), 1e-10));
+        }
+    }
 
     // Clamping and normalization in double precision
     double mmax = -1e20;

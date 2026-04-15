@@ -55,6 +55,19 @@ find_package(Threads REQUIRED)
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 set(GGML_BUILD_DIR "${GGML_DIR}/build")
 
+# CUDA detection for Linux platforms
+if(UNIX AND NOT APPLE)
+    find_package(CUDAToolkit QUIET)
+    option(GGML_CUDA "Enable GGML CUDA backend" OFF)
+    if(CUDAToolkit_FOUND AND GGML_CUDA)
+        message(STATUS "CUDA Toolkit found at ${CUDAToolkit_ROOT_DIR}")
+        message(STATUS "GGML CUDA backend: enabled")
+        set(GGML_CUDA_FOUND TRUE)
+    elseif(GGML_CUDA AND NOT CUDAToolkit_FOUND)
+        message(WARNING "CUDA requested but CUDAToolkit not found")
+    endif()
+endif()
+
 # Logger library
 add_library(logger STATIC
     src/logger.cpp
@@ -84,10 +97,23 @@ if(APPLE)
         Threads::Threads
         "-framework Accelerate"
     )
+    target_compile_definitions(mel_spectrogram PRIVATE HAVE_BLAS)
 else()
-    target_link_libraries(mel_spectrogram PRIVATE
-        Threads::Threads
-    )
+    # Try to find BLAS for Linux
+    find_package(BLAS QUIET)
+    if(BLAS_FOUND)
+        message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
+        target_link_libraries(mel_spectrogram PRIVATE
+            Threads::Threads
+            ${BLAS_LIBRARIES}
+        )
+        target_compile_definitions(mel_spectrogram PRIVATE HAVE_BLAS)
+    else()
+        message(STATUS "BLAS not found, using naive implementation")
+        target_link_libraries(mel_spectrogram PRIVATE
+            Threads::Threads
+        )
+    endif()
 endif()
 
 # Audio encoder library (GGML-based)
@@ -108,6 +134,11 @@ target_link_libraries(audio_encoder PUBLIC
     ggml-cpu
     Threads::Threads
 )
+if(GGML_CUDA_FOUND)
+    target_link_directories(audio_encoder PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(audio_encoder PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(audio_encoder PUBLIC GGML_USE_CUDA)
+endif()
 
 # Text decoder library (GGML-based)
 add_library(text_decoder STATIC
@@ -126,6 +157,11 @@ target_link_libraries(text_decoder PUBLIC
     ggml-cpu
     Threads::Threads
 )
+if(GGML_CUDA_FOUND)
+    target_link_directories(text_decoder PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(text_decoder PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(text_decoder PUBLIC GGML_USE_CUDA)
+endif()
 
 # Audio injection library (pure C++, no GGML dependency)
 add_library(audio_injection STATIC
@@ -173,6 +209,11 @@ target_link_libraries(forced_aligner PUBLIC
     logger
     Threads::Threads
 )
+if(GGML_CUDA_FOUND)
+    target_link_directories(forced_aligner PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(forced_aligner PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(forced_aligner PUBLIC GGML_USE_CUDA)
+endif()
 
 # CLI executable
 add_executable(qwen3-asr-cli
@@ -244,6 +285,10 @@ target_link_libraries(test_embedding PRIVATE
     ggml-cpu
     Threads::Threads
 )
+if(GGML_CUDA_FOUND)
+    target_link_directories(test_embedding PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(test_embedding PRIVATE ggml-cuda CUDA::cudart)
+endif()
 
 # Debug decoder test
 add_executable(test_decoder_debug
@@ -375,22 +420,10 @@ if(APPLE)
         "-framework Foundation"
         "-framework Accelerate"
     )
-elseif(WIN32)
-    # Windows: CUDA (if available) + CPU
-    find_package(CUDAToolkit QUIET)
-    if(CUDAToolkit_FOUND)
-        target_link_directories(qwen3asr PRIVATE ${GGML_BUILD_DIR}/src)
-        target_link_libraries(qwen3asr PRIVATE ggml-cuda CUDA::cudart)
-        message(STATUS "GGML CUDA backend: enabled")
-    endif()
-elseif(UNIX AND NOT APPLE)
-    # Linux: CUDA/Vulkan (if available) + CPU
-    find_package(CUDAToolkit QUIET)
-    if(CUDAToolkit_FOUND)
-        target_link_directories(qwen3asr PRIVATE ${GGML_BUILD_DIR}/src)
-        target_link_libraries(qwen3asr PRIVATE ggml-cuda CUDA::cudart)
-        message(STATUS "GGML CUDA backend: enabled")
-    endif()
+elseif(GGML_CUDA_FOUND)
+    # Linux/Windows: CUDA + CPU
+    target_link_directories(qwen3asr PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(qwen3asr PRIVATE ggml-cuda CUDA::cudart)
 endif()
 
 # Common platform settings
@@ -436,6 +469,11 @@ elseif(UNIX AND NOT APPLE)
     set_target_properties(test_c_api PROPERTIES
         BUILD_RPATH "${GGML_BUILD_DIR}/src"
     )
+    if(GGML_CUDA_FOUND)
+        set_target_properties(test_c_api PROPERTIES
+            BUILD_RPATH "${GGML_BUILD_DIR}/src;/usr/local/cuda/lib64"
+        )
+    endif()
 endif()
 
 # CTest support

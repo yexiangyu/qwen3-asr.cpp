@@ -63,13 +63,7 @@ bool AudioEncoder::load_model(const std::string & model_path) {
     }
 
     backends.push_back(state_.backend_cpu);
-    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(state_.backend_cpu);
-    if (state_.backend_gpu) {
-        ggml_backend_dev_t gpu_dev = ggml_backend_get_device(state_.backend_gpu);
-        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
-        if (host_buft) cpu_buft = host_buft;
-    }
-    backend_bufts.push_back(cpu_buft);
+    backend_bufts.push_back(ggml_backend_get_default_buffer_type(state_.backend_cpu));
 
     state_.sched = ggml_backend_sched_new(backends.data(), backend_bufts.data(), backends.size(), QWEN3_ASR_MAX_NODES, false, true);
     if (!state_.sched) {

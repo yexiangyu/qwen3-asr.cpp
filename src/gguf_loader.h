@@ -117,8 +117,8 @@ private:
     // Parse hyperparameters from GGUF metadata
     bool parse_hparams(struct gguf_context * ctx, audio_encoder_model & model);
     
-    // Create tensor structures
-    bool create_tensors(struct gguf_context * ctx, audio_encoder_model & model);
+    // Assign tensors from GGUF context to model structure
+    bool assign_tensors(struct gguf_context * ctx_gguf, audio_encoder_model & model);
     
     // Load tensor data from file
     bool load_tensor_data(const std::string & path, struct gguf_context * ctx, 

@@ -266,9 +266,9 @@ public:
     
 private:
     // Load model components
-    bool parse_hparams(struct gguf_context * ctx);
-    bool create_tensors(struct gguf_context * ctx);
-    bool load_tensor_data(const std::string & path, struct gguf_context * ctx);
+    bool parse_hparams(struct gguf_context * ctx_gguf);
+    bool assign_tensors(struct gguf_context * ctx_gguf);
+    bool load_tensor_data(const std::string & path, struct gguf_context * ctx_gguf);
     bool load_vocab(struct gguf_context * ctx);
     
     // Initialize KV cache

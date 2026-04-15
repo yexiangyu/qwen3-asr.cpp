@@ -1,6 +1,10 @@
 #include "text_decoder.h"
 #include "timing.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -36,46 +40,44 @@ TextDecoder::~TextDecoder() {
 }
 
 bool TextDecoder::load_model(const std::string & model_path) {
-    struct ggml_context * meta_ctx = nullptr;
     struct gguf_init_params params = {
         /*.no_alloc =*/ true,
-        /*.ctx      =*/ &meta_ctx,
+        /*.ctx      =*/ &model_.ctx,
     };
     
-    struct gguf_context * ctx = gguf_init_from_file(model_path.c_str(), params);
-    if (!ctx) {
+    struct gguf_context * ctx_gguf = gguf_init_from_file(model_path.c_str(), params);
+    if (!ctx_gguf) {
         error_msg_ = "Failed to open GGUF file: " + model_path;
         return false;
     }
     
-    if (!parse_config(ctx)) {
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+    if (!parse_config(ctx_gguf)) {
+        gguf_free(ctx_gguf);
+        if (model_.ctx) ggml_free(model_.ctx);
+        model_.ctx = nullptr;
         return false;
     }
     
-    if (!create_tensors(ctx)) {
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+    if (!assign_tensors(ctx_gguf)) {
+        gguf_free(ctx_gguf);
+        if (model_.ctx) ggml_free(model_.ctx);
+        model_.ctx = nullptr;
         return false;
     }
     
-    if (!load_tensor_data(model_path, ctx)) {
+    if (!load_tensor_data(model_path, ctx_gguf)) {
         free_decoder_model(model_);
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+        gguf_free(ctx_gguf);
         return false;
     }
     
-    if (!load_vocab(ctx)) {
+    if (!load_vocab(ctx_gguf)) {
         free_decoder_model(model_);
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+        gguf_free(ctx_gguf);
         return false;
     }
     
-    gguf_free(ctx);
-    if (meta_ctx) ggml_free(meta_ctx);
+    gguf_free(ctx_gguf);
     
     state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!state_.backend_cpu) {
@@ -94,13 +96,7 @@ bool TextDecoder::load_model(const std::string & model_path) {
     }
 
     backends.push_back(state_.backend_cpu);
-    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(state_.backend_cpu);
-    if (state_.backend_gpu) {
-        ggml_backend_dev_t gpu_dev = ggml_backend_get_device(state_.backend_gpu);
-        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
-        if (host_buft) cpu_buft = host_buft;
-    }
-    backend_bufts.push_back(cpu_buft);
+    backend_bufts.push_back(ggml_backend_get_default_buffer_type(state_.backend_cpu));
 
     state_.sched = ggml_backend_sched_new(backends.data(), backend_bufts.data(), backends.size(), QWEN3_ASR_MAX_NODES, false, true);
     if (!state_.sched) {
@@ -146,128 +142,60 @@ bool TextDecoder::parse_config(struct gguf_context * ctx) {
     return true;
 }
 
-bool TextDecoder::create_tensors(struct gguf_context * ctx) {
-    const int64_t n_tensors = gguf_get_n_tensors(ctx);
+bool TextDecoder::assign_tensors(struct gguf_context * ctx_gguf) {
+    (void)ctx_gguf;
     const auto & cfg = model_.config;
-    
-    const size_t ctx_size = n_tensors * ggml_tensor_overhead();
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ ctx_size,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    
-    model_.ctx = ggml_init(params);
-    if (!model_.ctx) {
-        error_msg_ = "Failed to create GGML context";
-        return false;
-    }
     
     model_.layers.resize(cfg.n_decoder_layers);
     
-    for (int64_t i = 0; i < n_tensors; ++i) {
-        const char * name = gguf_get_tensor_name(ctx, i);
-        enum ggml_type type = gguf_get_tensor_type(ctx, i);
+    for (struct ggml_tensor * tensor = ggml_get_first_tensor(model_.ctx); 
+         tensor; 
+         tensor = ggml_get_next_tensor(model_.ctx, tensor)) {
         
-        int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
-        int n_dims = 0;
+        const char * name = ggml_get_name(tensor);
         
         if (strstr(name, "audio.encoder")) {
             continue;
-        } else if (strstr(name, "token_embd.weight")) {
-            ne[0] = cfg.hidden_size;
-            ne[1] = cfg.vocab_size;
-            n_dims = 2;
-        } else if (strstr(name, "output_norm.weight")) {
-            ne[0] = cfg.hidden_size;
-            n_dims = 1;
-        } else if (strstr(name, "attn_output.weight")) {
-            ne[0] = cfg.n_attention_heads * cfg.head_dim;
-            ne[1] = cfg.hidden_size;
-            n_dims = 2;
-        } else if (strstr(name, "output.weight")) {
-            // Weight tying: output.weight aliases token_embd.weight
-            continue;
-        } else if (strstr(name, "attn_norm.weight")) {
-            ne[0] = cfg.hidden_size;
-            n_dims = 1;
-        } else if (strstr(name, "attn_q_norm.weight")) {
-            ne[0] = cfg.head_dim;
-            n_dims = 1;
-        } else if (strstr(name, "attn_k_norm.weight")) {
-            ne[0] = cfg.head_dim;
-            n_dims = 1;
-        } else if (strstr(name, "attn_q.weight")) {
-            ne[0] = cfg.hidden_size;
-            ne[1] = cfg.n_attention_heads * cfg.head_dim;
-            n_dims = 2;
-        } else if (strstr(name, "attn_k.weight")) {
-            ne[0] = cfg.hidden_size;
-            ne[1] = cfg.n_key_value_heads * cfg.head_dim;
-            n_dims = 2;
-        } else if (strstr(name, "attn_v.weight")) {
-            ne[0] = cfg.hidden_size;
-            ne[1] = cfg.n_key_value_heads * cfg.head_dim;
-            n_dims = 2;
-        } else if (strstr(name, "ffn_norm.weight")) {
-            ne[0] = cfg.hidden_size;
-            n_dims = 1;
-        } else if (strstr(name, "ffn_gate.weight")) {
-            ne[0] = cfg.hidden_size;
-            ne[1] = cfg.intermediate_size;
-            n_dims = 2;
-        } else if (strstr(name, "ffn_up.weight")) {
-            ne[0] = cfg.hidden_size;
-            ne[1] = cfg.intermediate_size;
-            n_dims = 2;
-        } else if (strstr(name, "ffn_down.weight")) {
-            ne[0] = cfg.intermediate_size;
-            ne[1] = cfg.hidden_size;
-            n_dims = 2;
-        } else {
-            continue;
         }
         
-        struct ggml_tensor * tensor = ggml_new_tensor(model_.ctx, type, n_dims, ne);
-        if (!tensor) {
-            error_msg_ = "Failed to create tensor: " + std::string(name);
-            return false;
-        }
-        ggml_set_name(tensor, name);
         model_.tensors[name] = tensor;
         
-        if (strstr(name, "token_embd.weight")) {
-            model_.token_embd = tensor;
-        } else if (strstr(name, "output_norm.weight")) {
-            model_.output_norm = tensor;
-        } else if (strstr(name, "blk.")) {
+        if (strstr(name, "blk.")) {
             int layer_idx = -1;
             if (sscanf(name, "blk.%d.", &layer_idx) == 1 && 
                 layer_idx >= 0 && layer_idx < cfg.n_decoder_layers) {
                 auto & layer = model_.layers[layer_idx];
                 
-                if (strstr(name, "attn_norm.weight")) layer.attn_norm = tensor;
+                if (strstr(name, "attn_output.weight")) layer.attn_output = tensor;
+                else if (strstr(name, "attn_norm.weight")) layer.attn_norm = tensor;
                 else if (strstr(name, "attn_q_norm.weight")) layer.attn_q_norm = tensor;
                 else if (strstr(name, "attn_k_norm.weight")) layer.attn_k_norm = tensor;
                 else if (strstr(name, "attn_q.weight")) layer.attn_q = tensor;
                 else if (strstr(name, "attn_k.weight")) layer.attn_k = tensor;
                 else if (strstr(name, "attn_v.weight")) layer.attn_v = tensor;
-                else if (strstr(name, "attn_output.weight")) layer.attn_output = tensor;
                 else if (strstr(name, "ffn_norm.weight")) layer.ffn_norm = tensor;
                 else if (strstr(name, "ffn_gate.weight")) layer.ffn_gate = tensor;
                 else if (strstr(name, "ffn_up.weight")) layer.ffn_up = tensor;
                 else if (strstr(name, "ffn_down.weight")) layer.ffn_down = tensor;
             }
         }
+        else if (strstr(name, "token_embd.weight")) {
+            model_.token_embd = tensor;
+        } else if (strstr(name, "output_norm.weight")) {
+            model_.output_norm = tensor;
+        } else if (strstr(name, "output.weight")) {
+            model_.output = tensor;
+        }
     }
     
-    // Weight tying: LM head shares token embedding weights
-    model_.output = model_.token_embd;
+    if (!model_.output && model_.token_embd) {
+        model_.output = model_.token_embd;
+    }
     
     return true;
 }
 
-bool TextDecoder::load_tensor_data(const std::string & path, struct gguf_context * ctx) {
+bool TextDecoder::load_tensor_data(const std::string & path, struct gguf_context * ctx_gguf) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         error_msg_ = "Failed to open file for mmap: " + path;
@@ -292,43 +220,67 @@ bool TextDecoder::load_tensor_data(const std::string & path, struct gguf_context
     model_.mmap_addr = mmap_addr;
     model_.mmap_size = st.st_size;
     
-    const size_t data_offset = gguf_get_data_offset(ctx);
-    const size_t total_size = st.st_size - data_offset;
+    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
     uint8_t * data_base = (uint8_t *)mmap_addr + data_offset;
     
-    const int64_t n_tensors = gguf_get_n_tensors(ctx);
-    size_t max_tensor_size = 0;
-    for (int64_t i = 0; i < n_tensors; ++i) {
-        size_t sz = gguf_get_tensor_size(ctx, i);
-        if (sz > max_tensor_size) max_tensor_size = sz;
-    }
-
-    // Try GPU device buffer (zero-copy on Apple Silicon unified memory)
+    // Following llama.cpp: use ggml_backend_alloc_ctx_tensors_from_buft
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    ggml_backend_buffer_type_t buft = nullptr;
+    
     if (gpu_dev) {
-        model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+        const char * dev_name = ggml_backend_dev_name(gpu_dev);
+        if (strstr(dev_name, "Metal") != nullptr) {
+            buft = ggml_backend_dev_buffer_type(gpu_dev);
+        }
+#ifdef GGML_USE_CUDA
+        else {
+            buft = ggml_backend_cuda_buffer_type(0);
+        }
+#endif
     }
-    if (!model_.buffer) {
-        model_.buffer = ggml_backend_cpu_buffer_from_ptr(data_base, total_size);
+    
+    if (!buft) {
+        buft = ggml_backend_cpu_buffer_type();
     }
+    
+    model_.buffer = ggml_backend_alloc_ctx_tensors_from_buft(model_.ctx, buft);
     if (!model_.buffer) {
-        error_msg_ = "Failed to create buffer from mmap";
+        error_msg_ = "Failed to allocate context tensors with buffer type";
         munmap(mmap_addr, st.st_size);
         model_.mmap_addr = nullptr;
         model_.mmap_size = 0;
         return false;
     }
     
+    fprintf(stderr, "info: text decoder allocated %zu bytes for model weights\n", 
+            ggml_backend_buffer_get_size(model_.buffer));
+    
+    // Load tensor data - only for tensors we care about (skip audio.encoder)
+    const int64_t n_tensors = gguf_get_n_tensors(ctx_gguf);
     for (int64_t i = 0; i < n_tensors; ++i) {
-        const char * name = gguf_get_tensor_name(ctx, i);
-        size_t offset = gguf_get_tensor_offset(ctx, i);
+        const char * name = gguf_get_tensor_name(ctx_gguf, i);
+        if (strstr(name, "audio.encoder")) {
+            continue;
+        }
         
-        auto it = model_.tensors.find(name);
-        if (it == model_.tensors.end()) continue;
+        struct ggml_tensor * tensor = ggml_get_tensor(model_.ctx, name);
+        if (!tensor) {
+            continue;
+        }
         
-        struct ggml_tensor * tensor = it->second;
-        tensor->buffer = model_.buffer;
-        tensor->data = data_base + offset;
+        const size_t offset = gguf_get_tensor_offset(ctx_gguf, i);
+        const size_t sz = ggml_nbytes(tensor);
+        
+        ggml_backend_tensor_set(tensor, data_base + offset, 0, sz);
+    }
+    
+    if (gpu_dev) {
+        const char * dev_name = ggml_backend_dev_name(gpu_dev);
+        if (strstr(dev_name, "Metal") == nullptr) {
+            munmap(mmap_addr, st.st_size);
+            model_.mmap_addr = nullptr;
+            model_.mmap_size = 0;
+        }
     }
     
     return true;
@@ -611,6 +563,11 @@ bool TextDecoder::forward_with_audio(
     
     struct ggml_cgraph * gf = build_graph(tokens, n_tokens, n_past,
                                           audio_embd, n_audio, audio_start_pos);
+    
+    if (!gf) {
+        error_msg_ = "Failed to build graph";
+        return false;
+    }
     
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";

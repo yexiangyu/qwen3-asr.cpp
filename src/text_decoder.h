@@ -161,11 +161,11 @@ private:
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
     
-    // Create tensor structures
-    bool create_tensors(struct gguf_context * ctx);
+    // Assign tensors from GGUF context to model structure
+    bool assign_tensors(struct gguf_context * ctx_gguf);
     
     // Load tensor data from file
-    bool load_tensor_data(const std::string & path, struct gguf_context * ctx);
+    bool load_tensor_data(const std::string & path, struct gguf_context * ctx_gguf);
     
     bool load_vocab(struct gguf_context * ctx);
     

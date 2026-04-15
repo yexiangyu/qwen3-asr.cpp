@@ -2,6 +2,10 @@
 #include "mel_spectrogram.h"
 #include "logger.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -56,46 +60,44 @@ ForcedAligner::~ForcedAligner() {
 }
 
 bool ForcedAligner::load_model(const std::string & model_path) {
-    struct ggml_context * meta_ctx = nullptr;
     struct gguf_init_params params = {
         /*.no_alloc =*/ true,
-        /*.ctx      =*/ &meta_ctx,
+        /*.ctx      =*/ &model_.ctx,
     };
     
-    struct gguf_context * ctx = gguf_init_from_file(model_path.c_str(), params);
-    if (!ctx) {
+    struct gguf_context * ctx_gguf = gguf_init_from_file(model_path.c_str(), params);
+    if (!ctx_gguf) {
         error_msg_ = "Failed to open GGUF file: " + model_path;
         return false;
     }
     
-    if (!parse_hparams(ctx)) {
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+    if (!parse_hparams(ctx_gguf)) {
+        gguf_free(ctx_gguf);
+        if (model_.ctx) ggml_free(model_.ctx);
+        model_.ctx = nullptr;
         return false;
     }
     
-    if (!create_tensors(ctx)) {
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+    if (!assign_tensors(ctx_gguf)) {
+        gguf_free(ctx_gguf);
+        if (model_.ctx) ggml_free(model_.ctx);
+        model_.ctx = nullptr;
         return false;
     }
     
-    if (!load_tensor_data(model_path, ctx)) {
+    if (!load_tensor_data(model_path, ctx_gguf)) {
         free_forced_aligner_model(model_);
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+        gguf_free(ctx_gguf);
         return false;
     }
     
-    if (!load_vocab(ctx)) {
+    if (!load_vocab(ctx_gguf)) {
         free_forced_aligner_model(model_);
-        gguf_free(ctx);
-        if (meta_ctx) ggml_free(meta_ctx);
+        gguf_free(ctx_gguf);
         return false;
     }
     
-    gguf_free(ctx);
-    if (meta_ctx) ggml_free(meta_ctx);
+    gguf_free(ctx_gguf);
     
     state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!state_.backend_cpu) {
@@ -114,13 +116,7 @@ bool ForcedAligner::load_model(const std::string & model_path) {
     }
 
     backends.push_back(state_.backend_cpu);
-    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(state_.backend_cpu);
-    if (state_.backend_gpu) {
-        ggml_backend_dev_t gpu_dev = ggml_backend_get_device(state_.backend_gpu);
-        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
-        if (host_buft) cpu_buft = host_buft;
-    }
-    backend_bufts.push_back(cpu_buft);
+    backend_bufts.push_back(ggml_backend_get_default_buffer_type(state_.backend_cpu));
 
     state_.sched = ggml_backend_sched_new(backends.data(), backend_bufts.data(), backends.size(), QWEN3_FA_MAX_NODES, false, true);
     if (!state_.sched) {
@@ -175,190 +171,24 @@ bool ForcedAligner::parse_hparams(struct gguf_context * ctx) {
     return true;
 }
 
-bool ForcedAligner::create_tensors(struct gguf_context * ctx) {
-    const int64_t n_tensors = gguf_get_n_tensors(ctx);
+bool ForcedAligner::assign_tensors(struct gguf_context * ctx_gguf) {
+    (void)ctx_gguf;
     const auto & hp = model_.hparams;
-    
-    const size_t ctx_size = n_tensors * ggml_tensor_overhead();
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ ctx_size,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    
-    model_.ctx = ggml_init(params);
-    if (!model_.ctx) {
-        error_msg_ = "Failed to create GGML context";
-        return false;
-    }
     
     model_.encoder_layers.resize(hp.audio_encoder_layers);
     model_.decoder_layers.resize(hp.text_decoder_layers);
     
-    for (int64_t i = 0; i < n_tensors; ++i) {
-        const char * name = gguf_get_tensor_name(ctx, i);
-        enum ggml_type type = gguf_get_tensor_type(ctx, i);
+    for (struct ggml_tensor * tensor = ggml_get_first_tensor(model_.ctx); 
+         tensor; 
+         tensor = ggml_get_next_tensor(model_.ctx, tensor)) {
         
-        int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
-        int n_dims = 0;
-        
-        if (strstr(name, "encoder.conv1.weight")) {
-            ne[0] = 3; ne[1] = 3; ne[2] = 1; ne[3] = hp.audio_conv_channels;
-            n_dims = 4;
-        } else if (strstr(name, "encoder.conv2.weight") || strstr(name, "encoder.conv3.weight")) {
-            ne[0] = 3; ne[1] = 3; ne[2] = hp.audio_conv_channels; ne[3] = hp.audio_conv_channels;
-            n_dims = 4;
-        } else if (strstr(name, "encoder.conv1.bias") || strstr(name, "encoder.conv2.bias") || 
-                   strstr(name, "encoder.conv3.bias")) {
-            ne[0] = hp.audio_conv_channels;
-            n_dims = 1;
-        } else if (strstr(name, "encoder.conv_out.weight")) {
-            ne[0] = hp.audio_conv_channels * 16;
-            ne[1] = hp.audio_d_model;
-            n_dims = 2;
-        } else if (strstr(name, "audio.encoder.blk.")) {
-            int layer_idx = -1;
-            if (sscanf(name, "audio.encoder.blk.%d.", &layer_idx) == 1 && 
-                layer_idx >= 0 && layer_idx < hp.audio_encoder_layers) {
-                
-                if (strstr(name, "attn_q.weight") || strstr(name, "attn_k.weight") || 
-                    strstr(name, "attn_v.weight") || strstr(name, "attn_out.weight")) {
-                    ne[0] = hp.audio_d_model;
-                    ne[1] = hp.audio_d_model;
-                    n_dims = 2;
-                } else if (strstr(name, "attn_q.bias") || strstr(name, "attn_k.bias") || 
-                           strstr(name, "attn_v.bias") || strstr(name, "attn_out.bias") ||
-                           strstr(name, "attn_norm.weight") || strstr(name, "attn_norm.bias")) {
-                    ne[0] = hp.audio_d_model;
-                    n_dims = 1;
-                } else if (strstr(name, "ffn_up.weight")) {
-                    ne[0] = hp.audio_d_model;
-                    ne[1] = hp.audio_ffn_dim;
-                    n_dims = 2;
-                } else if (strstr(name, "ffn_down.weight")) {
-                    ne[0] = hp.audio_ffn_dim;
-                    ne[1] = hp.audio_d_model;
-                    n_dims = 2;
-                } else if (strstr(name, "ffn_up.bias")) {
-                    ne[0] = hp.audio_ffn_dim;
-                    n_dims = 1;
-                } else if (strstr(name, "ffn_down.bias") || strstr(name, "ffn_norm.weight") || 
-                           strstr(name, "ffn_norm.bias")) {
-                    ne[0] = hp.audio_d_model;
-                    n_dims = 1;
-                }
-            }
-        } else if (strstr(name, "encoder.ln_post.weight") || strstr(name, "encoder.ln_post.bias")) {
-            ne[0] = hp.audio_d_model;
-            n_dims = 1;
-        } else if (strstr(name, "encoder.proj1.weight")) {
-            ne[0] = hp.audio_d_model;
-            ne[1] = hp.audio_d_model;
-            n_dims = 2;
-        } else if (strstr(name, "encoder.proj1.bias")) {
-            ne[0] = hp.audio_d_model;
-            n_dims = 1;
-        } else if (strstr(name, "encoder.proj2.weight")) {
-            ne[0] = hp.audio_d_model;
-            ne[1] = hp.text_hidden_size;
-            n_dims = 2;
-        } else if (strstr(name, "encoder.proj2.bias")) {
-            ne[0] = hp.text_hidden_size;
-            n_dims = 1;
-        } else if (strstr(name, "token_embd.weight")) {
-            ne[0] = hp.text_hidden_size;
-            ne[1] = hp.vocab_size;
-            n_dims = 2;
-        } else if (strstr(name, "output_norm.weight")) {
-            ne[0] = hp.text_hidden_size;
-            n_dims = 1;
-        } else if (strstr(name, "output.weight") && !strstr(name, "attn_output.weight")) {
-            ne[0] = hp.text_hidden_size;
-            ne[1] = hp.classify_num;
-            n_dims = 2;
-        } else if (strstr(name, "blk.") && !strstr(name, "audio.encoder.blk.")) {
-            int layer_idx = -1;
-            if (sscanf(name, "blk.%d.", &layer_idx) == 1 && 
-                layer_idx >= 0 && layer_idx < hp.text_decoder_layers) {
-                
-                if (strstr(name, "attn_norm.weight")) {
-                    ne[0] = hp.text_hidden_size;
-                    n_dims = 1;
-                } else if (strstr(name, "attn_q_norm.weight") || strstr(name, "attn_k_norm.weight")) {
-                    ne[0] = hp.text_head_dim;
-                    n_dims = 1;
-                } else if (strstr(name, "attn_q.weight")) {
-                    ne[0] = hp.text_hidden_size;
-                    ne[1] = hp.text_attention_heads * hp.text_head_dim;
-                    n_dims = 2;
-                } else if (strstr(name, "attn_k.weight")) {
-                    ne[0] = hp.text_hidden_size;
-                    ne[1] = hp.text_kv_heads * hp.text_head_dim;
-                    n_dims = 2;
-                } else if (strstr(name, "attn_v.weight")) {
-                    ne[0] = hp.text_hidden_size;
-                    ne[1] = hp.text_kv_heads * hp.text_head_dim;
-                    n_dims = 2;
-                } else if (strstr(name, "attn_output.weight")) {
-                    ne[0] = hp.text_attention_heads * hp.text_head_dim;
-                    ne[1] = hp.text_hidden_size;
-                    n_dims = 2;
-                } else if (strstr(name, "ffn_norm.weight")) {
-                    ne[0] = hp.text_hidden_size;
-                    n_dims = 1;
-                } else if (strstr(name, "ffn_gate.weight") || strstr(name, "ffn_up.weight")) {
-                    ne[0] = hp.text_hidden_size;
-                    ne[1] = hp.text_intermediate_size;
-                    n_dims = 2;
-                } else if (strstr(name, "ffn_down.weight")) {
-                    ne[0] = hp.text_intermediate_size;
-                    ne[1] = hp.text_hidden_size;
-                    n_dims = 2;
-                }
-            }
-        } else {
-            continue;
-        }
-        
-        if (n_dims == 0) continue;
-        
-        struct ggml_tensor * tensor = ggml_new_tensor(model_.ctx, type, n_dims, ne);
-        if (!tensor) {
-            error_msg_ = "Failed to create tensor: " + std::string(name);
-            return false;
-        }
-        ggml_set_name(tensor, name);
+        const char * name = ggml_get_name(tensor);
         model_.tensors[name] = tensor;
         
-        if (strstr(name, "encoder.conv1.weight")) {
-            model_.conv2d1_w = tensor;
-        } else if (strstr(name, "encoder.conv1.bias")) {
-            model_.conv2d1_b = tensor;
-        } else if (strstr(name, "encoder.conv2.weight")) {
-            model_.conv2d2_w = tensor;
-        } else if (strstr(name, "encoder.conv2.bias")) {
-            model_.conv2d2_b = tensor;
-        } else if (strstr(name, "encoder.conv3.weight")) {
-            model_.conv2d3_w = tensor;
-        } else if (strstr(name, "encoder.conv3.bias")) {
-            model_.conv2d3_b = tensor;
-        } else if (strstr(name, "encoder.conv_out.weight")) {
-            model_.conv_out_w = tensor;
-        } else if (strstr(name, "encoder.ln_post.weight")) {
-            model_.ln_post_w = tensor;
-        } else if (strstr(name, "encoder.ln_post.bias")) {
-            model_.ln_post_b = tensor;
-        } else if (strstr(name, "encoder.proj1.weight")) {
-            model_.proj1_w = tensor;
-        } else if (strstr(name, "encoder.proj1.bias")) {
-            model_.proj1_b = tensor;
-        } else if (strstr(name, "encoder.proj2.weight")) {
-            model_.proj2_w = tensor;
-        } else if (strstr(name, "encoder.proj2.bias")) {
-            model_.proj2_b = tensor;
-        } else if (strstr(name, "audio.encoder.blk.")) {
+        // Forced aligner encoder uses "audio.blk.X." naming (not "audio.encoder.blk.X.")
+        if (strstr(name, "audio.blk.")) {
             int layer_idx = -1;
-            if (sscanf(name, "audio.encoder.blk.%d.", &layer_idx) == 1 && 
+            if (sscanf(name, "audio.blk.%d.", &layer_idx) == 1 && 
                 layer_idx >= 0 && layer_idx < hp.audio_encoder_layers) {
                 auto & layer = model_.encoder_layers[layer_idx];
                 
@@ -379,37 +209,67 @@ bool ForcedAligner::create_tensors(struct gguf_context * ctx) {
                 else if (strstr(name, "ffn_norm.weight")) layer.ffn_norm_w = tensor;
                 else if (strstr(name, "ffn_norm.bias")) layer.ffn_norm_b = tensor;
             }
-        } else if (strstr(name, "token_embd.weight")) {
-            model_.token_embd = tensor;
-        } else if (strstr(name, "output_norm.weight")) {
-            model_.output_norm = tensor;
-        } else if (strstr(name, "output.weight") && !strstr(name, "attn_output.weight")) {
-            model_.classify_head_w = tensor;
-        } else if (strstr(name, "blk.") && !strstr(name, "audio.encoder.blk.")) {
+        }
+        // Decoder uses plain "blk.X." naming
+        else if (strstr(name, "blk.")) {
             int layer_idx = -1;
             if (sscanf(name, "blk.%d.", &layer_idx) == 1 && 
                 layer_idx >= 0 && layer_idx < hp.text_decoder_layers) {
                 auto & layer = model_.decoder_layers[layer_idx];
                 
-                if (strstr(name, "attn_norm.weight")) layer.attn_norm = tensor;
+                if (strstr(name, "attn_output.weight")) layer.attn_output = tensor;
+                else if (strstr(name, "attn_norm.weight")) layer.attn_norm = tensor;
                 else if (strstr(name, "attn_q_norm.weight")) layer.attn_q_norm = tensor;
                 else if (strstr(name, "attn_k_norm.weight")) layer.attn_k_norm = tensor;
                 else if (strstr(name, "attn_q.weight")) layer.attn_q = tensor;
                 else if (strstr(name, "attn_k.weight")) layer.attn_k = tensor;
                 else if (strstr(name, "attn_v.weight")) layer.attn_v = tensor;
-                else if (strstr(name, "attn_output.weight")) layer.attn_output = tensor;
                 else if (strstr(name, "ffn_norm.weight")) layer.ffn_norm = tensor;
                 else if (strstr(name, "ffn_gate.weight")) layer.ffn_gate = tensor;
                 else if (strstr(name, "ffn_up.weight")) layer.ffn_up = tensor;
                 else if (strstr(name, "ffn_down.weight")) layer.ffn_down = tensor;
             }
         }
+        // Conv layers - forced aligner uses "audio.conv.N.weight" naming
+        else if (strstr(name, "audio.conv.1.weight")) {
+            model_.conv2d1_w = tensor;
+        } else if (strstr(name, "audio.conv.1.bias")) {
+            model_.conv2d1_b = tensor;
+        } else if (strstr(name, "audio.conv.2.weight")) {
+            model_.conv2d2_w = tensor;
+        } else if (strstr(name, "audio.conv.2.bias")) {
+            model_.conv2d2_b = tensor;
+        } else if (strstr(name, "audio.conv.3.weight")) {
+            model_.conv2d3_w = tensor;
+        } else if (strstr(name, "audio.conv.3.bias")) {
+            model_.conv2d3_b = tensor;
+        } else if (strstr(name, "audio.conv_out.weight")) {
+            model_.conv_out_w = tensor;
+        } else if (strstr(name, "audio.ln_post.weight")) {
+            model_.ln_post_w = tensor;
+        } else if (strstr(name, "audio.ln_post.bias")) {
+            model_.ln_post_b = tensor;
+        } else if (strstr(name, "audio.proj1.weight")) {
+            model_.proj1_w = tensor;
+        } else if (strstr(name, "audio.proj1.bias")) {
+            model_.proj1_b = tensor;
+        } else if (strstr(name, "audio.proj2.weight")) {
+            model_.proj2_w = tensor;
+        } else if (strstr(name, "audio.proj2.bias")) {
+            model_.proj2_b = tensor;
+        } else if (strstr(name, "token_embd.weight")) {
+            model_.token_embd = tensor;
+        } else if (strstr(name, "output_norm.weight")) {
+            model_.output_norm = tensor;
+        } else if (strstr(name, "output.weight")) {
+            model_.classify_head_w = tensor;
+        }
     }
     
     return true;
 }
 
-bool ForcedAligner::load_tensor_data(const std::string & path, struct gguf_context * ctx) {
+bool ForcedAligner::load_tensor_data(const std::string & path, struct gguf_context * ctx_gguf) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         error_msg_ = "Failed to open file for mmap: " + path;
@@ -434,42 +294,63 @@ bool ForcedAligner::load_tensor_data(const std::string & path, struct gguf_conte
     model_.mmap_addr = mmap_addr;
     model_.mmap_size = st.st_size;
     
-    const size_t data_offset = gguf_get_data_offset(ctx);
-    const size_t total_size = st.st_size - data_offset;
+    const size_t data_offset = gguf_get_data_offset(ctx_gguf);
     uint8_t * data_base = (uint8_t *)mmap_addr + data_offset;
     
-    const int64_t n_tensors = gguf_get_n_tensors(ctx);
-    size_t max_tensor_size = 0;
-    for (int64_t i = 0; i < n_tensors; ++i) {
-        size_t sz = gguf_get_tensor_size(ctx, i);
-        if (sz > max_tensor_size) max_tensor_size = sz;
-    }
-
+    // Following llama.cpp: use ggml_backend_alloc_ctx_tensors_from_buft
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    ggml_backend_buffer_type_t buft = nullptr;
+    
     if (gpu_dev) {
-        model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+        const char * dev_name = ggml_backend_dev_name(gpu_dev);
+        if (strstr(dev_name, "Metal") != nullptr) {
+            buft = ggml_backend_dev_buffer_type(gpu_dev);
+        }
+#ifdef GGML_USE_CUDA
+        else {
+            buft = ggml_backend_cuda_buffer_type(0);
+        }
+#endif
     }
-    if (!model_.buffer) {
-        model_.buffer = ggml_backend_cpu_buffer_from_ptr(data_base, total_size);
+    
+    if (!buft) {
+        buft = ggml_backend_cpu_buffer_type();
     }
+    
+    model_.buffer = ggml_backend_alloc_ctx_tensors_from_buft(model_.ctx, buft);
     if (!model_.buffer) {
-        error_msg_ = "Failed to create buffer from mmap";
+        error_msg_ = "Failed to allocate context tensors with buffer type";
         munmap(mmap_addr, st.st_size);
         model_.mmap_addr = nullptr;
         model_.mmap_size = 0;
         return false;
     }
     
+    fprintf(stderr, "info: forced aligner allocated %zu bytes for model weights\n", 
+            ggml_backend_buffer_get_size(model_.buffer));
+    
+    // Load tensor data for all tensors
+    const int64_t n_tensors = gguf_get_n_tensors(ctx_gguf);
     for (int64_t i = 0; i < n_tensors; ++i) {
-        const char * name = gguf_get_tensor_name(ctx, i);
-        size_t offset = gguf_get_tensor_offset(ctx, i);
+        const char * name = gguf_get_tensor_name(ctx_gguf, i);
+        struct ggml_tensor * tensor = ggml_get_tensor(model_.ctx, name);
+        if (!tensor) {
+            continue;
+        }
         
-        auto it = model_.tensors.find(name);
-        if (it == model_.tensors.end()) continue;
+        const size_t offset = gguf_get_tensor_offset(ctx_gguf, i);
+        const size_t sz = ggml_nbytes(tensor);
         
-        struct ggml_tensor * tensor = it->second;
-        tensor->buffer = model_.buffer;
-        tensor->data = data_base + offset;
+        ggml_backend_tensor_set(tensor, data_base + offset, 0, sz);
+    }
+    
+    if (gpu_dev) {
+        const char * dev_name = ggml_backend_dev_name(gpu_dev);
+        if (strstr(dev_name, "Metal") == nullptr) {
+            munmap(mmap_addr, st.st_size);
+            model_.mmap_addr = nullptr;
+            model_.mmap_size = 0;
+        }
     }
     
     return true;
@@ -635,6 +516,12 @@ bool ForcedAligner::encode_audio(const float * mel_data, int n_mel, int n_frames
         max_chunk_len, n_mel, 1, n_chunks);
     ggml_set_name(mel_batch, "mel_batch");
     ggml_set_input(mel_batch);
+
+    if (!model_.conv2d1_w) {
+        error_msg_ = "conv2d1_w is null - tensor not loaded";
+        ggml_free(ctx0);
+        return false;
+    }
 
     struct ggml_tensor * cur = ggml_conv_2d(ctx0, model_.conv2d1_w, mel_batch, 2, 2, 1, 1, 1, 1);
     if (model_.conv2d1_b) {
