@@ -237,6 +237,13 @@ void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
     qwen3asr_handle asr = static_cast<qwen3asr_handle>(asr_handle_);
     qwen3aligner_handle aligner = aligner_handle_ ? static_cast<qwen3aligner_handle>(aligner_handle_) : nullptr;
     
+    // Process requests sequentially within the batch
+    // Note: True parallel batch processing would require refactoring to use 
+    // transcribe_batch() API which processes multiple audio files in parallel.
+    // Current implementation batches requests to reduce overhead but processes
+    // them sequentially for correctness.
+    LOG_INFO("Processing {} requests in batch (sequential within batch)", batch.size());
+    
     for (auto& req : batch) {
         try {
             LOG_INFO("Processing request {} type={}", req.request_id, static_cast<int>(req.type));
