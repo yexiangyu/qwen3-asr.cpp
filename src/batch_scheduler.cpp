@@ -81,7 +81,7 @@ void BatchScheduler::set_batch_size(int size) {
 }
 
 void BatchScheduler::set_timeout_ms(int ms) {
-    config_.batch_timeout_ms = std::max(10, std::min(1000, ms));
+    config_.batch_timeout_ms = std::max(10, std::min(60000, ms));
     LOG_INFO("Batch timeout set to {}ms", config_.batch_timeout_ms);
 }
 
