@@ -14,6 +14,7 @@ struct ASRServerConfig {
     int n_threads = 4;
     int max_tokens = 1024;
     std::string default_language = "";
+    std::string device = "";
 };
 
 class ASRServer {

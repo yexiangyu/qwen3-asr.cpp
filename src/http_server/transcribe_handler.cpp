@@ -86,8 +86,15 @@ bool ASRServer::init() {
     LOG_INFO("  Model path: {}", config_.asr_model_path);
     LOG_INFO("  Threads: {}", config_.n_threads);
     LOG_INFO("  Max tokens: {}", config_.max_tokens);
+    LOG_INFO("  Device: {}", config_.device.empty() ? "(auto)" : config_.device);
     
-    int ret = qwen3asr_init(&handle_);
+    int ret;
+    if (!config_.device.empty()) {
+        ret = qwen3asr_init_with_device_name(&handle_, config_.device.c_str());
+    } else {
+        ret = qwen3asr_init(&handle_);
+    }
+    
     if (ret != 0) {
         LOG_ERROR("Failed to init ASR handle: {}", qwen3_get_last_error());
         return false;
@@ -102,7 +109,7 @@ bool ASRServer::init() {
     }
     
     model_loaded_ = true;
-    LOG_INFO("ASRServer initialized successfully");
+    LOG_INFO("ASRServer initialized successfully on device: {}", qwen3asr_get_device_name(handle_));
     return true;
 }
 

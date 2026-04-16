@@ -14,6 +14,7 @@ struct ServerConfig {
     int port = 8080;
     int n_threads = 4;
     std::string default_language = "";
+    std::string device = "";
 };
 
 class AlignServer {

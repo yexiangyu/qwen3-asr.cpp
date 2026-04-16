@@ -104,8 +104,15 @@ bool AlignServer::init() {
     LOG_INFO("  Model path: {}", config_.aligner_model_path);
     LOG_INFO("  Korean dict: {}", config_.korean_dict_path.empty() ? "(none)" : config_.korean_dict_path);
     LOG_INFO("  Threads: {}", config_.n_threads);
+    LOG_INFO("  Device: {}", config_.device.empty() ? "(auto)" : config_.device);
     
-    int ret = qwen3aligner_init(&handle_);
+    int ret;
+    if (!config_.device.empty()) {
+        ret = qwen3aligner_init_with_device_name(&handle_, config_.device.c_str());
+    } else {
+        ret = qwen3aligner_init(&handle_);
+    }
+    
     if (ret != 0) {
         LOG_ERROR("Failed to init aligner handle: {}", qwen3_get_last_error());
         return false;
@@ -127,7 +134,7 @@ bool AlignServer::init() {
     }
     
     model_loaded_ = true;
-    LOG_INFO("AlignServer initialized successfully");
+    LOG_INFO("AlignServer initialized successfully on device: {}", qwen3aligner_get_device_name(handle_));
     return true;
 }
 

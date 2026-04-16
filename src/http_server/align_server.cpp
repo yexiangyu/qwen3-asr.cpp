@@ -16,6 +16,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --threads <num>        Processing threads (default: 4)\n");
     fprintf(stderr, "  --korean-dict <path>   Korean dictionary path\n");
     fprintf(stderr, "  --default-language <lang>  Default language\n");
+    fprintf(stderr, "  --device <name>        GPU device name (e.g. CUDA0, CUDA1, Metal)\n");
     fprintf(stderr, "  --help                 Show this message\n");
 }
 
@@ -48,6 +49,8 @@ int run_server(int argc, char** argv) {
             config.korean_dict_path = argv[++i];
         } else if (strcmp(argv[i], "--default-language") == 0 && i + 1 < argc) {
             config.default_language = argv[++i];
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            config.device = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
