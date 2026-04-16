@@ -314,10 +314,16 @@ bool TextDecoder::init_kv_cache(int32_t n_ctx) {
     free_kv_cache(state_.cache);
     
     state_.cache.n_ctx = n_ctx;
-    state_.cache.n_used = 0;
+    state_.cache.head = 0;
+    state_.cache.n = 0;
     state_.cache.head_dim = cfg.head_dim;
     state_.cache.n_kv_heads = cfg.n_key_value_heads;
     state_.cache.n_layers = cfg.n_decoder_layers;
+    
+    state_.cache.cells.resize(n_ctx);
+    for (int i = 0; i < n_ctx; ++i) {
+        state_.cache.cells[i].pos = -1;
+    }
     
     const size_t n_tensors = cfg.n_decoder_layers * 2;
     const size_t ctx_size = n_tensors * ggml_tensor_overhead();
@@ -359,13 +365,52 @@ bool TextDecoder::init_kv_cache(int32_t n_ctx) {
     return true;
 }
 
+int32_t kv_cache_batched::alloc_seq(kv_seq_id seq_id, int32_t n_tokens) {
+    int32_t start = head;
+    for (int i = 0; i < n_tokens; ++i) {
+        cells[head + i].pos = i;
+        cells[head + i].seq_id.insert(seq_id);
+    }
+    head += n_tokens;
+    n = head;
+    return start;
+}
+
+void kv_cache_batched::free_seq(kv_seq_id seq_id) {
+    for (int32_t i = 0; i < n_ctx; ++i) {
+        cells[i].seq_id.erase(seq_id);
+    }
+}
+
+void kv_cache_batched::clear_all() {
+    head = 0;
+    n = 0;
+    for (int i = 0; i < n_ctx; ++i) {
+        cells[i].pos = -1;
+        cells[i].seq_id.clear();
+    }
+}
+
 void TextDecoder::clear_kv_cache() {
-    state_.cache.n_used = 0;
+    state_.cache.clear_all();
+}
+
+int32_t TextDecoder::kv_alloc_seq(kv_seq_id seq_id, int32_t n_tokens) {
+    return state_.cache.alloc_seq(seq_id, n_tokens);
+}
+
+void TextDecoder::kv_free_seq(kv_seq_id seq_id) {
+    state_.cache.free_seq(seq_id);
+}
+
+void TextDecoder::kv_clear_all() {
+    state_.cache.clear_all();
 }
 
 struct ggml_cgraph * TextDecoder::build_graph(
     const int32_t * tokens, int32_t n_tokens, int32_t n_past,
     const float * audio_embd, int32_t n_audio, int32_t audio_start_pos) {
+    (void)tokens;
     
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
@@ -436,7 +481,6 @@ struct ggml_cgraph * TextDecoder::build_graph(
     
     const float KQscale = 1.0f / sqrtf(float(head_dim));
     
-    // Flash attention causal mask: [n_kv, n_tokens], F16
     int n_kv = n_past + n_tokens;
     struct ggml_tensor * fa_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, n_tokens);
     ggml_set_name(fa_mask, "fa_mask");
@@ -505,7 +549,203 @@ struct ggml_cgraph * TextDecoder::build_graph(
             head_dim, n_kv_head, n_kv,
             v_cache->nb[1], v_cache->nb[2], 0);
         
-        // flash_attn_ext expects: Q[head_dim, n_tokens, n_head], K[head_dim, n_kv, n_kv_head], V[head_dim, n_kv, n_kv_head]
+        struct ggml_tensor * Qfa = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+        
+        cur = ggml_flash_attn_ext(ctx0, Qfa, K, V, fa_mask, KQscale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx0, cur, n_head * head_dim, n_tokens);
+        
+        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = ggml_add(ctx0, cur, inpL);
+        struct ggml_tensor * inpFF = cur;
+        
+        cur = ggml_rms_norm(ctx0, inpFF, eps);
+        cur = ggml_mul(ctx0, cur, layer.ffn_norm);
+        
+        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+        struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+        
+        gate = ggml_silu(ctx0, gate);
+        
+        cur = ggml_mul(ctx0, gate, up);
+        
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        ggml_format_name(cur, "ffn_out_%d", il);
+        
+        inpL = ggml_add(ctx0, cur, inpFF);
+    }
+    
+    cur = inpL;
+
+    if (n_tokens > 1) {
+        cur = ggml_view_2d(ctx0, cur, hidden_size, 1, cur->nb[1], (n_tokens - 1) * cur->nb[1]);
+    }
+
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, model_.output_norm);
+    ggml_set_name(cur, "result_norm");
+    
+    cur = ggml_mul_mat(ctx0, model_.output, cur);
+    ggml_set_name(cur, "logits");
+    ggml_set_output(cur);
+    
+    ggml_build_forward_expand(gf, cur);
+    
+    ggml_free(ctx0);
+    
+    return gf;
+}
+
+struct ggml_cgraph * TextDecoder::build_graph_batch(
+    const decode_batch & batch,
+    const float * audio_embd, int32_t n_audio, int32_t audio_start_pos) {
+    
+    const auto & cfg = model_.config;
+    const int n_head = cfg.n_attention_heads;
+    const int n_kv_head = cfg.n_key_value_heads;
+    const int head_dim = cfg.head_dim;
+    const int hidden_size = cfg.hidden_size;
+    const float eps = cfg.rms_norm_eps;
+    const float rope_theta = cfg.rope_theta;
+    const int n_layer = cfg.n_decoder_layers;
+    
+    const int n_tokens = batch.n_tokens;
+    const int n_kv = state_.cache.n;
+    const int kv_head = state_.cache.head;
+    
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ state_.compute_meta.size(),
+        /*.mem_buffer =*/ state_.compute_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_ASR_MAX_NODES, false);
+    
+    struct ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(inp_tokens, "inp_tokens");
+    ggml_set_input(inp_tokens);
+    
+    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(inp_pos, "inp_pos");
+    ggml_set_input(inp_pos);
+    
+    struct ggml_tensor * inp_seq_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(inp_seq_ids, "inp_seq_ids");
+    ggml_set_input(inp_seq_ids);
+    
+    struct ggml_tensor * inp_audio = nullptr;
+    if (audio_embd && n_audio > 0) {
+        inp_audio = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, n_audio);
+        ggml_set_name(inp_audio, "inp_audio");
+        ggml_set_input(inp_audio);
+    }
+    
+    struct ggml_tensor * cur = ggml_get_rows(ctx0, model_.token_embd, inp_tokens);
+    
+    if (inp_audio && n_audio > 0 && audio_start_pos >= 0 && audio_start_pos + n_audio <= n_tokens) {
+        struct ggml_tensor * embd_before = nullptr;
+        struct ggml_tensor * embd_after = nullptr;
+        
+        if (audio_start_pos > 0) {
+            embd_before = ggml_view_2d(ctx0, cur, hidden_size, audio_start_pos,
+                                       cur->nb[1], 0);
+        }
+        
+        if (audio_start_pos + n_audio < n_tokens) {
+            int after_start = audio_start_pos + n_audio;
+            int after_len = n_tokens - after_start;
+            embd_after = ggml_view_2d(ctx0, cur, hidden_size, after_len,
+                                      cur->nb[1], after_start * cur->nb[1]);
+        }
+        
+        if (embd_before && embd_after) {
+            struct ggml_tensor * tmp = ggml_concat(ctx0, embd_before, inp_audio, 1);
+            cur = ggml_concat(ctx0, tmp, embd_after, 1);
+        } else if (embd_before) {
+            cur = ggml_concat(ctx0, embd_before, inp_audio, 1);
+        } else if (embd_after) {
+            cur = ggml_concat(ctx0, inp_audio, embd_after, 1);
+        } else {
+            cur = inp_audio;
+        }
+        ggml_set_name(cur, "embd_with_audio");
+        ggml_set_output(cur);
+    }
+    
+    struct ggml_tensor * inpL = cur;
+    
+    const float KQscale = 1.0f / sqrtf(float(head_dim));
+    
+    struct ggml_tensor * fa_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_set_name(fa_mask, "fa_mask");
+    ggml_set_input(fa_mask);
+    
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model_.layers[il];
+        
+        if (!layer.attn_norm || !layer.attn_q || !layer.attn_k || !layer.attn_v || 
+            !layer.attn_output || !layer.ffn_norm || !layer.ffn_gate || 
+            !layer.ffn_up || !layer.ffn_down) {
+            ggml_free(ctx0);
+            return nullptr;
+        }
+        
+        cur = ggml_rms_norm(ctx0, inpL, eps);
+        cur = ggml_mul(ctx0, cur, layer.attn_norm);
+        
+        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+        
+        Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        
+        if (layer.attn_q_norm) {
+            Qcur = ggml_rms_norm(ctx0, Qcur, eps);
+            Qcur = ggml_mul(ctx0, Qcur, layer.attn_q_norm);
+        }
+        
+        if (layer.attn_k_norm) {
+            Kcur = ggml_rms_norm(ctx0, Kcur, eps);
+            Kcur = ggml_mul(ctx0, Kcur, layer.attn_k_norm);
+        }
+        
+        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
+                             head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                             rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        
+        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
+                             head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                             rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        
+        struct ggml_tensor * k_cache = state_.cache.k_cache[il];
+        struct ggml_tensor * v_cache = state_.cache.v_cache[il];
+        
+        struct ggml_tensor * k_cache_view = ggml_view_3d(ctx0, k_cache,
+            head_dim, n_kv_head, n_tokens,
+            k_cache->nb[1], k_cache->nb[2],
+            kv_head * k_cache->nb[2]);
+        
+        struct ggml_tensor * v_cache_view = ggml_view_3d(ctx0, v_cache,
+            head_dim, n_kv_head, n_tokens,
+            v_cache->nb[1], v_cache->nb[2],
+            kv_head * v_cache->nb[2]);
+        
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k_cache_view));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v_cache_view));
+        
+        struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
+            head_dim, n_kv_head, n_kv,
+            k_cache->nb[1], k_cache->nb[2], 0);
+        
+        struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
+            head_dim, n_kv_head, n_kv,
+            v_cache->nb[1], v_cache->nb[2], 0);
+        
         struct ggml_tensor * Qfa = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
@@ -583,7 +823,29 @@ bool TextDecoder::forward_with_audio(
         return false;
     }
     
-    struct ggml_cgraph * gf = build_graph(tokens, n_tokens, n_past,
+    decode_batch batch;
+    std::vector<int32_t> tokens_vec(tokens, tokens + n_tokens);
+    std::vector<int32_t> pos_vec(n_tokens);
+    std::vector<int32_t> seq_vec(n_tokens, 0);
+    
+    for (int i = 0; i < n_tokens; ++i) {
+        pos_vec[i] = n_past + i;
+    }
+    
+    batch.n_tokens = n_tokens;
+    batch.token_ids = tokens_vec.data();
+    batch.positions = pos_vec.data();
+    batch.seq_ids = seq_vec.data();
+    batch.n_seqs = 1;
+    batch.seq_n_tokens = nullptr;
+    
+    for (int i = 0; i < n_tokens; ++i) {
+        state_.cache.cells[state_.cache.head + i].pos = pos_vec[i];
+        state_.cache.cells[state_.cache.head + i].seq_id.insert(0);
+    }
+    state_.cache.n = state_.cache.head + n_tokens;
+    
+    struct ggml_cgraph * gf = build_graph_batch(batch,
                                           audio_embd, n_audio, audio_start_pos);
     
     if (!gf) {
@@ -606,22 +868,30 @@ bool TextDecoder::forward_with_audio(
     
     struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
     if (inp_pos) {
-        std::vector<int32_t> positions(n_tokens);
-        for (int i = 0; i < n_tokens; ++i) {
-            positions[i] = n_past + i;
-        }
-        ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
+        ggml_backend_tensor_set(inp_pos, pos_vec.data(), 0, n_tokens * sizeof(int32_t));
+    }
+    
+    struct ggml_tensor * inp_seq_ids = ggml_graph_get_tensor(gf, "inp_seq_ids");
+    if (inp_seq_ids) {
+        ggml_backend_tensor_set(inp_seq_ids, seq_vec.data(), 0, n_tokens * sizeof(int32_t));
     }
     
     struct ggml_tensor * fa_mask_t = ggml_graph_get_tensor(gf, "fa_mask");
     if (fa_mask_t) {
-        int n_kv = n_past + n_tokens;
+        int n_kv = state_.cache.n;
         std::vector<ggml_fp16_t> mask_data((size_t)n_kv * n_tokens);
         const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t neginf_f16 = ggml_fp32_to_fp16(-INFINITY);
         for (int q = 0; q < n_tokens; ++q) {
+            kv_seq_id seq_id_q = seq_vec[q];
+            kv_pos pos_q = pos_vec[q];
             for (int k = 0; k < n_kv; ++k) {
-                mask_data[k + q * n_kv] = (k <= n_past + q) ? zero_f16 : neginf_f16;
+                if (!state_.cache.cells[k].has_seq_id(seq_id_q) ||
+                    state_.cache.cells[k].pos > pos_q) {
+                    mask_data[k + q * n_kv] = neginf_f16;
+                } else {
+                    mask_data[k + q * n_kv] = zero_f16;
+                }
             }
         }
         ggml_backend_tensor_set(fa_mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
@@ -656,7 +926,120 @@ bool TextDecoder::forward_with_audio(
     output.resize(n_logit_rows * vocab_size);
     ggml_backend_tensor_get(logits, output.data(), 0, output.size() * sizeof(float));
     
-    state_.cache.n_used = n_past + n_tokens;
+    state_.cache.head += n_tokens;
+    
+    ggml_backend_sched_reset(state_.sched);
+    
+    return true;
+}
+
+bool TextDecoder::forward_batch(const decode_batch & batch,
+                                const float * audio_embd, int32_t n_audio,
+                                int32_t audio_start_pos,
+                                std::vector<float> & output) {
+    QWEN3_TIMER("decoder.forward_batch");
+    
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    
+    if (state_.cache.n_ctx == 0) {
+        if (!init_kv_cache(1024)) {
+            return false;
+        }
+    }
+    
+    if (state_.cache.head + batch.n_tokens > state_.cache.n_ctx) {
+        error_msg_ = "Context length exceeded";
+        return false;
+    }
+    
+    for (int i = 0; i < batch.n_tokens; ++i) {
+        state_.cache.cells[state_.cache.head + i].pos = batch.positions[i];
+        state_.cache.cells[state_.cache.head + i].seq_id.insert(batch.seq_ids[i]);
+    }
+    state_.cache.n = state_.cache.head + batch.n_tokens;
+    
+    struct ggml_cgraph * gf = build_graph_batch(batch,
+                                          audio_embd, n_audio, audio_start_pos);
+    
+    if (!gf) {
+        error_msg_ = "Failed to build graph";
+        return false;
+    }
+    
+    if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+        error_msg_ = "Failed to allocate graph";
+        return false;
+    }
+    
+    struct ggml_tensor * inp_tokens = ggml_graph_get_tensor(gf, "inp_tokens");
+    if (inp_tokens) {
+        ggml_backend_tensor_set(inp_tokens, batch.token_ids, 0, batch.n_tokens * sizeof(int32_t));
+    }
+    
+    struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
+    if (inp_pos) {
+        ggml_backend_tensor_set(inp_pos, batch.positions, 0, batch.n_tokens * sizeof(int32_t));
+    }
+    
+    struct ggml_tensor * inp_seq_ids = ggml_graph_get_tensor(gf, "inp_seq_ids");
+    if (inp_seq_ids) {
+        ggml_backend_tensor_set(inp_seq_ids, batch.seq_ids, 0, batch.n_tokens * sizeof(int32_t));
+    }
+    
+    struct ggml_tensor * fa_mask_t = ggml_graph_get_tensor(gf, "fa_mask");
+    if (fa_mask_t) {
+        int n_kv = state_.cache.n;
+        std::vector<ggml_fp16_t> mask_data((size_t)n_kv * batch.n_tokens);
+        const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neginf_f16 = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < batch.n_tokens; ++q) {
+            kv_seq_id seq_id_q = batch.seq_ids[q];
+            kv_pos pos_q = batch.positions[q];
+            for (int k = 0; k < n_kv; ++k) {
+                if (!state_.cache.cells[k].has_seq_id(seq_id_q) ||
+                    state_.cache.cells[k].pos > pos_q) {
+                    mask_data[k + q * n_kv] = neginf_f16;
+                } else {
+                    mask_data[k + q * n_kv] = zero_f16;
+                }
+            }
+        }
+        ggml_backend_tensor_set(fa_mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
+    
+    if (audio_embd && n_audio > 0) {
+        struct ggml_tensor * inp_audio = ggml_graph_get_tensor(gf, "inp_audio");
+        if (inp_audio) {
+            ggml_backend_tensor_set(inp_audio, audio_embd, 0,
+                                    n_audio * model_.config.hidden_size * sizeof(float));
+        }
+    }
+    
+    {
+        QWEN3_TIMER("decoder.compute");
+        if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+            error_msg_ = "Failed to compute graph";
+            ggml_backend_sched_reset(state_.sched);
+            return false;
+        }
+    }
+    
+    struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
+    if (!logits) {
+        error_msg_ = "Failed to find logits tensor";
+        ggml_backend_sched_reset(state_.sched);
+        return false;
+    }
+    
+    int64_t vocab_size = logits->ne[0];
+    int64_t n_logit_rows = logits->ne[1];
+    output.resize(n_logit_rows * vocab_size);
+    ggml_backend_tensor_get(logits, output.data(), 0, output.size() * sizeof(float));
+    
+    state_.cache.head += batch.n_tokens;
     
     ggml_backend_sched_reset(state_.sched);
     
@@ -677,36 +1060,69 @@ bool TextDecoder::forward_debug(const int32_t * tokens, int32_t n_tokens, int32_
         }
     }
     
-    struct ggml_cgraph * gf = build_graph(tokens, n_tokens, n_past, nullptr, 0, -1);
+    std::vector<int32_t> pos_vec(n_tokens);
+    std::vector<int32_t> seq_vec(n_tokens, 0);
+    for (int i = 0; i < n_tokens; ++i) {
+        pos_vec[i] = n_past + i;
+    }
+    
+    for (int i = 0; i < n_tokens; ++i) {
+        state_.cache.cells[state_.cache.head + i].pos = pos_vec[i];
+        state_.cache.cells[state_.cache.head + i].seq_id.insert(0);
+    }
+    state_.cache.n = state_.cache.head + n_tokens;
+    
+    decode_batch batch;
+    batch.n_tokens = n_tokens;
+    batch.token_ids = const_cast<int32_t*>(tokens);
+    batch.positions = pos_vec.data();
+    batch.seq_ids = seq_vec.data();
+    batch.n_seqs = 1;
+    batch.seq_n_tokens = nullptr;
+    
+    struct ggml_cgraph * gf = build_graph_batch(batch, nullptr, 0, -1);
+    
+    if (!gf) {
+        error_msg_ = "Failed to build graph";
+        return false;
+    }
     
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
     
-    struct ggml_tensor * inp_tokens = ggml_graph_get_tensor(gf, "inp_tokens");
-    if (inp_tokens) {
-        ggml_backend_tensor_set(inp_tokens, tokens, 0, n_tokens * sizeof(int32_t));
+    struct ggml_tensor * inp_tokens_t = ggml_graph_get_tensor(gf, "inp_tokens");
+    if (inp_tokens_t) {
+        ggml_backend_tensor_set(inp_tokens_t, tokens, 0, n_tokens * sizeof(int32_t));
     }
     
     struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
     if (inp_pos) {
-        std::vector<int32_t> positions(n_tokens);
-        for (int i = 0; i < n_tokens; ++i) {
-            positions[i] = n_past + i;
-        }
-        ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
+        ggml_backend_tensor_set(inp_pos, pos_vec.data(), 0, n_tokens * sizeof(int32_t));
+    }
+    
+    struct ggml_tensor * inp_seq_ids = ggml_graph_get_tensor(gf, "inp_seq_ids");
+    if (inp_seq_ids) {
+        ggml_backend_tensor_set(inp_seq_ids, seq_vec.data(), 0, n_tokens * sizeof(int32_t));
     }
     
     struct ggml_tensor * fa_mask_t = ggml_graph_get_tensor(gf, "fa_mask");
     if (fa_mask_t) {
-        int n_kv = n_past + n_tokens;
+        int n_kv = state_.cache.n;
         std::vector<ggml_fp16_t> mask_data((size_t)n_kv * n_tokens);
         const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t neginf_f16 = ggml_fp32_to_fp16(-INFINITY);
         for (int q = 0; q < n_tokens; ++q) {
+            kv_seq_id seq_id_q = seq_vec[q];
+            kv_pos pos_q = pos_vec[q];
             for (int k = 0; k < n_kv; ++k) {
-                mask_data[k + q * n_kv] = (k <= n_past + q) ? zero_f16 : neginf_f16;
+                if (!state_.cache.cells[k].has_seq_id(seq_id_q) ||
+                    state_.cache.cells[k].pos > pos_q) {
+                    mask_data[k + q * n_kv] = neginf_f16;
+                } else {
+                    mask_data[k + q * n_kv] = zero_f16;
+                }
             }
         }
         ggml_backend_tensor_set(fa_mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
@@ -737,7 +1153,7 @@ bool TextDecoder::forward_debug(const int32_t * tokens, int32_t n_tokens, int32_
         }
     }
     
-    state_.cache.n_used = n_past + n_tokens;
+    state_.cache.head += n_tokens;
     ggml_backend_sched_reset(state_.sched);
     
     return true;
@@ -761,7 +1177,7 @@ void free_decoder_model(text_decoder_model & model) {
     model.layers.clear();
 }
 
-void free_kv_cache(kv_cache & cache) {
+void free_kv_cache(kv_cache_batched & cache) {
     if (cache.buffer) {
         ggml_backend_buffer_free(cache.buffer);
         cache.buffer = nullptr;
@@ -772,8 +1188,34 @@ void free_kv_cache(kv_cache & cache) {
     }
     cache.k_cache.clear();
     cache.v_cache.clear();
+    cache.cells.clear();
     cache.n_ctx = 0;
-    cache.n_used = 0;
+    cache.head = 0;
+    cache.n = 0;
+}
+
+decode_batch decode_batch_init(int32_t n_tokens, int32_t n_seqs) {
+    decode_batch batch;
+    batch.n_tokens = n_tokens;
+    batch.token_ids = (int32_t *) malloc(sizeof(int32_t) * n_tokens);
+    batch.positions = (int32_t *) malloc(sizeof(int32_t) * n_tokens);
+    batch.seq_ids = (int32_t *) malloc(sizeof(int32_t) * n_tokens);
+    batch.n_seqs = n_seqs;
+    batch.seq_n_tokens = (int32_t *) malloc(sizeof(int32_t) * n_seqs);
+    return batch;
+}
+
+void decode_batch_free(decode_batch & batch) {
+    if (batch.token_ids) free(batch.token_ids);
+    if (batch.positions) free(batch.positions);
+    if (batch.seq_ids) free(batch.seq_ids);
+    if (batch.seq_n_tokens) free(batch.seq_n_tokens);
+    batch.token_ids = nullptr;
+    batch.positions = nullptr;
+    batch.seq_ids = nullptr;
+    batch.seq_n_tokens = nullptr;
+    batch.n_tokens = 0;
+    batch.n_seqs = 0;
 }
 
 bool TextDecoder::load_vocab(struct gguf_context * ctx) {

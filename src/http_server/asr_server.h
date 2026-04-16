@@ -1,8 +1,9 @@
 #pragma once
 
 #include "qwen3asr_c_api.h"
+#include "batch_scheduler.h"
 #include <string>
-#include <mutex>
+#include <memory>
 #include <vector>
 #include <cstdint>
 
@@ -18,6 +19,8 @@ struct CombinedServerConfig {
     std::string default_language = "";
     std::string asr_device = "";
     std::string aligner_device = "";
+    int max_batch_size = 2;
+    int batch_timeout_ms = 100;
 };
 
 class CombinedASRServer {
@@ -25,7 +28,7 @@ private:
     CombinedServerConfig config_;
     qwen3asr_handle asr_handle_;
     qwen3aligner_handle aligner_handle_;
-    std::mutex server_mutex_;
+    std::unique_ptr<BatchScheduler> batch_scheduler_;
     bool models_loaded_;
     
 public:

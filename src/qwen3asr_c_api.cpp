@@ -2,12 +2,16 @@
 #include "qwen3_asr.h"
 #include "forced_aligner.h"
 #include "logger.h"
+#include "batch_scheduler.h"
 #include "ggml-backend.h"
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <future>
 
 namespace {
 
@@ -939,6 +943,294 @@ void qwen3asr_free_combined_result(qwen3combined_result* result) {
         qwen3asr_free_result(&result->transcription);
         qwen3aligner_free_result(&result->alignment);
     }
+}
+
+int qwen3asr_transcribe_batch(
+    qwen3asr_handle handle,
+    const int16_t** pcm_samples,
+    const int32_t* n_samples,
+    int n_requests,
+    const qwen3asr_params* params,
+    qwen3asr_result* results
+) {
+    if (!handle || !handle->asr) {
+        g_last_error = "Invalid handle";
+        return -1;
+    }
+    
+    if (!pcm_samples || !n_samples || !results) {
+        g_last_error = "Null pointer argument";
+        return -1;
+    }
+    
+    if (n_requests <= 0) {
+        g_last_error = "Invalid number of requests";
+        return -1;
+    }
+    
+    std::vector<std::vector<float>> float_buffers(n_requests);
+    std::vector<const float*> float_ptrs(n_requests);
+    std::vector<int> sample_counts(n_requests);
+    
+    for (int i = 0; i < n_requests; ++i) {
+        if (!pcm_samples[i]) {
+            g_last_error = "Null PCM pointer at index " + std::to_string(i);
+            return -1;
+        }
+        if (n_samples[i] <= 0) {
+            g_last_error = "Invalid sample count at index " + std::to_string(i);
+            return -1;
+        }
+        float_buffers[i] = pcm_to_float(pcm_samples[i], n_samples[i]);
+        float_ptrs[i] = float_buffers[i].data();
+        sample_counts[i] = n_samples[i];
+    }
+    
+    qwen3_asr::transcribe_params tp;
+    if (params) {
+        tp.max_tokens = params->max_tokens;
+        tp.language = params->language ? params->language : "";
+        tp.context = params->context ? params->context : "";
+        tp.n_threads = params->n_threads;
+    }
+    
+    auto batch_results = handle->asr->transcribe_batch(float_ptrs, sample_counts, tp);
+    
+    if (batch_results.size() != static_cast<size_t>(n_requests)) {
+        g_last_error = "Batch transcription returned wrong number of results";
+        return -1;
+    }
+    
+    for (int i = 0; i < n_requests; ++i) {
+        const auto& br = batch_results[i];
+        
+        if (!br.success) {
+            results[i].text = nullptr;
+            results[i].text_content = nullptr;
+            results[i].token_ids = nullptr;
+            results[i].token_confs = nullptr;
+            results[i].n_tokens = 0;
+            results[i].t_mel_ms = 0;
+            results[i].t_encode_ms = 0;
+            results[i].t_decode_ms = 0;
+            results[i].t_total_ms = 0;
+            continue;
+        }
+        
+        results[i].text = strdup(br.text.c_str());
+        results[i].text_content = strdup(br.text_content.c_str());
+        
+        if (!results[i].text || !results[i].text_content) {
+            for (int j = 0; j <= i; ++j) {
+                if (results[j].text) free(results[j].text);
+                if (results[j].text_content) free(results[j].text_content);
+                if (results[j].token_ids) free(results[j].token_ids);
+                if (results[j].token_confs) free(results[j].token_confs);
+            }
+            g_last_error = "Failed to allocate memory for result strings";
+            return -1;
+        }
+        
+        results[i].n_tokens = static_cast<int32_t>(br.tokens.size());
+        results[i].t_mel_ms = 0;
+        results[i].t_encode_ms = 0;
+        results[i].t_decode_ms = 0;
+        results[i].t_total_ms = 0;
+        
+        if (br.tokens.size() > 0) {
+            results[i].token_ids = (int32_t*)malloc(br.tokens.size() * sizeof(int32_t));
+            results[i].token_confs = (float*)malloc(br.token_confs.size() * sizeof(float));
+            
+            if (!results[i].token_ids || !results[i].token_confs) {
+                for (int j = 0; j <= i; ++j) {
+                    if (results[j].text) free(results[j].text);
+                    if (results[j].text_content) free(results[j].text_content);
+                    if (results[j].token_ids) free(results[j].token_ids);
+                    if (results[j].token_confs) free(results[j].token_confs);
+                }
+                g_last_error = "Failed to allocate memory for token arrays";
+                return -1;
+            }
+            
+            for (size_t j = 0; j < br.tokens.size(); ++j) {
+                results[i].token_ids[j] = br.tokens[j];
+                results[i].token_confs[j] = br.token_confs[j];
+            }
+        } else {
+            results[i].token_ids = nullptr;
+            results[i].token_confs = nullptr;
+        }
+    }
+    
+    return 0;
+}
+
+struct qwen3_batch_scheduler_t {
+    qwen3_asr::BatchScheduler scheduler;
+    std::unordered_map<int, std::future<std::string>> pending_futures;
+    std::mutex futures_mutex;
+    int next_result_id;
+    
+    qwen3_batch_scheduler_t() : next_result_id(0) {}
+};
+
+qwen3_batch_scheduler_handle qwen3_batch_scheduler_init(
+    qwen3asr_handle asr,
+    qwen3aligner_handle aligner,
+    qwen3_batch_config config
+) {
+    if (!asr || !asr->asr) {
+        g_last_error = "Invalid ASR handle";
+        return nullptr;
+    }
+    
+    auto* scheduler = new qwen3_batch_scheduler_t();
+    scheduler->scheduler.set_asr(asr);
+    
+    if (aligner && aligner->aligner) {
+        scheduler->scheduler.set_aligner(aligner);
+    }
+    
+    scheduler->scheduler.set_batch_size(config.max_batch_size > 0 ? config.max_batch_size : 2);
+    scheduler->scheduler.set_timeout_ms(config.batch_timeout_ms > 0 ? config.batch_timeout_ms : 100);
+    
+    return scheduler;
+}
+
+void qwen3_batch_scheduler_free(qwen3_batch_scheduler_handle scheduler) {
+    if (scheduler) {
+        auto* s = static_cast<qwen3_batch_scheduler_t*>(scheduler);
+        s->scheduler.stop();
+        delete s;
+    }
+}
+
+int qwen3_batch_scheduler_start(qwen3_batch_scheduler_handle scheduler) {
+    if (!scheduler) {
+        g_last_error = "Invalid scheduler handle";
+        return -1;
+    }
+    
+    auto* s = static_cast<qwen3_batch_scheduler_t*>(scheduler);
+    s->scheduler.start();
+    
+    return 0;
+}
+
+void qwen3_batch_scheduler_stop(qwen3_batch_scheduler_handle scheduler) {
+    if (scheduler) {
+        auto* s = static_cast<qwen3_batch_scheduler_t*>(scheduler);
+        s->scheduler.stop();
+    }
+}
+
+int qwen3_batch_scheduler_submit(
+    qwen3_batch_scheduler_handle scheduler,
+    const int16_t* pcm,
+    int32_t n_samples,
+    const char* language,
+    const char* context,
+    int max_tokens,
+    int* request_id
+) {
+    if (!scheduler) {
+        g_last_error = "Invalid scheduler handle";
+        return -1;
+    }
+    
+    if (!pcm || n_samples <= 0) {
+        g_last_error = "Invalid PCM data";
+        return -1;
+    }
+    
+    auto* s = static_cast<qwen3_batch_scheduler_t*>(scheduler);
+    
+    std::vector<int16_t> pcm_vec(pcm, pcm + n_samples);
+    std::string lang = language ? language : "";
+    std::string ctx = context ? context : "";
+    
+    int id = s->next_result_id++;
+    
+    auto future = s->scheduler.submit_request(pcm_vec, lang, ctx, max_tokens > 0 ? max_tokens : 1024);
+    
+    {
+        std::lock_guard<std::mutex> lock(s->futures_mutex);
+        s->pending_futures[id] = std::move(future);
+    }
+    
+    if (request_id) {
+        *request_id = id;
+    }
+    
+    return 0;
+}
+
+int qwen3_batch_scheduler_get_result(
+    qwen3_batch_scheduler_handle scheduler,
+    int request_id,
+    char** json_result
+) {
+    if (!scheduler) {
+        g_last_error = "Invalid scheduler handle";
+        return -1;
+    }
+    
+    if (!json_result) {
+        g_last_error = "Null result pointer";
+        return -1;
+    }
+    
+    auto* s = static_cast<qwen3_batch_scheduler_t*>(scheduler);
+    
+    std::future<std::string> future;
+    {
+        std::lock_guard<std::mutex> lock(s->futures_mutex);
+        auto it = s->pending_futures.find(request_id);
+        if (it == s->pending_futures.end()) {
+            g_last_error = "Invalid request ID";
+            return -1;
+        }
+        future = std::move(it->second);
+        s->pending_futures.erase(it);
+    }
+    
+    try {
+        std::string result = future.get();
+        *json_result = strdup(result.c_str());
+        if (!*json_result) {
+            g_last_error = "Failed to allocate memory for result";
+            return -1;
+        }
+    } catch (const std::exception& e) {
+        g_last_error = std::string("Exception: ") + e.what();
+        return -1;
+    }
+    
+    return 0;
+}
+
+void qwen3_batch_scheduler_free_result(char* json_result) {
+    if (json_result) {
+        free(json_result);
+    }
+}
+
+int qwen3_batch_scheduler_get_pending_count(qwen3_batch_scheduler_handle scheduler) {
+    if (!scheduler) {
+        return 0;
+    }
+    
+    auto* s = static_cast<qwen3_batch_scheduler_t*>(scheduler);
+    return s->scheduler.get_pending_count();
+}
+
+int qwen3_batch_scheduler_is_running(qwen3_batch_scheduler_handle scheduler) {
+    if (!scheduler) {
+        return 0;
+    }
+    
+    auto* s = static_cast<qwen3_batch_scheduler_t*>(scheduler);
+    return s->scheduler.is_running() ? 1 : 0;
 }
 
 }

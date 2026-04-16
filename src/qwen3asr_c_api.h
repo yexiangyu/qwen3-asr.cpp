@@ -201,6 +201,56 @@ QWEN3ASR_API int qwen3asr_transcribe_align_pcm_combined(
 
 QWEN3ASR_API void qwen3asr_free_combined_result(qwen3combined_result* result);
 
+typedef struct {
+    int max_batch_size;
+    int batch_timeout_ms;
+} qwen3_batch_config;
+
+QWEN3ASR_API int qwen3asr_transcribe_batch(
+    qwen3asr_handle handle,
+    const int16_t** pcm_samples,
+    const int32_t* n_samples,
+    int n_requests,
+    const qwen3asr_params* params,
+    qwen3asr_result* results
+);
+
+typedef void* qwen3_batch_scheduler_handle;
+
+QWEN3ASR_API qwen3_batch_scheduler_handle qwen3_batch_scheduler_init(
+    qwen3asr_handle asr,
+    qwen3aligner_handle aligner,
+    qwen3_batch_config config
+);
+
+QWEN3ASR_API void qwen3_batch_scheduler_free(qwen3_batch_scheduler_handle scheduler);
+
+QWEN3ASR_API int qwen3_batch_scheduler_start(qwen3_batch_scheduler_handle scheduler);
+
+QWEN3ASR_API void qwen3_batch_scheduler_stop(qwen3_batch_scheduler_handle scheduler);
+
+QWEN3ASR_API int qwen3_batch_scheduler_submit(
+    qwen3_batch_scheduler_handle scheduler,
+    const int16_t* pcm,
+    int32_t n_samples,
+    const char* language,
+    const char* context,
+    int max_tokens,
+    int* request_id
+);
+
+QWEN3ASR_API int qwen3_batch_scheduler_get_result(
+    qwen3_batch_scheduler_handle scheduler,
+    int request_id,
+    char** json_result
+);
+
+QWEN3ASR_API void qwen3_batch_scheduler_free_result(char* json_result);
+
+QWEN3ASR_API int qwen3_batch_scheduler_get_pending_count(qwen3_batch_scheduler_handle scheduler);
+
+QWEN3ASR_API int qwen3_batch_scheduler_is_running(qwen3_batch_scheduler_handle scheduler);
+
 #ifdef __cplusplus
 }
 #endif

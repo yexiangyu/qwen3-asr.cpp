@@ -9,6 +9,7 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <set>
 
 namespace qwen3_asr {
 
@@ -77,19 +78,46 @@ struct text_decoder_model {
     std::map<std::string, struct ggml_tensor *> tensors;
 };
 
-// KV cache for autoregressive generation
-struct kv_cache {
-    std::vector<struct ggml_tensor *> k_cache;  // Per-layer K cache
-    std::vector<struct ggml_tensor *> v_cache;  // Per-layer V cache
-    
+typedef int32_t kv_pos;
+typedef int32_t kv_seq_id;
+
+struct kv_cell {
+    kv_pos pos = -1;
+    std::set<kv_seq_id> seq_id;
+
+    bool has_seq_id(const kv_seq_id & id) const {
+        return seq_id.find(id) != seq_id.end();
+    }
+};
+
+struct kv_cache_batched {
+    std::vector<struct ggml_tensor *> k_cache;
+    std::vector<struct ggml_tensor *> v_cache;
+
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
-    
-    int32_t n_ctx = 0;      // Maximum context length
-    int32_t n_used = 0;     // Current number of cached tokens
+
+    int32_t n_ctx = 0;
+    int32_t head = 0;
+    int32_t n = 0;
     int32_t head_dim = 64;
     int32_t n_kv_heads = 8;
     int32_t n_layers = 28;
+
+    std::vector<kv_cell> cells;
+
+    int32_t alloc_seq(kv_seq_id seq_id, int32_t n_tokens);
+    void free_seq(kv_seq_id seq_id);
+    void clear_all();
+};
+
+struct decode_batch {
+    int32_t n_tokens;
+    int32_t * token_ids;
+    int32_t * positions;
+    int32_t * seq_ids;
+    int32_t n_seqs;
+    int32_t * seq_n_tokens;
 };
 
 // Text decoder state
@@ -100,7 +128,7 @@ struct text_decoder_state {
     
     std::vector<uint8_t> compute_meta;
     
-    kv_cache cache;
+    kv_cache_batched cache;
 };
 
 // Text decoder class
@@ -109,32 +137,28 @@ public:
     TextDecoder();
     ~TextDecoder();
     
-    // Load model from GGUF file
     bool load_model(const std::string & model_path, const std::string & device_name = "");
     
-    // Initialize KV cache for given context length
     bool init_kv_cache(int32_t n_ctx);
     
-    // Clear KV cache (for new sequence)
     void clear_kv_cache();
     
-    // Forward pass: compute logits for input tokens
-    // tokens: input token IDs [n_tokens]
-    // n_past: number of tokens already in KV cache
-    // output: logits [n_tokens, vocab_size]
     bool forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
                  std::vector<float> & output);
     
-    // Forward pass with audio embedding injection
-    // tokens: input token IDs [n_tokens]
-    // audio_embd: audio embeddings [n_audio, hidden_size]
-    // audio_start_pos: position in token sequence where audio starts
-    // n_past: number of tokens already in KV cache
-    // output: logits [n_tokens, vocab_size]
     bool forward_with_audio(const int32_t * tokens, int32_t n_tokens,
                             const float * audio_embd, int32_t n_audio,
                             int32_t audio_start_pos, int32_t n_past,
                             std::vector<float> & output);
+    
+    bool forward_batch(const decode_batch & batch,
+                       const float * audio_embd, int32_t n_audio,
+                       int32_t audio_start_pos,
+                       std::vector<float> & output);
+    
+    int32_t kv_alloc_seq(kv_seq_id seq_id, int32_t n_tokens);
+    void kv_free_seq(kv_seq_id seq_id);
+    void kv_clear_all();
     
     const text_decoder_config & get_config() const { return model_.config; }
     
@@ -151,23 +175,23 @@ public:
                        std::map<std::string, std::vector<float>> & debug_tensors);
     
 private:
-    // Build computation graph for forward pass
     struct ggml_cgraph * build_graph(const int32_t * tokens, int32_t n_tokens,
                                      int32_t n_past,
                                      const float * audio_embd = nullptr,
                                      int32_t n_audio = 0,
                                      int32_t audio_start_pos = 0);
     
-    // Initialize backend state with device selection
+    struct ggml_cgraph * build_graph_batch(const decode_batch & batch,
+                                           const float * audio_embd = nullptr,
+                                           int32_t n_audio = 0,
+                                           int32_t audio_start_pos = 0);
+    
     bool init_state(const std::string & device_name = "");
     
-    // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
     
-    // Assign tensors from GGUF context to model structure
     bool assign_tensors(struct gguf_context * ctx_gguf);
     
-    // Load tensor data from file
     bool load_tensor_data(const std::string & path, struct gguf_context * ctx_gguf);
     
     bool load_vocab(struct gguf_context * ctx);
@@ -180,10 +204,12 @@ private:
     std::unordered_map<std::string, int> bpe_ranks_;
 };
 
-// Free model resources
 void free_decoder_model(text_decoder_model & model);
 
-// Free KV cache resources
-void free_kv_cache(kv_cache & cache);
+void free_kv_cache(kv_cache_batched & cache);
+
+decode_batch decode_batch_init(int32_t n_tokens, int32_t n_seqs);
+
+void decode_batch_free(decode_batch & batch);
 
 } // namespace qwen3_asr

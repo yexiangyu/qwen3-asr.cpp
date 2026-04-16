@@ -3,7 +3,6 @@
 
 #include <sstream>
 #include <iomanip>
-#include <mutex>
 #include <cstring>
 
 namespace qwen3_asr {
@@ -182,6 +181,10 @@ CombinedASRServer::CombinedASRServer(const CombinedServerConfig& config)
 }
 
 CombinedASRServer::~CombinedASRServer() {
+    if (batch_scheduler_) {
+        batch_scheduler_->stop();
+        batch_scheduler_.reset();
+    }
     if (asr_handle_) {
         qwen3asr_free(asr_handle_);
         asr_handle_ = nullptr;
@@ -252,10 +255,18 @@ bool CombinedASRServer::init() {
         }
     }
     
+    batch_scheduler_ = std::make_unique<BatchScheduler>();
+    batch_scheduler_->set_asr(asr_handle_);
+    batch_scheduler_->set_aligner(aligner_handle_);
+    batch_scheduler_->set_batch_size(config_.max_batch_size);
+    batch_scheduler_->set_timeout_ms(config_.batch_timeout_ms);
+    batch_scheduler_->start();
+    
     models_loaded_ = true;
     LOG_INFO("CombinedASRServer initialized successfully");
     LOG_INFO("  ASR device: {}", qwen3asr_get_device_name(asr_handle_));
     LOG_INFO("  Aligner device: {}", qwen3aligner_get_device_name(aligner_handle_));
+    LOG_INFO("  Batch scheduler: size={}, timeout={}ms", config_.max_batch_size, config_.batch_timeout_ms);
     return true;
 }
 
@@ -265,8 +276,6 @@ std::string CombinedASRServer::handle_transcribe(
     const std::string& context,
     int max_tokens
 ) {
-    std::lock_guard<std::mutex> lock(server_mutex_);
-    
     LOG_INFO("Processing transcribe request: pcm_samples={}, lang={}, context_len={}, max_tokens={}",
              pcm_data.size(), language.empty() ? "(auto)" : language, 
              context.size(), max_tokens);
@@ -305,8 +314,6 @@ std::string CombinedASRServer::handle_align(
     const std::vector<int16_t>& pcm_data,
     const std::string& language
 ) {
-    std::lock_guard<std::mutex> lock(server_mutex_);
-    
     LOG_INFO("Processing align request: text_len={}, pcm_samples={}, lang={}",
              text.size(), pcm_data.size(), language.empty() ? "(auto)" : language);
     
@@ -344,47 +351,12 @@ std::string CombinedASRServer::handle_transcribe_align(
     const std::string& context,
     int max_tokens
 ) {
-    std::lock_guard<std::mutex> lock(server_mutex_);
-    
     LOG_INFO("Processing transcribe-align request: pcm_samples={}, lang={}, context_len={}, max_tokens={}",
              pcm_data.size(), language.empty() ? "(auto)" : language, 
              context.size(), max_tokens);
     
-    qwen3asr_params asr_params;
-    asr_params.max_tokens = max_tokens > 0 ? max_tokens : config_.max_tokens;
-    asr_params.language = language.empty() ? nullptr : language.c_str();
-    asr_params.context = context.empty() ? nullptr : context.c_str();
-    asr_params.n_threads = config_.n_threads;
-    
-    qwen3aligner_params align_params;
-    align_params.language = language.empty() ? nullptr : language.c_str();
-    align_params.n_threads = config_.n_threads;
-    
-    qwen3combined_result combined_result;
-    int ret = qwen3asr_transcribe_align_pcm_combined(
-        asr_handle_,
-        aligner_handle_,
-        pcm_data.data(),
-        static_cast<int32_t>(pcm_data.size()),
-        &asr_params,
-        &align_params,
-        &combined_result
-    );
-    
-    if (ret != 0) {
-        LOG_ERROR("Transcribe-align failed: {}", qwen3_get_last_error());
-        return build_error_response(qwen3_get_last_error());
-    }
-    
-    std::string json_response = build_combined_response(combined_result.transcription, combined_result.alignment);
-    
-    LOG_INFO("Transcribe-align completed: {} tokens, {} utterances, total {} ms",
-             combined_result.transcription.n_tokens, combined_result.alignment.n_utterances,
-             combined_result.transcription.t_total_ms + combined_result.alignment.t_total_ms);
-    
-    qwen3asr_free_combined_result(&combined_result);
-    
-    return json_response;
+    auto future = batch_scheduler_->submit_request(pcm_data, language, context, max_tokens);
+    return future.get();
 }
 
 }

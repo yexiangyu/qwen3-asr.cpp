@@ -32,21 +32,29 @@ struct transcribe_params {
 
 // Transcription result
 struct transcribe_result {
-    std::string text;                          // 完整转录文本（含 "language Chinese ..." 前缀）
-    std::string text_prefix;                   // 前缀部分（如 "language Chinese"）
-    std::string text_content;                  // 实际内容部分（去除前缀）
-    std::vector<int32_t> tokens;               // BPE token IDs
-    std::vector<float> token_confidences;      // 每个 token 的 softmax confidence
-    std::vector<std::string> token_strings;    // 每个 token 解码后的字符串
+    std::string text;
+    std::string text_prefix;
+    std::string text_content;
+    std::vector<int32_t> tokens;
+    std::vector<float> token_confidences;
+    std::vector<std::string> token_strings;
     bool success = false;
     std::string error_msg;
     
-    // Timing info (in milliseconds)
     int64_t t_load_ms = 0;
     int64_t t_mel_ms = 0;
     int64_t t_encode_ms = 0;
     int64_t t_decode_ms = 0;
     int64_t t_total_ms = 0;
+};
+
+struct batch_result {
+    std::string text;
+    std::string text_content;
+    std::vector<int32_t> tokens;
+    std::vector<float> token_confs;
+    bool success = false;
+    std::string error_msg;
 };
 
 // Progress callback type
@@ -72,6 +80,15 @@ public:
     // n_samples: number of samples
     transcribe_result transcribe(const float * samples, int n_samples,
                                   const transcribe_params & params = transcribe_params());
+    
+    // Batch transcription for multiple audio inputs
+    // audio_samples: vector of audio sample arrays (each normalized to [-1, 1])
+    // n_samples: vector of sample counts for each audio
+    // Returns vector of batch_result for each input
+    std::vector<batch_result> transcribe_batch(
+        const std::vector<const float *> & audio_samples,
+        const std::vector<int> & n_samples,
+        const transcribe_params & params = transcribe_params());
     
     // Set progress callback
     void set_progress_callback(progress_callback_t callback);

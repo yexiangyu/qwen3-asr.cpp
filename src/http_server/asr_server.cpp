@@ -20,6 +20,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --default-language <lang>  Default language\n");
     fprintf(stderr, "  --asr-device <name>      ASR GPU device (e.g. CUDA0, Metal)\n");
     fprintf(stderr, "  --aligner-device <name>  Aligner GPU device (e.g. CUDA1)\n");
+    fprintf(stderr, "  --batch-size <num>       Max batch size for scheduler (default: 2)\n");
+    fprintf(stderr, "  --batch-timeout <ms>     Batch timeout in milliseconds (default: 100)\n");
     fprintf(stderr, "  --help                   Show this message\n");
 }
 
@@ -63,6 +65,16 @@ int run_combined_server(int argc, char** argv) {
             config.asr_device = argv[++i];
         } else if (strcmp(argv[i], "--aligner-device") == 0 && i + 1 < argc) {
             config.aligner_device = argv[++i];
+        } else if (strcmp(argv[i], "--batch-size") == 0 && i + 1 < argc) {
+            if (!parse_int(argv[++i], config.max_batch_size)) {
+                fprintf(stderr, "Error: Invalid batch-size number\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--batch-timeout") == 0 && i + 1 < argc) {
+            if (!parse_int(argv[++i], config.batch_timeout_ms)) {
+                fprintf(stderr, "Error: Invalid batch-timeout number\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;

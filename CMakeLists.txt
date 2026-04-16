@@ -485,6 +485,7 @@ set(QWEN3ASR_ALL_SOURCES
     src/audio_utils.cpp
     src/gguf_loader.cpp
     src/logger.cpp
+    src/batch_scheduler.cpp
 )
 
 add_library(qwen3asr SHARED ${QWEN3ASR_ALL_SOURCES})

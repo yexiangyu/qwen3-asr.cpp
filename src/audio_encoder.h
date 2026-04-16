@@ -17,6 +17,21 @@ struct audio_encoder_state {
     struct ggml_tensor * embd_enc = nullptr;
 };
 
+struct BatchMelInput {
+    std::vector<const float*> mels;
+    std::vector<int> mel_lengths;
+    int batch_size;
+    
+    BatchMelInput() : batch_size(0) {}
+};
+
+struct BatchEncoderOutput {
+    std::vector<std::vector<float>> features;
+    std::vector<int> feature_lengths;
+    std::vector<bool> success;
+    std::vector<std::string> errors;
+};
+
 class AudioEncoder {
 public:
     AudioEncoder();
@@ -30,9 +45,10 @@ public:
     bool encode_conv_only(const float * mel_data, int n_mel, int n_frames,
                           std::vector<float> & output);
     
-    // Encode without chunking (for testing/debugging)
     bool encode_no_chunk(const float * mel_data, int n_mel, int n_frames,
                          std::vector<float> & output);
+    
+    bool encode_batch(const BatchMelInput& input, BatchEncoderOutput& output);
     
     const audio_encoder_hparams & get_hparams() const { return model_.hparams; }
     const text_decoder_hparams & get_text_hparams() const { return model_.text_hparams; }
@@ -42,6 +58,8 @@ public:
 private:
     struct ggml_cgraph * build_graph_conv(int n_frames);
     struct ggml_cgraph * build_graph_encoder(int n_ctx);
+    struct ggml_cgraph * build_graph_conv_batch(int max_frames, int batch_size);
+    struct ggml_cgraph * build_graph_encoder_batch(int n_ctx, int batch_size);
     
     bool compute_graph(struct ggml_cgraph * graph);
     
@@ -52,4 +70,4 @@ private:
     int n_threads_ = 4;
 };
 
-} // namespace qwen3_asr
+}
