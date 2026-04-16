@@ -1018,17 +1018,18 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder_batch(int n_ctx, int batc
         }
         
         {
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q_w, cur);
+            struct ggml_tensor * cur_c = ggml_cont(ctx0, cur);
+            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q_w, cur_c);
             if (layer.attn_q_b) {
                 Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
             }
             
-            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k_w, cur);
+            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k_w, cur_c);
             if (layer.attn_k_b) {
                 Kcur = ggml_add(ctx0, Kcur, layer.attn_k_b);
             }
             
-            struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v_w, cur);
+            struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v_w, cur_c);
             if (layer.attn_v_b) {
                 Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
             }
@@ -1058,7 +1059,8 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder_batch(int n_ctx, int batc
         
         {
             cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx * batch_size);
-            cur = ggml_mul_mat(ctx0, layer.attn_out_w, cur);
+            struct ggml_tensor * cur_c = ggml_cont(ctx0, cur);
+            cur = ggml_mul_mat(ctx0, layer.attn_out_w, cur_c);
             if (layer.attn_out_b) {
                 cur = ggml_add(ctx0, cur, layer.attn_out_b);
             }
@@ -1081,14 +1083,16 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder_batch(int n_ctx, int batc
             }
             
             cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx * batch_size);
-            cur = ggml_mul_mat(ctx0, layer.ffn_up_w, cur);
+            struct ggml_tensor * cur_c = ggml_cont(ctx0, cur);
+            cur = ggml_mul_mat(ctx0, layer.ffn_up_w, cur_c);
             if (layer.ffn_up_b) {
                 cur = ggml_add(ctx0, cur, layer.ffn_up_b);
             }
             
             cur = ggml_gelu(ctx0, cur);
             
-            cur = ggml_mul_mat(ctx0, layer.ffn_down_w, cur);
+            cur_c = ggml_cont(ctx0, cur);
+            cur = ggml_mul_mat(ctx0, layer.ffn_down_w, cur_c);
             if (layer.ffn_down_b) {
                 cur = ggml_add(ctx0, cur, layer.ffn_down_b);
             }
@@ -1110,7 +1114,8 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder_batch(int n_ctx, int batc
     
     if (model_.proj1_w) {
         cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx * batch_size);
-        cur = ggml_mul_mat(ctx0, model_.proj1_w, cur);
+        struct ggml_tensor * cur_c = ggml_cont(ctx0, cur);
+        cur = ggml_mul_mat(ctx0, model_.proj1_w, cur_c);
         if (model_.proj1_b) {
             cur = ggml_add(ctx0, cur, model_.proj1_b);
         }
@@ -1120,7 +1125,8 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder_batch(int n_ctx, int batc
     
     if (model_.proj2_w) {
         cur = ggml_reshape_2d(ctx0, cur, model_.proj1_w ? model_.proj1_w->ne[0] : n_state, n_ctx * batch_size);
-        cur = ggml_mul_mat(ctx0, model_.proj2_w, cur);
+        struct ggml_tensor * cur_c = ggml_cont(ctx0, cur);
+        cur = ggml_mul_mat(ctx0, model_.proj2_w, cur_c);
         if (model_.proj2_b) {
             cur = ggml_add(ctx0, cur, model_.proj2_b);
         }
