@@ -1038,9 +1038,9 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder_batch(int n_ctx, int batc
                 ggml_reshape_4d(ctx0, Qcur, n_state_head, n_head, n_ctx, batch_size),
                 0, 2, 1, 3);
             
-            struct ggml_tensor * K = ggml_permute(ctx0,
+            struct ggml_tensor * K = ggml_cont(ctx0, ggml_permute(ctx0,
                 ggml_reshape_4d(ctx0, Kcur, n_state_head, n_head, n_ctx, batch_size),
-                0, 2, 1, 3);
+                0, 2, 1, 3));
             
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
             
