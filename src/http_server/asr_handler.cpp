@@ -1,4 +1,6 @@
 #include "asr_server.h"
+#include "qwen3_asr.h"
+#include "forced_aligner.h"
 #include "logger.h"
 
 #include <sstream>
@@ -32,25 +34,13 @@ static std::string escape_json_string(const std::string& s) {
     return result;
 }
 
-static std::string build_transcribe_response(const qwen3asr_result& result) {
+static std::string build_transcribe_response(const transcribe_result& result) {
     std::ostringstream json;
     json << "{\n";
     json << "  \"success\": true,\n";
     json << "  \"text\": \"" << escape_json_string(result.text) << "\",\n";
     json << "  \"text_content\": \"" << escape_json_string(result.text_content) << "\",\n";
-    json << "  \"n_tokens\": " << result.n_tokens << ",\n";
-    json << "  \"tokens\": [\n";
-    
-    for (int32_t i = 0; i < result.n_tokens; ++i) {
-        json << "    {";
-        json << "\"id\": " << result.token_ids[i] << ", ";
-        json << "\"confidence\": " << std::fixed << std::setprecision(4) << result.token_confs[i];
-        json << "}";
-        if (i + 1 < result.n_tokens) json << ",";
-        json << "\n";
-    }
-    
-    json << "  ],\n";
+    json << "  \"n_tokens\": " << result.tokens.size() << ",\n";
     json << "  \"mel_ms\": " << result.t_mel_ms << ",\n";
     json << "  \"encode_ms\": " << result.t_encode_ms << ",\n";
     json << "  \"decode_ms\": " << result.t_decode_ms << ",\n";
@@ -60,23 +50,23 @@ static std::string build_transcribe_response(const qwen3asr_result& result) {
     return json.str();
 }
 
-static std::string build_align_response(const qwen3alignment_result& result) {
+static std::string build_align_response(const alignment_result& result) {
     std::ostringstream json;
     json << "{\n";
     json << "  \"success\": true,\n";
-    json << "  \"n_utterances\": " << result.n_utterances << ",\n";
+    json << "  \"n_utterances\": " << result.utterances.size() << ",\n";
     json << "  \"utterances\": [\n";
     
-    for (int i = 0; i < result.n_utterances; ++i) {
+    for (size_t i = 0; i < result.utterances.size(); ++i) {
         const auto& utt = result.utterances[i];
         json << "    {\n";
         json << "      \"start\": " << std::fixed << std::setprecision(3) << utt.start << ",\n";
         json << "      \"end\": " << std::fixed << std::setprecision(3) << utt.end << ",\n";
         json << "      \"text\": \"" << escape_json_string(utt.text) << "\",\n";
-        json << "      \"n_words\": " << utt.n_words << ",\n";
+        json << "      \"n_words\": " << utt.words.size() << ",\n";
         json << "      \"words\": [\n";
         
-        for (int j = 0; j < utt.n_words; ++j) {
+        for (size_t j = 0; j < utt.words.size(); ++j) {
             const auto& w = utt.words[j];
             json << "        {";
             json << "\"word\": \"" << escape_json_string(w.word) << "\", ";
@@ -86,13 +76,13 @@ static std::string build_align_response(const qwen3alignment_result& result) {
             json << "\"conf_start_time\": " << std::fixed << std::setprecision(4) << w.conf_start_time << ", ";
             json << "\"conf_end_time\": " << std::fixed << std::setprecision(4) << w.conf_end_time;
             json << "}";
-            if (j + 1 < utt.n_words) json << ",";
+            if (j + 1 < utt.words.size()) json << ",";
             json << "\n";
         }
         
         json << "      ]\n";
         json << "    }";
-        if (i + 1 < result.n_utterances) json << ",";
+        if (i + 1 < result.utterances.size()) json << ",";
         json << "\n";
     }
     
@@ -101,63 +91,6 @@ static std::string build_align_response(const qwen3alignment_result& result) {
     json << "  \"encode_ms\": " << result.t_encode_ms << ",\n";
     json << "  \"decode_ms\": " << result.t_decode_ms << ",\n";
     json << "  \"total_ms\": " << result.t_total_ms << "\n";
-    json << "}\n";
-    
-    return json.str();
-}
-
-static std::string build_combined_response(
-    const qwen3asr_result& asr_result,
-    const qwen3alignment_result& align_result
-) {
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"success\": true,\n";
-    json << "  \"text\": \"" << escape_json_string(asr_result.text) << "\",\n";
-    json << "  \"text_content\": \"" << escape_json_string(asr_result.text_content) << "\",\n";
-    json << "  \"n_tokens\": " << asr_result.n_tokens << ",\n";
-    json << "  \"n_utterances\": " << align_result.n_utterances << ",\n";
-    json << "  \"utterances\": [\n";
-    
-    for (int i = 0; i < align_result.n_utterances; ++i) {
-        const auto& utt = align_result.utterances[i];
-        json << "    {\n";
-        json << "      \"start\": " << std::fixed << std::setprecision(3) << utt.start << ",\n";
-        json << "      \"end\": " << std::fixed << std::setprecision(3) << utt.end << ",\n";
-        json << "      \"text\": \"" << escape_json_string(utt.text) << "\",\n";
-        json << "      \"n_words\": " << utt.n_words << ",\n";
-        json << "      \"words\": [\n";
-        
-        for (int j = 0; j < utt.n_words; ++j) {
-            const auto& w = utt.words[j];
-            json << "        {";
-            json << "\"word\": \"" << escape_json_string(w.word) << "\", ";
-            json << "\"start\": " << std::fixed << std::setprecision(3) << w.start << ", ";
-            json << "\"end\": " << std::fixed << std::setprecision(3) << w.end << ", ";
-            json << "\"conf_word\": " << std::fixed << std::setprecision(4) << w.conf_word << ", ";
-            json << "\"conf_start_time\": " << std::fixed << std::setprecision(4) << w.conf_start_time << ", ";
-            json << "\"conf_end_time\": " << std::fixed << std::setprecision(4) << w.conf_end_time;
-            json << "}";
-            if (j + 1 < utt.n_words) json << ",";
-            json << "\n";
-        }
-        
-        json << "      ]\n";
-        json << "    }";
-        if (i + 1 < align_result.n_utterances) json << ",";
-        json << "\n";
-    }
-    
-    json << "  ],\n";
-    json << "  \"transcribe_mel_ms\": " << asr_result.t_mel_ms << ",\n";
-    json << "  \"transcribe_encode_ms\": " << asr_result.t_encode_ms << ",\n";
-    json << "  \"transcribe_decode_ms\": " << asr_result.t_decode_ms << ",\n";
-    json << "  \"transcribe_total_ms\": " << asr_result.t_total_ms << ",\n";
-    json << "  \"alignment_mel_ms\": " << align_result.t_mel_ms << ",\n";
-    json << "  \"alignment_encode_ms\": " << align_result.t_encode_ms << ",\n";
-    json << "  \"alignment_decode_ms\": " << align_result.t_decode_ms << ",\n";
-    json << "  \"alignment_total_ms\": " << align_result.t_total_ms << ",\n";
-    json << "  \"total_ms\": " << (asr_result.t_total_ms + align_result.t_total_ms) << "\n";
     json << "}\n";
     
     return json.str();
@@ -174,8 +107,6 @@ static std::string build_error_response(const std::string& error_msg) {
 
 CombinedASRServer::CombinedASRServer(const CombinedServerConfig& config)
     : config_(config)
-    , asr_handle_(nullptr)
-    , aligner_handle_(nullptr)
     , models_loaded_(false)
 {
 }
@@ -184,14 +115,6 @@ CombinedASRServer::~CombinedASRServer() {
     if (batch_scheduler_) {
         batch_scheduler_->stop();
         batch_scheduler_.reset();
-    }
-    if (asr_handle_) {
-        qwen3asr_free(asr_handle_);
-        asr_handle_ = nullptr;
-    }
-    if (aligner_handle_) {
-        qwen3aligner_free(aligner_handle_);
-        aligner_handle_ = nullptr;
     }
 }
 
@@ -204,68 +127,44 @@ bool CombinedASRServer::init() {
     LOG_INFO("  ASR device: {}", config_.asr_device.empty() ? "(auto)" : config_.asr_device);
     LOG_INFO("  Aligner device: {}", config_.aligner_device.empty() ? "(auto)" : config_.aligner_device);
     
-    int ret;
+    // Create ASR object
+    asr_ = std::make_unique<Qwen3ASR>();
     
-    if (!config_.asr_device.empty()) {
-        ret = qwen3asr_init_with_device_name(&asr_handle_, config_.asr_device.c_str());
-    } else {
-        ret = qwen3asr_init(&asr_handle_);
-    }
-    
-    if (ret != 0) {
-        LOG_ERROR("Failed to init ASR handle: {}", qwen3_get_last_error());
+    // Load ASR model with device selection
+    if (!asr_->load_model(config_.asr_model_path, config_.asr_device)) {
+        LOG_ERROR("Failed to load ASR model: {}", asr_->get_error());
+        asr_.reset();
         return false;
     }
     
-    ret = qwen3asr_load_model(asr_handle_, config_.asr_model_path.c_str());
-    if (ret != 0) {
-        LOG_ERROR("Failed to load ASR model: {}", qwen3_get_last_error());
-        qwen3asr_free(asr_handle_);
-        asr_handle_ = nullptr;
+    // Create Aligner object
+    aligner_ = std::make_unique<ForcedAligner>();
+    
+    // Load Aligner model with device selection
+    if (!aligner_->load_model(config_.aligner_model_path, config_.aligner_device)) {
+        LOG_ERROR("Failed to load aligner model: {}", aligner_->get_error());
+        asr_.reset();
+        aligner_.reset();
         return false;
     }
     
-    if (!config_.aligner_device.empty()) {
-        ret = qwen3aligner_init_with_device_name(&aligner_handle_, config_.aligner_device.c_str());
-    } else {
-        ret = qwen3aligner_init(&aligner_handle_);
-    }
-    
-    if (ret != 0) {
-        LOG_ERROR("Failed to init aligner handle: {}", qwen3_get_last_error());
-        qwen3asr_free(asr_handle_);
-        asr_handle_ = nullptr;
-        return false;
-    }
-    
-    ret = qwen3aligner_load_model(aligner_handle_, config_.aligner_model_path.c_str());
-    if (ret != 0) {
-        LOG_ERROR("Failed to load aligner model: {}", qwen3_get_last_error());
-        qwen3asr_free(asr_handle_);
-        asr_handle_ = nullptr;
-        qwen3aligner_free(aligner_handle_);
-        aligner_handle_ = nullptr;
-        return false;
-    }
-    
+    // Load Korean dictionary if specified
     if (!config_.korean_dict_path.empty()) {
-        ret = qwen3aligner_load_korean_dict(aligner_handle_, config_.korean_dict_path.c_str());
-        if (ret != 0) {
-            LOG_WARN("Failed to load Korean dict: {}", qwen3_get_last_error());
+        if (!aligner_->load_korean_dict(config_.korean_dict_path)) {
+            LOG_WARN("Failed to load Korean dict: {}", aligner_->get_error());
         }
     }
     
+    // Initialize batch scheduler with C++ objects
     batch_scheduler_ = std::make_unique<BatchScheduler>();
-    batch_scheduler_->set_asr(asr_handle_);
-    batch_scheduler_->set_aligner(aligner_handle_);
+    batch_scheduler_->set_asr(asr_.get());
+    batch_scheduler_->set_aligner(aligner_.get());
     batch_scheduler_->set_batch_size(config_.max_batch_size);
     batch_scheduler_->set_timeout_ms(config_.batch_timeout_ms);
     batch_scheduler_->start();
     
     models_loaded_ = true;
     LOG_INFO("CombinedASRServer initialized successfully");
-    LOG_INFO("  ASR device: {}", qwen3asr_get_device_name(asr_handle_));
-    LOG_INFO("  Aligner device: {}", qwen3aligner_get_device_name(aligner_handle_));
     LOG_INFO("  Batch scheduler: size={}, timeout={}ms", config_.max_batch_size, config_.batch_timeout_ms);
     return true;
 }
@@ -280,33 +179,12 @@ std::string CombinedASRServer::handle_transcribe(
              pcm_data.size(), language.empty() ? "(auto)" : language, 
              context.size(), max_tokens);
     
-    qwen3asr_params params;
-    params.max_tokens = max_tokens > 0 ? max_tokens : config_.max_tokens;
-    params.language = language.empty() ? nullptr : language.c_str();
-    params.context = context.empty() ? nullptr : context.c_str();
-    params.n_threads = config_.n_threads;
-    
-    qwen3asr_result result;
-    int ret = qwen3asr_transcribe_pcm(
-        asr_handle_,
-        pcm_data.data(),
-        static_cast<int32_t>(pcm_data.size()),
-        &params,
-        &result
+    // Submit to batch scheduler
+    auto future = batch_scheduler_->submit_request(
+        pcm_data, language, context, max_tokens,
+        RequestType::TRANSCRIBE
     );
-    
-    if (ret != 0) {
-        LOG_ERROR("Transcribe failed: {}", qwen3_get_last_error());
-        return build_error_response(qwen3_get_last_error());
-    }
-    
-    std::string json_response = build_transcribe_response(result);
-    
-    LOG_INFO("Transcribe completed: {} tokens, {} ms", result.n_tokens, result.t_total_ms);
-    
-    qwen3asr_free_result(&result);
-    
-    return json_response;
+    return future.get();
 }
 
 std::string CombinedASRServer::handle_align(
@@ -317,32 +195,29 @@ std::string CombinedASRServer::handle_align(
     LOG_INFO("Processing align request: text_len={}, pcm_samples={}, lang={}",
              text.size(), pcm_data.size(), language.empty() ? "(auto)" : language);
     
-    qwen3aligner_params params;
-    params.language = language.empty() ? nullptr : language.c_str();
-    params.n_threads = config_.n_threads;
-    
-    qwen3alignment_result result;
-    int ret = qwen3aligner_align_pcm(
-        aligner_handle_,
-        pcm_data.data(),
-        static_cast<int32_t>(pcm_data.size()),
-        text.c_str(),
-        &params,
-        &result
-    );
-    
-    if (ret != 0) {
-        LOG_ERROR("Align failed: {}", qwen3_get_last_error());
-        return build_error_response(qwen3_get_last_error());
+    // Convert PCM to float
+    std::vector<float> float_samples(pcm_data.size());
+    for (size_t i = 0; i < pcm_data.size(); ++i) {
+        float_samples[i] = pcm_data[i] / 32768.0f;
     }
     
-    std::string json_response = build_align_response(result);
+    align_params ap;
     
-    LOG_INFO("Align completed: {} utterances, {} ms", result.n_utterances, result.t_total_ms);
+    auto result = aligner_->align(
+        float_samples.data(),
+        static_cast<int>(float_samples.size()),
+        text,
+        language,
+        ap
+    );
     
-    qwen3aligner_free_result(&result);
+    if (!result.success) {
+        LOG_ERROR("Align failed: {}", result.error_msg);
+        return build_error_response(result.error_msg);
+    }
     
-    return json_response;
+    LOG_INFO("Align completed: {} utterances, {} ms", result.utterances.size(), result.t_total_ms);
+    return build_align_response(result);
 }
 
 std::string CombinedASRServer::handle_transcribe_align(
@@ -356,7 +231,7 @@ std::string CombinedASRServer::handle_transcribe_align(
              context.size(), max_tokens);
     
     auto future = batch_scheduler_->submit_request(
-        pcm_data, language, context, max_tokens, 
+        pcm_data, language, context, max_tokens,
         RequestType::TRANSCRIBE_ALIGN
     );
     return future.get();

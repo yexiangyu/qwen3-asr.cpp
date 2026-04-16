@@ -1085,10 +1085,10 @@ qwen3_batch_scheduler_handle qwen3_batch_scheduler_init(
     }
     
     auto* scheduler = new qwen3_batch_scheduler_t();
-    scheduler->scheduler.set_asr(asr);
+    scheduler->scheduler.set_asr(asr->asr);
     
     if (aligner && aligner->aligner) {
-        scheduler->scheduler.set_aligner(aligner);
+        scheduler->scheduler.set_aligner(aligner->aligner);
     }
     
     scheduler->scheduler.set_batch_size(config.max_batch_size > 0 ? config.max_batch_size : 2);

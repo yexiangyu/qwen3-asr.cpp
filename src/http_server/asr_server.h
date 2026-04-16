@@ -1,6 +1,5 @@
 #pragma once
 
-#include "qwen3asr_c_api.h"
 #include "batch_scheduler.h"
 #include <string>
 #include <memory>
@@ -8,6 +7,10 @@
 #include <cstdint>
 
 namespace qwen3_asr {
+
+// Forward declarations
+class Qwen3ASR;
+class ForcedAligner;
 
 struct CombinedServerConfig {
     std::string asr_model_path;
@@ -26,8 +29,8 @@ struct CombinedServerConfig {
 class CombinedASRServer {
 private:
     CombinedServerConfig config_;
-    qwen3asr_handle asr_handle_;
-    qwen3aligner_handle aligner_handle_;
+    std::unique_ptr<Qwen3ASR> asr_;
+    std::unique_ptr<ForcedAligner> aligner_;
     std::unique_ptr<BatchScheduler> batch_scheduler_;
     bool models_loaded_;
     

@@ -13,6 +13,10 @@
 
 namespace qwen3_asr {
 
+// Forward declarations
+class Qwen3ASR;
+class ForcedAligner;
+
 enum class RequestType {
     TRANSCRIBE,
     TRANSCRIBE_ALIGN
@@ -44,8 +48,8 @@ public:
     BatchScheduler();
     ~BatchScheduler();
     
-    void set_asr(void* asr_handle);
-    void set_aligner(void* aligner_handle);
+    void set_asr(Qwen3ASR* asr);
+    void set_aligner(ForcedAligner* aligner);
     
     std::future<std::string> submit_request(
         const std::vector<int16_t>& pcm,
@@ -67,10 +71,19 @@ public:
 private:
     void batch_worker();
     void process_batch(std::vector<ASRRequest>& batch);
+    void process_batch_transcribe_align(std::vector<ASRRequest>& batch);
+    void process_batch_transcribe_only(std::vector<ASRRequest>& batch);
+    
+    std::string build_transcribe_json(const std::string& text, const std::string& text_content,
+                                       int n_tokens, int64_t mel_ms, int64_t encode_ms, 
+                                       int64_t decode_ms, int64_t total_ms);
+    std::string build_transcribe_align_json(const std::string& text, const std::string& text_content,
+                                             const std::vector<std::pair<std::string, std::vector<std::pair<float, float>>>>& words_with_times,
+                                             int64_t total_ms);
     
     BatchConfig config_;
-    void* asr_handle_;
-    void* aligner_handle_;
+    Qwen3ASR* asr_;
+    ForcedAligner* aligner_;
     
     std::deque<ASRRequest> pending_queue_;
     std::mutex queue_mutex_;

@@ -679,9 +679,14 @@ std::vector<batch_result> Qwen3ASR::transcribe_batch(
         results[seq_id].success = true;
     }
     
+    int64_t t_total = get_time_ms() - t_total_start;
     if (params.print_timing) {
-        int64_t t_total = get_time_ms() - t_total_start;
         LOG_INFO("Batch transcription timing: Total {} ms for {} requests", (long long)t_total, n_requests);
+    }
+    
+    // Fill timing info (approximate - batch timing is shared)
+    for (int seq_id = 0; seq_id < n_requests; ++seq_id) {
+        results[seq_id].t_total_ms = t_total;
     }
     
     return results;

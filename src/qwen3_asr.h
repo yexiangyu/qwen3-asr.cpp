@@ -55,6 +55,12 @@ struct batch_result {
     std::vector<float> token_confs;
     bool success = false;
     std::string error_msg;
+    
+    // Timing info (in milliseconds)
+    int64_t t_mel_ms = 0;
+    int64_t t_encode_ms = 0;
+    int64_t t_decode_ms = 0;
+    int64_t t_total_ms = 0;
 };
 
 // Progress callback type

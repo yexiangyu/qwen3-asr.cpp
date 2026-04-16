@@ -1,5 +1,6 @@
 #include "batch_scheduler.h"
-#include "qwen3asr_c_api.h"
+#include "qwen3_asr.h"
+#include "forced_aligner.h"
 #include "logger.h"
 
 #include <algorithm>
@@ -8,11 +9,10 @@
 
 namespace qwen3_asr {
 
-static std::string escape_json_string_local(const char* s) {
-    if (!s) return "";
+static std::string escape_json_string(const std::string& s) {
     std::string result;
-    while (*s) {
-        char c = *s++;
+    result.reserve(s.size() + 10);
+    for (char c : s) {
         switch (c) {
             case '"':  result += "\\\""; break;
             case '\\': result += "\\\\"; break;
@@ -32,69 +32,9 @@ static std::string escape_json_string_local(const char* s) {
     return result;
 }
 
-static std::string build_transcribe_json_response(const qwen3asr_result& result) {
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"success\": true,\n";
-    json << "  \"text\": \"" << escape_json_string_local(result.text) << "\",\n";
-    json << "  \"text_content\": \"" << escape_json_string_local(result.text_content) << "\",\n";
-    json << "  \"n_tokens\": " << result.n_tokens << ",\n";
-    json << "  \"mel_ms\": " << result.t_mel_ms << ",\n";
-    json << "  \"encode_ms\": " << result.t_encode_ms << ",\n";
-    json << "  \"decode_ms\": " << result.t_decode_ms << ",\n";
-    json << "  \"total_ms\": " << result.t_total_ms << "\n";
-    json << "}\n";
-    return json.str();
-}
-
-static std::string build_transcribe_align_json_response(const qwen3alignment_result& result) {
-    std::ostringstream json;
-    json << "{\n";
-    json << "  \"success\": true,\n";
-    json << "  \"n_utterances\": " << result.n_utterances << ",\n";
-    json << "  \"utterances\": [\n";
-    
-    for (int i = 0; i < result.n_utterances; ++i) {
-        const auto& utt = result.utterances[i];
-        json << "    {\n";
-        json << "      \"start\": " << std::fixed << std::setprecision(3) << utt.start << ",\n";
-        json << "      \"end\": " << std::fixed << std::setprecision(3) << utt.end << ",\n";
-        json << "      \"text\": \"" << escape_json_string_local(utt.text) << "\",\n";
-        json << "      \"n_words\": " << utt.n_words << ",\n";
-        json << "      \"words\": [\n";
-        
-        for (int j = 0; j < utt.n_words; ++j) {
-            const auto& w = utt.words[j];
-            json << "        {";
-            json << "\"word\": \"" << escape_json_string_local(w.word) << "\", ";
-            json << "\"start\": " << std::fixed << std::setprecision(3) << w.start << ", ";
-            json << "\"end\": " << std::fixed << std::setprecision(3) << w.end << ", ";
-            json << "\"conf_word\": " << std::fixed << std::setprecision(4) << w.conf_word << ", ";
-            json << "\"conf_start_time\": " << std::fixed << std::setprecision(4) << w.conf_start_time << ", ";
-            json << "\"conf_end_time\": " << std::fixed << std::setprecision(4) << w.conf_end_time;
-            json << "}";
-            if (j + 1 < utt.n_words) json << ",";
-            json << "\n";
-        }
-        
-        json << "      ]\n";
-        json << "    }";
-        if (i + 1 < result.n_utterances) json << ",";
-        json << "\n";
-    }
-    
-    json << "  ],\n";
-    json << "  \"mel_ms\": " << result.t_mel_ms << ",\n";
-    json << "  \"encode_ms\": " << result.t_encode_ms << ",\n";
-    json << "  \"decode_ms\": " << result.t_decode_ms << ",\n";
-    json << "  \"total_ms\": " << result.t_total_ms << "\n";
-    json << "}\n";
-    return json.str();
-}
-
 BatchScheduler::BatchScheduler() 
-    : asr_handle_(nullptr)
-    , aligner_handle_(nullptr)
+    : asr_(nullptr)
+    , aligner_(nullptr)
     , running_(false)
     , next_request_id_(0)
 {
@@ -104,12 +44,12 @@ BatchScheduler::~BatchScheduler() {
     stop();
 }
 
-void BatchScheduler::set_asr(void* asr_handle) {
-    asr_handle_ = asr_handle;
+void BatchScheduler::set_asr(Qwen3ASR* asr) {
+    asr_ = asr;
 }
 
-void BatchScheduler::set_aligner(void* aligner_handle) {
-    aligner_handle_ = aligner_handle;
+void BatchScheduler::set_aligner(ForcedAligner* aligner) {
+    aligner_ = aligner;
 }
 
 void BatchScheduler::start() {
@@ -193,7 +133,7 @@ void BatchScheduler::batch_worker() {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             
-            bool timeout_reached = !batch_cv_.wait_for(
+            batch_cv_.wait_for(
                 lock, 
                 std::chrono::milliseconds(config_.batch_timeout_ms),
                 [this] { 
@@ -224,102 +164,39 @@ void BatchScheduler::batch_worker() {
 }
 
 void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
-    if (!asr_handle_) {
-        LOG_ERROR("ASR handle not set");
+    if (!asr_) {
+        LOG_ERROR("ASR object not set");
         for (auto& req : batch) {
-            req.result_promise.set_value("{\"success\":false,\"error\":\"ASR handle not set\"}");
+            req.result_promise.set_value("{\"success\":false,\"error\":\"ASR not initialized\"}");
         }
         return;
     }
     
     auto batch_start = std::chrono::steady_clock::now();
     
-    qwen3asr_handle asr = static_cast<qwen3asr_handle>(asr_handle_);
-    qwen3aligner_handle aligner = aligner_handle_ ? static_cast<qwen3aligner_handle>(aligner_handle_) : nullptr;
+    // Check if all requests are TRANSCRIBE_ALIGN
+    bool all_transcribe_align = true;
+    for (const auto& req : batch) {
+        if (req.type != RequestType::TRANSCRIBE_ALIGN || !aligner_) {
+            all_transcribe_align = false;
+            break;
+        }
+    }
     
-    // Process requests sequentially within the batch
-    // Note: True parallel batch processing would require refactoring to use 
-    // transcribe_batch() API which processes multiple audio files in parallel.
-    // Current implementation batches requests to reduce overhead but processes
-    // them sequentially for correctness.
-    LOG_INFO("Processing {} requests in batch (sequential within batch)", batch.size());
-    
-    for (auto& req : batch) {
-        try {
-            LOG_INFO("Processing request {} type={}", req.request_id, static_cast<int>(req.type));
-            
-            if (req.type == RequestType::TRANSCRIBE_ALIGN && aligner) {
-                // Full transcribe-align pipeline
-                LOG_INFO("Request {}: Running transcribe-align pipeline", req.request_id);
-                LOG_INFO("Request {}: language={}, context={}, max_tokens={}", 
-                         req.request_id, req.language, req.context, req.max_tokens);
-                // Full transcribe-align pipeline
-                qwen3asr_params asr_params;
-                asr_params.max_tokens = req.max_tokens > 0 ? req.max_tokens : 1024;
-                asr_params.language = req.language.empty() ? nullptr : req.language.c_str();
-                asr_params.context = req.context.empty() ? nullptr : req.context.c_str();
-                asr_params.n_threads = 4;
-                
-                qwen3aligner_params align_params;
-                align_params.language = req.language.empty() ? nullptr : req.language.c_str();
-                align_params.n_threads = 4;
-                
-                qwen3alignment_result align_result;
-                LOG_INFO("Request {}: Calling qwen3asr_transcribe_and_align_pcm with max_tokens={}", 
-                         req.request_id, asr_params.max_tokens);
-                int ret = qwen3asr_transcribe_and_align_pcm(
-                    asr,
-                    aligner,
-                    req.pcm_data.data(),
-                    static_cast<int32_t>(req.pcm_data.size()),
-                    &asr_params,
-                    &align_params,
-                    &align_result
-                );
-                
-                LOG_INFO("Request {}: qwen3asr_transcribe_and_align_pcm returned {}", req.request_id, ret);
-                
-                if (ret != 0) {
-                    std::string error = qwen3_get_last_error();
-                    LOG_ERROR("Request {} transcribe-align failed: {}", req.request_id, error);
-                    req.result_promise.set_value("{\"success\":false,\"error\":\"" + error + "\"}");
-                } else {
-                    std::string json_response = build_transcribe_align_json_response(align_result);
-                    req.result_promise.set_value(json_response);
-                    qwen3aligner_free_result(&align_result);
-                    LOG_DEBUG("Request {} transcribe-align completed", req.request_id);
-                }
+    if (all_transcribe_align && batch.size() > 1) {
+        process_batch_transcribe_align(batch);
+    } else {
+        // Mixed types or single request - process sequentially
+        for (auto& req : batch) {
+            if (req.type == RequestType::TRANSCRIBE_ALIGN && aligner_) {
+                // Single transcribe-align
+                process_batch_transcribe_align(batch);
+                break;
             } else {
-                // Transcription only
-                qwen3asr_params params;
-                params.max_tokens = req.max_tokens > 0 ? req.max_tokens : 1024;
-                params.language = req.language.empty() ? nullptr : req.language.c_str();
-                params.context = req.context.empty() ? nullptr : req.context.c_str();
-                params.n_threads = 4;
-                
-                qwen3asr_result result;
-                int ret = qwen3asr_transcribe_pcm(
-                    asr,
-                    req.pcm_data.data(),
-                    static_cast<int32_t>(req.pcm_data.size()),
-                    &params,
-                    &result
-                );
-                
-                if (ret != 0) {
-                    std::string error = qwen3_get_last_error();
-                    LOG_ERROR("Request {} failed: {}", req.request_id, error);
-                    req.result_promise.set_value("{\"success\":false,\"error\":\"" + error + "\"}");
-                } else {
-                    std::string json_response = build_transcribe_json_response(result);
-                    req.result_promise.set_value(json_response);
-                    qwen3asr_free_result(&result);
-                    LOG_DEBUG("Request {} completed", req.request_id);
-                }
+                // Transcribe only
+                process_batch_transcribe_only(batch);
+                break;
             }
-        } catch (const std::exception& e) {
-            LOG_ERROR("Exception processing request {}: {}", req.request_id, e.what());
-            req.result_promise.set_value("{\"success\":false,\"error\":\"Internal error\"}");
         }
     }
     
@@ -328,6 +205,184 @@ void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
     
     LOG_INFO("Batch of {} requests processed in {}ms (avg {}ms per request)",
              batch.size(), batch_ms, batch.size() > 0 ? batch_ms / batch.size() : 0);
+}
+
+void BatchScheduler::process_batch_transcribe_align(std::vector<ASRRequest>& batch) {
+    if (!asr_ || !aligner_) {
+        LOG_ERROR("ASR or Aligner not set");
+        for (auto& req : batch) {
+            req.result_promise.set_value("{\"success\":false,\"error\":\"Model not initialized\"}");
+        }
+        return;
+    }
+    
+    // Step 1: Prepare float samples for batch transcription
+    std::vector<std::vector<float>> float_samples_list(batch.size());
+    std::vector<const float*> audio_samples(batch.size());
+    std::vector<int> n_samples_list(batch.size());
+    
+    for (size_t i = 0; i < batch.size(); ++i) {
+        float_samples_list[i].resize(batch[i].pcm_data.size());
+        for (size_t j = 0; j < batch[i].pcm_data.size(); ++j) {
+            float_samples_list[i][j] = batch[i].pcm_data[j] / 32768.0f;
+        }
+        audio_samples[i] = float_samples_list[i].data();
+        n_samples_list[i] = static_cast<int>(batch[i].pcm_data.size());
+    }
+    
+    // Step 2: Batch transcribe using transcribe_batch()
+    transcribe_params tp;
+    tp.max_tokens = 1024;
+    tp.n_threads = 4;
+    if (!batch.empty() && !batch[0].language.empty()) {
+        tp.language = batch[0].language;
+    }
+    
+    LOG_INFO("Calling transcribe_batch for {} requests", batch.size());
+    auto transcribe_results = asr_->transcribe_batch(audio_samples, n_samples_list, tp);
+    LOG_INFO("transcribe_batch completed, {} results returned", transcribe_results.size());
+    
+    // Step 3: Align each result
+    for (size_t i = 0; i < batch.size(); ++i) {
+        auto& req = batch[i];
+        try {
+            if (i < transcribe_results.size() && transcribe_results[i].success) {
+                const std::string& text = transcribe_results[i].text_content;
+                
+                // Align
+                align_params ap;
+                
+                LOG_INFO("Request {}: Aligning text: {}", req.request_id, text.substr(0, 50));
+                auto align_result = aligner_->align(
+                    float_samples_list[i].data(),
+                    n_samples_list[i],
+                    text,
+                    req.language,
+                    ap
+                );
+                
+                if (!align_result.success) {
+                    LOG_ERROR("Request {} align failed: {}", req.request_id, align_result.error_msg);
+                    req.result_promise.set_value("{\"success\":false,\"error\":\"" + escape_json_string(align_result.error_msg) + "\"}");
+                } else {
+                    // Build JSON response
+                    std::ostringstream json;
+                    json << "{\n";
+                    json << "  \"success\": true,\n";
+                    json << "  \"n_utterances\": " << align_result.utterances.size() << ",\n";
+                    json << "  \"utterances\": [\n";
+                    
+                    for (size_t u = 0; u < align_result.utterances.size(); ++u) {
+                        const auto& utt = align_result.utterances[u];
+                        json << "    {\n";
+                        json << "      \"start\": " << std::fixed << std::setprecision(3) << utt.start << ",\n";
+                        json << "      \"end\": " << std::fixed << std::setprecision(3) << utt.end << ",\n";
+                        json << "      \"text\": \"" << escape_json_string(utt.text) << "\",\n";
+                        json << "      \"n_words\": " << utt.words.size() << ",\n";
+                        json << "      \"words\": [\n";
+                        
+                        for (size_t w = 0; w < utt.words.size(); ++w) {
+                            const auto& word = utt.words[w];
+                            json << "        {";
+                            json << "\"word\": \"" << escape_json_string(word.word) << "\", ";
+                            json << "\"start\": " << std::fixed << std::setprecision(3) << word.start << ", ";
+                            json << "\"end\": " << std::fixed << std::setprecision(3) << word.end << ", ";
+                            json << "\"conf_word\": " << std::fixed << std::setprecision(4) << word.conf_word << ", ";
+                            json << "\"conf_start_time\": " << std::fixed << std::setprecision(4) << word.conf_start_time << ", ";
+                            json << "\"conf_end_time\": " << std::fixed << std::setprecision(4) << word.conf_end_time;
+                            json << "}";
+                            if (w + 1 < utt.words.size()) json << ",";
+                            json << "\n";
+                        }
+                        
+                        json << "      ]\n";
+                        json << "    }";
+                        if (u + 1 < align_result.utterances.size()) json << ",";
+                        json << "\n";
+                    }
+                    
+                    json << "  ],\n";
+                    json << "  \"transcribe_ms\": " << transcribe_results[i].t_total_ms << ",\n";
+                    json << "  \"align_ms\": " << align_result.t_total_ms << ",\n";
+                    json << "  \"total_ms\": " << (transcribe_results[i].t_total_ms + align_result.t_total_ms) << "\n";
+                    json << "}\n";
+                    
+                    req.result_promise.set_value(json.str());
+                    LOG_INFO("Request {} transcribe-align completed", req.request_id);
+                }
+            } else {
+                std::string error = i < transcribe_results.size() ? transcribe_results[i].error_msg : "No result";
+                LOG_ERROR("Request {} transcribe failed: {}", req.request_id, error);
+                req.result_promise.set_value("{\"success\":false,\"error\":\"" + escape_json_string(error) + "\"}");
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Exception processing request {}: {}", req.request_id, e.what());
+            req.result_promise.set_value("{\"success\":false,\"error\":\"Internal error\"}");
+        }
+    }
+}
+
+void BatchScheduler::process_batch_transcribe_only(std::vector<ASRRequest>& batch) {
+    if (!asr_) {
+        LOG_ERROR("ASR not set");
+        for (auto& req : batch) {
+            req.result_promise.set_value("{\"success\":false,\"error\":\"ASR not initialized\"}");
+        }
+        return;
+    }
+    
+    // Prepare float samples
+    std::vector<std::vector<float>> float_samples_list(batch.size());
+    std::vector<const float*> audio_samples(batch.size());
+    std::vector<int> n_samples_list(batch.size());
+    
+    for (size_t i = 0; i < batch.size(); ++i) {
+        float_samples_list[i].resize(batch[i].pcm_data.size());
+        for (size_t j = 0; j < batch[i].pcm_data.size(); ++j) {
+            float_samples_list[i][j] = batch[i].pcm_data[j] / 32768.0f;
+        }
+        audio_samples[i] = float_samples_list[i].data();
+        n_samples_list[i] = static_cast<int>(batch[i].pcm_data.size());
+    }
+    
+    // Batch transcribe
+    transcribe_params tp;
+    tp.max_tokens = 1024;
+    tp.n_threads = 4;
+    if (!batch.empty() && !batch[0].language.empty()) {
+        tp.language = batch[0].language;
+    }
+    
+    LOG_INFO("Calling transcribe_batch for {} requests", batch.size());
+    auto results = asr_->transcribe_batch(audio_samples, n_samples_list, tp);
+    LOG_INFO("transcribe_batch completed, {} results returned", results.size());
+    
+    // Return results
+    for (size_t i = 0; i < batch.size(); ++i) {
+        auto& req = batch[i];
+        try {
+            if (i < results.size() && results[i].success) {
+                std::ostringstream json;
+                json << "{\n";
+                json << "  \"success\": true,\n";
+                json << "  \"text\": \"" << escape_json_string(results[i].text) << "\",\n";
+                json << "  \"text_content\": \"" << escape_json_string(results[i].text_content) << "\",\n";
+                json << "  \"n_tokens\": " << results[i].tokens.size() << ",\n";
+                json << "  \"total_ms\": " << results[i].t_total_ms << "\n";
+                json << "}\n";
+                
+                req.result_promise.set_value(json.str());
+                LOG_INFO("Request {} transcribe completed", req.request_id);
+            } else {
+                std::string error = i < results.size() ? results[i].error_msg : "No result";
+                LOG_ERROR("Request {} failed: {}", req.request_id, error);
+                req.result_promise.set_value("{\"success\":false,\"error\":\"" + escape_json_string(error) + "\"}");
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Exception processing request {}: {}", req.request_id, e.what());
+            req.result_promise.set_value("{\"success\":false,\"error\":\"Internal error\"}");
+        }
+    }
 }
 
 }
