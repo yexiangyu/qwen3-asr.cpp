@@ -47,6 +47,51 @@ static std::string build_transcribe_json_response(const qwen3asr_result& result)
     return json.str();
 }
 
+static std::string build_transcribe_align_json_response(const qwen3alignment_result& result) {
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"success\": true,\n";
+    json << "  \"n_utterances\": " << result.n_utterances << ",\n";
+    json << "  \"utterances\": [\n";
+    
+    for (int i = 0; i < result.n_utterances; ++i) {
+        const auto& utt = result.utterances[i];
+        json << "    {\n";
+        json << "      \"start\": " << std::fixed << std::setprecision(3) << utt.start << ",\n";
+        json << "      \"end\": " << std::fixed << std::setprecision(3) << utt.end << ",\n";
+        json << "      \"text\": \"" << escape_json_string_local(utt.text) << "\",\n";
+        json << "      \"n_words\": " << utt.n_words << ",\n";
+        json << "      \"words\": [\n";
+        
+        for (int j = 0; j < utt.n_words; ++j) {
+            const auto& w = utt.words[j];
+            json << "        {";
+            json << "\"word\": \"" << escape_json_string_local(w.word) << "\", ";
+            json << "\"start\": " << std::fixed << std::setprecision(3) << w.start << ", ";
+            json << "\"end\": " << std::fixed << std::setprecision(3) << w.end << ", ";
+            json << "\"conf_word\": " << std::fixed << std::setprecision(4) << w.conf_word << ", ";
+            json << "\"conf_start_time\": " << std::fixed << std::setprecision(4) << w.conf_start_time << ", ";
+            json << "\"conf_end_time\": " << std::fixed << std::setprecision(4) << w.conf_end_time;
+            json << "}";
+            if (j + 1 < utt.n_words) json << ",";
+            json << "\n";
+        }
+        
+        json << "      ]\n";
+        json << "    }";
+        if (i + 1 < result.n_utterances) json << ",";
+        json << "\n";
+    }
+    
+    json << "  ],\n";
+    json << "  \"mel_ms\": " << result.t_mel_ms << ",\n";
+    json << "  \"encode_ms\": " << result.t_encode_ms << ",\n";
+    json << "  \"decode_ms\": " << result.t_decode_ms << ",\n";
+    json << "  \"total_ms\": " << result.t_total_ms << "\n";
+    json << "}\n";
+    return json.str();
+}
+
 BatchScheduler::BatchScheduler() 
     : asr_handle_(nullptr)
     , aligner_handle_(nullptr)
@@ -104,7 +149,8 @@ std::future<std::string> BatchScheduler::submit_request(
     const std::vector<int16_t>& pcm,
     const std::string& language,
     const std::string& context,
-    int max_tokens
+    int max_tokens,
+    RequestType type
 ) {
     ASRRequest req;
     req.pcm_data = pcm;
@@ -112,6 +158,7 @@ std::future<std::string> BatchScheduler::submit_request(
     req.context = context;
     req.max_tokens = max_tokens;
     req.request_id = next_request_id_.fetch_add(1);
+    req.type = type;
     
     std::future<std::string> future = req.result_promise.get_future();
     
@@ -122,8 +169,8 @@ std::future<std::string> BatchScheduler::submit_request(
     
     batch_cv_.notify_one();
     
-    LOG_DEBUG("Request {} submitted, pending count: {}", 
-              req.request_id, pending_queue_.size());
+    LOG_DEBUG("Request {} submitted (type={}), pending count: {}", 
+              req.request_id, static_cast<int>(type), pending_queue_.size());
     
     return future;
 }
@@ -188,34 +235,74 @@ void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
     auto batch_start = std::chrono::steady_clock::now();
     
     qwen3asr_handle asr = static_cast<qwen3asr_handle>(asr_handle_);
+    qwen3aligner_handle aligner = aligner_handle_ ? static_cast<qwen3aligner_handle>(aligner_handle_) : nullptr;
     
     for (auto& req : batch) {
         try {
-            qwen3asr_params params;
-            params.max_tokens = req.max_tokens;
-            params.language = req.language.empty() ? nullptr : req.language.c_str();
-            params.context = req.context.empty() ? nullptr : req.context.c_str();
-            params.n_threads = 4;
+            LOG_INFO("Processing request {} type={}", req.request_id, static_cast<int>(req.type));
             
-            qwen3asr_result result;
-            int ret = qwen3asr_transcribe_pcm(
-                asr,
-                req.pcm_data.data(),
-                static_cast<int32_t>(req.pcm_data.size()),
-                &params,
-                &result
-            );
-            
-            if (ret != 0) {
-                std::string error = qwen3_get_last_error();
-                LOG_ERROR("Request {} failed: {}", req.request_id, error);
-                req.result_promise.set_value("{\"success\":false,\"error\":\"" + error + "\"}");
-            } else {
-                std::string json_response = build_transcribe_json_response(result);
-                req.result_promise.set_value(json_response);
-                qwen3asr_free_result(&result);
+            if (req.type == RequestType::TRANSCRIBE_ALIGN && aligner) {
+                // Full transcribe-align pipeline
+                LOG_INFO("Request {}: Running transcribe-align pipeline", req.request_id);
+                // Full transcribe-align pipeline
+                qwen3asr_params asr_params;
+                asr_params.max_tokens = req.max_tokens;
+                asr_params.language = req.language.empty() ? nullptr : req.language.c_str();
+                asr_params.context = req.context.empty() ? nullptr : req.context.c_str();
+                asr_params.n_threads = 4;
                 
-                LOG_DEBUG("Request {} completed", req.request_id);
+                qwen3aligner_params align_params;
+                align_params.language = req.language.empty() ? nullptr : req.language.c_str();
+                align_params.n_threads = 4;
+                
+                qwen3alignment_result align_result;
+                int ret = qwen3asr_transcribe_and_align_pcm(
+                    asr,
+                    aligner,
+                    req.pcm_data.data(),
+                    static_cast<int32_t>(req.pcm_data.size()),
+                    &asr_params,
+                    &align_params,
+                    &align_result
+                );
+                
+                if (ret != 0) {
+                    std::string error = qwen3_get_last_error();
+                    LOG_ERROR("Request {} transcribe-align failed: {}", req.request_id, error);
+                    req.result_promise.set_value("{\"success\":false,\"error\":\"" + error + "\"}");
+                } else {
+                    std::string json_response = build_transcribe_align_json_response(align_result);
+                    req.result_promise.set_value(json_response);
+                    qwen3aligner_free_result(&align_result);
+                    LOG_DEBUG("Request {} transcribe-align completed", req.request_id);
+                }
+            } else {
+                // Transcription only
+                qwen3asr_params params;
+                params.max_tokens = req.max_tokens;
+                params.language = req.language.empty() ? nullptr : req.language.c_str();
+                params.context = req.context.empty() ? nullptr : req.context.c_str();
+                params.n_threads = 4;
+                
+                qwen3asr_result result;
+                int ret = qwen3asr_transcribe_pcm(
+                    asr,
+                    req.pcm_data.data(),
+                    static_cast<int32_t>(req.pcm_data.size()),
+                    &params,
+                    &result
+                );
+                
+                if (ret != 0) {
+                    std::string error = qwen3_get_last_error();
+                    LOG_ERROR("Request {} failed: {}", req.request_id, error);
+                    req.result_promise.set_value("{\"success\":false,\"error\":\"" + error + "\"}");
+                } else {
+                    std::string json_response = build_transcribe_json_response(result);
+                    req.result_promise.set_value(json_response);
+                    qwen3asr_free_result(&result);
+                    LOG_DEBUG("Request {} completed", req.request_id);
+                }
             }
         } catch (const std::exception& e) {
             LOG_ERROR("Exception processing request {}: {}", req.request_id, e.what());

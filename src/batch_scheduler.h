@@ -13,6 +13,11 @@
 
 namespace qwen3_asr {
 
+enum class RequestType {
+    TRANSCRIBE,
+    TRANSCRIBE_ALIGN
+};
+
 struct ASRRequest {
     std::vector<int16_t> pcm_data;
     std::string language;
@@ -20,8 +25,9 @@ struct ASRRequest {
     int max_tokens;
     std::promise<std::string> result_promise;
     int request_id;
+    RequestType type;
     
-    ASRRequest() : max_tokens(1024), request_id(-1) {}
+    ASRRequest() : max_tokens(1024), request_id(-1), type(RequestType::TRANSCRIBE) {}
 };
 
 struct BatchConfig {
@@ -45,7 +51,8 @@ public:
         const std::vector<int16_t>& pcm,
         const std::string& language = "",
         const std::string& context = "",
-        int max_tokens = 1024
+        int max_tokens = 1024,
+        RequestType type = RequestType::TRANSCRIBE
     );
     
     void start();

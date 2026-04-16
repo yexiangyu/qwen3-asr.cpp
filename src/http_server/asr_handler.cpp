@@ -355,7 +355,10 @@ std::string CombinedASRServer::handle_transcribe_align(
              pcm_data.size(), language.empty() ? "(auto)" : language, 
              context.size(), max_tokens);
     
-    auto future = batch_scheduler_->submit_request(pcm_data, language, context, max_tokens);
+    auto future = batch_scheduler_->submit_request(
+        pcm_data, language, context, max_tokens, 
+        RequestType::TRANSCRIBE_ALIGN
+    );
     return future.get();
 }
 
