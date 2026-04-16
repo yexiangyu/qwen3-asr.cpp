@@ -244,9 +244,11 @@ void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
             if (req.type == RequestType::TRANSCRIBE_ALIGN && aligner) {
                 // Full transcribe-align pipeline
                 LOG_INFO("Request {}: Running transcribe-align pipeline", req.request_id);
+                LOG_INFO("Request {}: language={}, context={}, max_tokens={}", 
+                         req.request_id, req.language, req.context, req.max_tokens);
                 // Full transcribe-align pipeline
                 qwen3asr_params asr_params;
-                asr_params.max_tokens = req.max_tokens;
+                asr_params.max_tokens = req.max_tokens > 0 ? req.max_tokens : 1024;
                 asr_params.language = req.language.empty() ? nullptr : req.language.c_str();
                 asr_params.context = req.context.empty() ? nullptr : req.context.c_str();
                 asr_params.n_threads = 4;
@@ -256,6 +258,8 @@ void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
                 align_params.n_threads = 4;
                 
                 qwen3alignment_result align_result;
+                LOG_INFO("Request {}: Calling qwen3asr_transcribe_and_align_pcm with max_tokens={}", 
+                         req.request_id, asr_params.max_tokens);
                 int ret = qwen3asr_transcribe_and_align_pcm(
                     asr,
                     aligner,
@@ -265,6 +269,8 @@ void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
                     &align_params,
                     &align_result
                 );
+                
+                LOG_INFO("Request {}: qwen3asr_transcribe_and_align_pcm returned {}", req.request_id, ret);
                 
                 if (ret != 0) {
                     std::string error = qwen3_get_last_error();
@@ -279,7 +285,7 @@ void BatchScheduler::process_batch(std::vector<ASRRequest>& batch) {
             } else {
                 // Transcription only
                 qwen3asr_params params;
-                params.max_tokens = req.max_tokens;
+                params.max_tokens = req.max_tokens > 0 ? req.max_tokens : 1024;
                 params.language = req.language.empty() ? nullptr : req.language.c_str();
                 params.context = req.context.empty() ? nullptr : req.context.c_str();
                 params.n_threads = 4;

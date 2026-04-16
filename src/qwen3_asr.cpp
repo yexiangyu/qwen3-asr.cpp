@@ -272,6 +272,9 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
                                std::vector<float> & output_confs) {
     const auto & cfg = decoder_.get_config();
     
+    LOG_INFO("decode_greedy: n_input_tokens={}, max_tokens={}, eos_token={}", 
+             input_tokens.size(), params.max_tokens, cfg.eos_token_id);
+    
     int32_t n_ctx_needed = input_tokens.size() + params.max_tokens;
     if (!decoder_.init_kv_cache(n_ctx_needed)) {
         error_msg_ = "Failed to initialize KV cache: " + decoder_.get_error();
