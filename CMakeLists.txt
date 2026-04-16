@@ -696,6 +696,24 @@ if(QWEN3_ASR_HTTP_SERVER)
         Threads::Threads
     )
     
+    # Combined ASR server executable (transcription + alignment)
+    add_executable(qwen3-asr-server
+        src/http_server/asr_server.cpp
+        src/http_server/asr_handler.cpp
+    )
+    target_include_directories(qwen3-asr-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${crow_SOURCE_DIR}/include
+        "${asio_SOURCE_DIR}/asio/include"
+    )
+    target_link_libraries(qwen3-asr-server PRIVATE
+        qwen3asr
+        logger
+        asio_header
+        Crow::Crow
+        Threads::Threads
+    )
+    
     # Install targets
-    install(TARGETS qwen3-align-server qwen3-transcribe-server DESTINATION bin)
+    install(TARGETS qwen3-align-server qwen3-transcribe-server qwen3-asr-server DESTINATION bin)
 endif()

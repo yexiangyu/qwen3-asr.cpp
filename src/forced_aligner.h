@@ -219,7 +219,7 @@ public:
     ~ForcedAligner();
     
     // Load model from GGUF file
-    bool load_model(const std::string & model_path);
+    bool load_model(const std::string & model_path, const std::string & device_name = "");
     
     // Original align interface (without ASR token confidence)
     alignment_result align(const std::string & audio_path, const std::string & text,

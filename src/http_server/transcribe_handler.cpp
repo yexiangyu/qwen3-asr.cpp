@@ -39,7 +39,6 @@ static std::string build_success_response(const qwen3asr_result& result) {
     json << "  \"success\": true,\n";
     json << "  \"text\": \"" << escape_json_string(result.text) << "\",\n";
     json << "  \"text_content\": \"" << escape_json_string(result.text_content) << "\",\n";
-    json << "  \"processing_time_ms\": " << result.t_total_ms << ",\n";
     json << "  \"n_tokens\": " << result.n_tokens << ",\n";
     json << "  \"tokens\": [\n";
     
@@ -52,7 +51,11 @@ static std::string build_success_response(const qwen3asr_result& result) {
         json << "\n";
     }
     
-    json << "  ]\n";
+    json << "  ],\n";
+    json << "  \"mel_ms\": " << result.t_mel_ms << ",\n";
+    json << "  \"encode_ms\": " << result.t_encode_ms << ",\n";
+    json << "  \"decode_ms\": " << result.t_decode_ms << ",\n";
+    json << "  \"total_ms\": " << result.t_total_ms << "\n";
     json << "}\n";
     
     return json.str();

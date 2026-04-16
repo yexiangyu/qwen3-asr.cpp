@@ -37,15 +37,15 @@ static std::string extract_text_content(const std::string & text) {
 Qwen3ASR::Qwen3ASR() = default;
 Qwen3ASR::~Qwen3ASR() = default;
 
-bool Qwen3ASR::load_model(const std::string & model_path) {
+bool Qwen3ASR::load_model(const std::string & model_path, const std::string & device_name) {
     int64_t t_start = get_time_ms();
     
-    if (!encoder_.load_model(model_path)) {
+    if (!encoder_.load_model(model_path, device_name)) {
         error_msg_ = "Failed to load audio encoder: " + encoder_.get_error();
         return false;
     }
     
-    if (!decoder_.load_model(model_path)) {
+    if (!decoder_.load_model(model_path, device_name)) {
         error_msg_ = "Failed to load text decoder: " + decoder_.get_error();
         return false;
     }

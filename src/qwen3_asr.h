@@ -60,7 +60,7 @@ public:
     
     // Load model from GGUF file
     // Returns true on success, false on failure (check get_error())
-    bool load_model(const std::string & model_path);
+    bool load_model(const std::string & model_path, const std::string & device_name = "");
     
     // Transcribe audio file (WAV format, 16kHz mono)
     // Returns transcription result

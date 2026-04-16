@@ -22,7 +22,7 @@ public:
     AudioEncoder();
     ~AudioEncoder();
     
-    bool load_model(const std::string & model_path);
+    bool load_model(const std::string & model_path, const std::string & device_name = "");
     
     bool encode(const float * mel_data, int n_mel, int n_frames, 
                 std::vector<float> & output);

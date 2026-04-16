@@ -76,23 +76,42 @@ cmake -B build -DQWEN3_ASR_TIMING=ON && cmake --build build -j$(nproc)
 
 ### HTTP Servers
 
-Two HTTP servers are provided for production deployment:
+Three HTTP servers are provided for production deployment:
 
-#### Transcribe Server (ASR)
+#### Combined ASR Server (Recommended)
+
+```bash
+./build/qwen3-asr-server \
+    --asr-model models/qwen3-asr-0.6b-f16.gguf \
+    --aligner-model models/qwen3-forced-aligner-0.6b-f16.gguf \
+    --port 8082 \
+    --threads 4 \
+    --korean-dict assets/korean_dict_jieba.dict \
+    --asr-device CUDA0 \
+    --aligner-device CUDA1
+
+# Endpoints:
+#   GET  /health          - Health check
+#   POST /transcribe      - Transcription only
+#   POST /align           - Alignment only (requires text)
+#   POST /transcribe-align - Combined transcription + alignment (recommended)
+```
+
+#### Transcribe Server (ASR Only)
 
 ```bash
 ./build/qwen3-transcribe-server \
     --model models/qwen3-asr-0.6b-f16.gguf \
     --port 8081 \
     --threads 4 \
-    --device CUDA0  # Optional: specify GPU device
+    --device CUDA0
 
 # Endpoints:
 #   GET  /health     - Health check
 #   POST /transcribe - Upload audio (multipart: audio, language, context, max_tokens)
 ```
 
-#### Align Server (Forced Alignment)
+#### Align Server (Forced Alignment Only)
 
 ```bash
 ./build/qwen3-align-server \
@@ -100,7 +119,7 @@ Two HTTP servers are provided for production deployment:
     --port 8080 \
     --threads 4 \
     --korean-dict assets/korean_dict_jieba.dict \
-    --device CUDA1  # Optional: specify different GPU
+    --device CUDA1
 
 # Endpoints:
 #   GET  /health - Health check
@@ -109,20 +128,31 @@ Two HTTP servers are provided for production deployment:
 
 #### Multi-GPU Deployment
 
-Run both servers on different GPUs:
+Run separate servers on different GPUs:
 
 ```bash
-# GPU 0 for transcription
-./build/qwen3-transcribe-server --model models/asr.gguf --port 8081 --device CUDA0
+# Option 1: Combined server with separate GPU assignments
+./build/qwen3-asr-server \
+    --asr-model models/asr.gguf \
+    --aligner-model models/aligner.gguf \
+    --port 8082 \
+    --asr-device CUDA0 \
+    --aligner-device CUDA1
 
-# GPU 1 for alignment
+# Option 2: Separate servers on different GPUs
+./build/qwen3-transcribe-server --model models/asr.gguf --port 8081 --device CUDA0
 ./build/qwen3-align-server --model models/aligner.gguf --port 8080 --device CUDA1
 ```
 
 #### API Usage Example
 
 ```bash
-# Transcribe
+# Combined transcription + alignment (single request)
+curl -X POST http://localhost:8082/transcribe-align \
+    -F "audio=@audio.raw" \
+    -F "language=chinese"
+
+# Transcription only
 curl -X POST http://localhost:8081/transcribe \
     -F "audio=@audio.raw" \
     -F "language=chinese"

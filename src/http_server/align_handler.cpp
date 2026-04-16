@@ -37,7 +37,6 @@ static std::string build_success_response(const qwen3alignment_result& result) {
     std::ostringstream json;
     json << "{\n";
     json << "  \"success\": true,\n";
-    json << "  \"processing_time_ms\": " << result.t_total_ms << ",\n";
     json << "  \"n_utterances\": " << result.n_utterances << ",\n";
     json << "  \"utterances\": [\n";
     
@@ -70,7 +69,11 @@ static std::string build_success_response(const qwen3alignment_result& result) {
         json << "\n";
     }
     
-    json << "  ]\n";
+    json << "  ],\n";
+    json << "  \"mel_ms\": " << result.t_mel_ms << ",\n";
+    json << "  \"encode_ms\": " << result.t_encode_ms << ",\n";
+    json << "  \"decode_ms\": " << result.t_decode_ms << ",\n";
+    json << "  \"total_ms\": " << result.t_total_ms << "\n";
     json << "}\n";
     
     return json.str();

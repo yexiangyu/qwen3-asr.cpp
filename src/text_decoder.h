@@ -110,7 +110,7 @@ public:
     ~TextDecoder();
     
     // Load model from GGUF file
-    bool load_model(const std::string & model_path);
+    bool load_model(const std::string & model_path, const std::string & device_name = "");
     
     // Initialize KV cache for given context length
     bool init_kv_cache(int32_t n_ctx);
@@ -157,6 +157,9 @@ private:
                                      const float * audio_embd = nullptr,
                                      int32_t n_audio = 0,
                                      int32_t audio_start_pos = 0);
+    
+    // Initialize backend state with device selection
+    bool init_state(const std::string & device_name = "");
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);

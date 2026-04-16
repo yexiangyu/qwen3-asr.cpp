@@ -81,6 +81,9 @@ typedef struct {
     int32_t* token_ids;
     float* token_confs;
     int32_t n_tokens;
+    int64_t t_mel_ms;
+    int64_t t_encode_ms;
+    int64_t t_decode_ms;
     int64_t t_total_ms;
 } qwen3asr_result;
 
@@ -137,6 +140,9 @@ typedef struct {
 typedef struct {
     qwen3aligned_utterance* utterances;
     int32_t n_utterances;
+    int64_t t_mel_ms;
+    int64_t t_encode_ms;
+    int64_t t_decode_ms;
     int64_t t_total_ms;
 } qwen3alignment_result;
 
@@ -177,6 +183,23 @@ QWEN3ASR_API int qwen3asr_transcribe_and_align_pcm(
     const qwen3aligner_params* align_params,
     qwen3alignment_result* result
 );
+
+typedef struct {
+    qwen3asr_result transcription;
+    qwen3alignment_result alignment;
+} qwen3combined_result;
+
+QWEN3ASR_API int qwen3asr_transcribe_align_pcm_combined(
+    qwen3asr_handle asr_handle,
+    qwen3aligner_handle aligner_handle,
+    const int16_t* pcm_samples,
+    int32_t n_samples,
+    const qwen3asr_params* asr_params,
+    const qwen3aligner_params* align_params,
+    qwen3combined_result* result
+);
+
+QWEN3ASR_API void qwen3asr_free_combined_result(qwen3combined_result* result);
 
 #ifdef __cplusplus
 }

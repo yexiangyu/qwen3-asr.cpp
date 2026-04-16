@@ -168,7 +168,12 @@ int qwen3asr_load_model(qwen3asr_handle handle, const char* model_path) {
         return -1;
     }
     
-    if (!handle->asr->load_model(model_path)) {
+    std::string device = handle->device_name;
+    if (device == "auto") {
+        device = "";
+    }
+    
+    if (!handle->asr->load_model(model_path, device)) {
         g_last_error = handle->asr->get_error();
         return -1;
     }
@@ -243,6 +248,9 @@ int qwen3asr_transcribe_wav_file(
     }
     
     result->n_tokens = static_cast<int32_t>(internal_result.tokens.size());
+    result->t_mel_ms = internal_result.t_mel_ms;
+    result->t_encode_ms = internal_result.t_encode_ms;
+    result->t_decode_ms = internal_result.t_decode_ms;
     result->t_total_ms = internal_result.t_total_ms;
     
     if (internal_result.tokens.size() > 0) {
@@ -325,6 +333,9 @@ int qwen3asr_transcribe_pcm(
     }
     
     result->n_tokens = static_cast<int32_t>(internal_result.tokens.size());
+    result->t_mel_ms = internal_result.t_mel_ms;
+    result->t_encode_ms = internal_result.t_encode_ms;
+    result->t_decode_ms = internal_result.t_decode_ms;
     result->t_total_ms = internal_result.t_total_ms;
     
     if (internal_result.tokens.size() > 0) {
@@ -418,7 +429,12 @@ int qwen3aligner_load_model(qwen3aligner_handle handle, const char* model_path) 
         return -1;
     }
     
-    if (!handle->aligner->load_model(model_path)) {
+    std::string device = handle->device_name;
+    if (device == "auto") {
+        device = "";
+    }
+    
+    if (!handle->aligner->load_model(model_path, device)) {
         g_last_error = handle->aligner->get_error();
         return -1;
     }
@@ -473,6 +489,9 @@ void qwen3aligner_free_result(qwen3alignment_result* result) {
 
 static bool fill_alignment_result(const qwen3_asr::alignment_result& internal, qwen3alignment_result* result) {
     result->n_utterances = static_cast<int32_t>(internal.utterances.size());
+    result->t_mel_ms = internal.t_mel_ms;
+    result->t_encode_ms = internal.t_encode_ms;
+    result->t_decode_ms = internal.t_decode_ms;
     result->t_total_ms = internal.t_total_ms;
     
     if (internal.utterances.size() > 0) {
@@ -797,6 +816,129 @@ int qwen3asr_transcribe_and_align_pcm(
         return -1;
     }
     return 0;
+}
+
+int qwen3asr_transcribe_align_pcm_combined(
+    qwen3asr_handle asr_handle,
+    qwen3aligner_handle aligner_handle,
+    const int16_t* pcm_samples,
+    int32_t n_samples,
+    const qwen3asr_params* asr_params,
+    const qwen3aligner_params* align_params,
+    qwen3combined_result* result
+) {
+    if (!asr_handle || !asr_handle->asr) {
+        g_last_error = "Invalid ASR handle";
+        return -1;
+    }
+    
+    if (!aligner_handle || !aligner_handle->aligner) {
+        g_last_error = "Invalid aligner handle";
+        return -1;
+    }
+    
+    if (!pcm_samples) {
+        g_last_error = "PCM samples pointer is null";
+        return -1;
+    }
+    
+    if (n_samples <= 0) {
+        g_last_error = "Invalid number of samples";
+        return -1;
+    }
+    
+    if (!result) {
+        g_last_error = "Result pointer is null";
+        return -1;
+    }
+    
+    std::vector<float> float_samples = pcm_to_float(pcm_samples, n_samples);
+    
+    qwen3_asr::transcribe_params tp;
+    if (asr_params) {
+        tp.max_tokens = asr_params->max_tokens;
+        tp.language = asr_params->language ? asr_params->language : "";
+        tp.context = asr_params->context ? asr_params->context : "";
+        tp.n_threads = asr_params->n_threads;
+    }
+    
+    auto asr_result = asr_handle->asr->transcribe(float_samples.data(), n_samples, tp);
+    if (!asr_result.success) {
+        g_last_error = asr_result.error_msg;
+        return -1;
+    }
+    
+    result->transcription.text = strdup(asr_result.text.c_str());
+    result->transcription.text_content = strdup(asr_result.text_content.c_str());
+    
+    if (!result->transcription.text || !result->transcription.text_content) {
+        if (result->transcription.text) free(result->transcription.text);
+        if (result->transcription.text_content) free(result->transcription.text_content);
+        g_last_error = "Failed to allocate memory for transcription strings";
+        return -1;
+    }
+    
+    result->transcription.n_tokens = static_cast<int32_t>(asr_result.tokens.size());
+    result->transcription.t_mel_ms = asr_result.t_mel_ms;
+    result->transcription.t_encode_ms = asr_result.t_encode_ms;
+    result->transcription.t_decode_ms = asr_result.t_decode_ms;
+    result->transcription.t_total_ms = asr_result.t_total_ms;
+    
+    if (asr_result.tokens.size() > 0) {
+        result->transcription.token_ids = (int32_t*)malloc(asr_result.tokens.size() * sizeof(int32_t));
+        result->transcription.token_confs = (float*)malloc(asr_result.token_confidences.size() * sizeof(float));
+        
+        if (!result->transcription.token_ids || !result->transcription.token_confs) {
+            free(result->transcription.text);
+            free(result->transcription.text_content);
+            if (result->transcription.token_ids) free(result->transcription.token_ids);
+            if (result->transcription.token_confs) free(result->transcription.token_confs);
+            g_last_error = "Failed to allocate memory for token arrays";
+            return -1;
+        }
+        
+        for (size_t i = 0; i < asr_result.tokens.size(); ++i) {
+            result->transcription.token_ids[i] = asr_result.tokens[i];
+            result->transcription.token_confs[i] = asr_result.token_confidences[i];
+        }
+    } else {
+        result->transcription.token_ids = nullptr;
+        result->transcription.token_confs = nullptr;
+    }
+    
+    std::string lang = align_params && align_params->language ? align_params->language : "";
+    
+    qwen3_asr::align_params ap;
+    auto align_internal = aligner_handle->aligner->align_with_asr_tokens(
+        float_samples.data(),
+        n_samples,
+        asr_result.text_content,
+        asr_result.tokens,
+        asr_result.token_confidences,
+        asr_result.token_strings,
+        lang,
+        ap
+    );
+    
+    if (!align_internal.success) {
+        g_last_error = align_internal.error_msg;
+        qwen3asr_free_result(&result->transcription);
+        return -1;
+    }
+    
+    if (!fill_alignment_result(align_internal, &result->alignment)) {
+        qwen3asr_free_result(&result->transcription);
+        return -1;
+    }
+    
+    return 0;
+}
+
+void qwen3asr_free_combined_result(qwen3combined_result* result) {
+    if (result) {
+        qwen3asr_free_result(&result->transcription);
+        qwen3aligner_free_result(&result->alignment);
+    }
 }
 
 }

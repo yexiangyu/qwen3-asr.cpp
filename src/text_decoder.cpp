@@ -39,7 +39,7 @@ TextDecoder::~TextDecoder() {
     free_decoder_model(model_);
 }
 
-bool TextDecoder::load_model(const std::string & model_path) {
+bool TextDecoder::load_model(const std::string & model_path, const std::string & device_name) {
     struct gguf_init_params params = {
         /*.no_alloc =*/ true,
         /*.ctx      =*/ &model_.ctx,
@@ -79,13 +79,35 @@ bool TextDecoder::load_model(const std::string & model_path) {
     
     gguf_free(ctx_gguf);
     
+    if (!init_state(device_name)) {
+        return false;
+    }
+    
+    if (!init_kv_cache(4096)) {
+        return false;
+    }
+    
+    return true;
+}
+
+bool TextDecoder::init_state(const std::string & device_name) {
     state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!state_.backend_cpu) {
         error_msg_ = "Failed to initialize CPU backend";
         return false;
     }
 
-    state_.backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    // Initialize GPU backend with device selection
+    if (!device_name.empty()) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(device_name.c_str());
+        if (dev) {
+            state_.backend_gpu = ggml_backend_dev_init(dev, nullptr);
+        }
+    }
+    
+    if (!state_.backend_gpu) {
+        state_.backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    }
 
     std::vector<ggml_backend_t> backends;
     std::vector<ggml_backend_buffer_type_t> backend_bufts;
