@@ -129,35 +129,63 @@ void BatchScheduler::batch_worker() {
     
     while (running_) {
         std::vector<ASRRequest> batch;
-        bool timeout_triggered = false;
+        bool batch_full = false;
         
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             
-            auto wait_start = std::chrono::steady_clock::now();
-            
-            // Wait until: batch is full OR timeout OR shutdown
-            timeout_triggered = !batch_cv_.wait_for(
-                lock, 
-                std::chrono::milliseconds(config_.batch_timeout_ms),
-                [this] { 
-                    return !running_ || pending_queue_.size() >= static_cast<size_t>(config_.max_batch_size); 
-                }
-            );
-            
-            auto wait_end = std::chrono::steady_clock::now();
-            auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wait_end - wait_start).count();
+            // Step 1: Wait for at least one request
+            batch_cv_.wait(lock, [this] { 
+                return !running_ || !pending_queue_.empty(); 
+            });
             
             if (!running_) break;
             
-            // Determine why we woke up
-            if (timeout_triggered) {
-                LOG_INFO("Batch timeout triggered after {}ms (queue size: {})", 
-                         wait_ms, pending_queue_.size());
+            auto wait_start = std::chrono::steady_clock::now();
+            
+            // Step 2: Wait for batch full OR timeout
+            // If batch is already full (max_batch_size=1), skip waiting
+            if (pending_queue_.size() < static_cast<size_t>(config_.max_batch_size)) {
+                while (running_) {
+                    auto elapsed = std::chrono::steady_clock::now() - wait_start;
+                    auto remaining = std::chrono::milliseconds(config_.batch_timeout_ms) - 
+                                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+                    
+                    if (remaining.count() <= 0) {
+                        // Timeout expired
+                        LOG_INFO("Batch timeout after {}ms (queue: {}/{})", 
+                                 config_.batch_timeout_ms, pending_queue_.size(), config_.max_batch_size);
+                        break;
+                    }
+                    
+                    // Wait for new request or timeout
+                    auto status = batch_cv_.wait_for(lock, remaining);
+                    
+                    if (!running_) break;
+                    
+                    // Check if batch is full
+                    if (pending_queue_.size() >= static_cast<size_t>(config_.max_batch_size)) {
+                        batch_full = true;
+                        LOG_INFO("Batch full after {}ms (queue: {}/{})", 
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - wait_start).count(),
+                                 pending_queue_.size(), config_.max_batch_size);
+                        break;
+                    }
+                    
+                    // If notified but not full, continue waiting
+                    if (status == std::cv_status::no_timeout) {
+                        LOG_DEBUG("New request arrived (queue: {}), continuing to wait for batch fill", 
+                                  pending_queue_.size());
+                    }
+                }
             } else {
-                LOG_INFO("Batch full triggered after {}ms (queue size: {})", 
-                         wait_ms, pending_queue_.size());
+                batch_full = true;
+                LOG_INFO("Batch immediately full (queue: {}/{})", 
+                         pending_queue_.size(), config_.max_batch_size);
             }
+            
+            if (!running_) break;
             
             // Take all available requests (up to max_batch_size)
             int batch_size = std::min(
@@ -174,8 +202,6 @@ void BatchScheduler::batch_worker() {
         if (!batch.empty()) {
             LOG_INFO("Processing batch of {} requests", batch.size());
             process_batch(batch);
-        } else {
-            LOG_DEBUG("No requests in batch after timeout, continuing");
         }
     }
     
