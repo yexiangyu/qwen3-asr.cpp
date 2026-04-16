@@ -13,6 +13,12 @@
 #ifdef __APPLE__
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
+#elif defined(HAVE_BLAS)
+#ifdef HAVE_MKL
+#include <mkl_cblas.h>
+#else
+#include <cblas.h>
+#endif
 #endif
 
 #ifndef M_PI

@@ -1,6 +1,25 @@
 cmake_minimum_required(VERSION 3.14)
 project(qwen3-asr-ggml VERSION 0.1.0 LANGUAGES CXX)
 
+# Auto-initialize GGML submodule if not present
+set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
+if(NOT EXISTS "${GGML_DIR}/CMakeLists.txt")
+    message(STATUS "GGML submodule not found, initializing...")
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            RESULT_VARIABLE GIT_SUBMOD_RESULT
+        )
+        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
+            message(FATAL_ERROR "Failed to initialize GGML submodule. Please run 'git submodule update --init --recursive' manually.")
+        endif()
+    else()
+        message(FATAL_ERROR "Git not found. Please initialize GGML submodule manually.")
+    endif()
+endif()
+
 # C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,22 +70,38 @@ endif()
 # Find threads
 find_package(Threads REQUIRED)
 
-# GGML library paths
-set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
-set(GGML_BUILD_DIR "${GGML_DIR}/build")
-
-# CUDA detection for Linux platforms
+# CUDA detection for Linux: auto-enable if found at /usr/local/cuda, unless explicitly disabled
 if(UNIX AND NOT APPLE)
-    find_package(CUDAToolkit QUIET)
-    option(GGML_CUDA "Enable GGML CUDA backend" OFF)
-    if(CUDAToolkit_FOUND AND GGML_CUDA)
-        message(STATUS "CUDA Toolkit found at ${CUDAToolkit_ROOT_DIR}")
-        message(STATUS "GGML CUDA backend: enabled")
-        set(GGML_CUDA_FOUND TRUE)
-    elseif(GGML_CUDA AND NOT CUDAToolkit_FOUND)
-        message(WARNING "CUDA requested but CUDAToolkit not found")
+    option(GGML_CUDA "Enable GGML CUDA backend" ON)
+    
+    if(GGML_CUDA)
+        # Set CUDA toolkit hint paths before find_package (only if not already set)
+        if(NOT DEFINED ENV{CUDAToolkit_ROOT} AND NOT DEFINED CUDAToolkit_ROOT)
+            set(ENV{CUDAToolkit_ROOT} "/usr/local/cuda")
+        endif()
+        find_package(CUDAToolkit QUIET)
+        
+        if(CUDAToolkit_FOUND)
+            message(STATUS "CUDA Toolkit found at ${CUDAToolkit_ROOT_DIR}")
+            message(STATUS "GGML CUDA backend: enabled")
+            set(GGML_CUDA_FOUND TRUE)
+            # Set CUDA compiler path for GGML subdirectory
+            if(NOT CMAKE_CUDA_COMPILER)
+                set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc" CACHE PATH "CUDA compiler" FORCE)
+            endif()
+        else()
+            message(STATUS "CUDA not found, building with CPU only")
+            set(GGML_CUDA_FOUND FALSE)
+        endif()
+    else()
+        message(STATUS "CUDA explicitly disabled")
+        set(GGML_CUDA_FOUND FALSE)
     endif()
 endif()
+
+# Build GGML as part of this project (GGML_CUDA must be set before add_subdirectory)
+set(GGML_BUILD_DIR "${GGML_DIR}/build")
+add_subdirectory(${GGML_DIR} ${GGML_BUILD_DIR} EXCLUDE_FROM_ALL)
 
 # Logger library
 add_library(logger STATIC
@@ -99,10 +134,69 @@ if(APPLE)
     )
     target_compile_definitions(mel_spectrogram PRIVATE HAVE_BLAS)
 else()
-    # Try to find BLAS for Linux
-    find_package(BLAS QUIET)
+    # Try to find BLAS for Linux: prefer MKL, then OpenBLAS, then generic BLAS
+    set(BLAS_FOUND FALSE)
+    set(BLAS_LIBRARIES "")
+
+    # 1. Try Intel MKL at /opt/intel/oneapi/mkl/latest
+    if(NOT BLAS_FOUND)
+        set(MKL_ROOT "/opt/intel/oneapi/mkl/latest")
+        if(EXISTS "${MKL_ROOT}")
+            message(STATUS "Intel MKL root found at ${MKL_ROOT}")
+            find_path(MKL_INCLUDE_DIR mkl.h PATHS "${MKL_ROOT}/include" NO_DEFAULT_PATH)
+            # Use mkl_rt single dynamic library for simpler linking
+            find_library(MKL_RT_LIB NAMES mkl_rt PATHS "${MKL_ROOT}/lib" "${MKL_ROOT}/lib/intel64" NO_DEFAULT_PATH)
+
+            if(MKL_RT_LIB)
+                set(BLAS_FOUND TRUE)
+                set(HAVE_MKL TRUE)
+                set(BLAS_LIBRARIES ${MKL_RT_LIB})
+                message(STATUS "Intel MKL found: ${BLAS_LIBRARIES}")
+                target_include_directories(mel_spectrogram PRIVATE "${MKL_ROOT}/include")
+                target_compile_definitions(mel_spectrogram PRIVATE HAVE_MKL)
+            else()
+                message(STATUS "MKL root found but mkl_rt not found, trying other BLAS providers")
+            endif()
+        endif()
+    endif()
+
+    # 2. Try OpenBLAS
+    if(NOT BLAS_FOUND)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(OPENBLAS QUIET openblas)
+        endif()
+        if(OPENBLAS_FOUND)
+            set(BLAS_FOUND TRUE)
+            set(BLAS_LIBRARIES ${OPENBLAS_LINK_LIBRARIES})
+            message(STATUS "OpenBLAS found via pkg-config: ${BLAS_LIBRARIES}")
+            if(OPENBLAS_INCLUDE_DIRS)
+                target_include_directories(mel_spectrogram PRIVATE ${OPENBLAS_INCLUDE_DIRS})
+            endif()
+        else()
+            # Try finding OpenBLAS directly
+            find_library(OPENBLAS_LIB NAMES openblas PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib /opt/OpenBLAS/lib)
+            find_path(OPENBLAS_INCLUDE_DIR cblas.h PATHS /usr/include /usr/include/openblas /usr/local/include /opt/OpenBLAS/include)
+            if(OPENBLAS_LIB)
+                set(BLAS_FOUND TRUE)
+                set(BLAS_LIBRARIES ${OPENBLAS_LIB})
+                message(STATUS "OpenBLAS found: ${BLAS_LIBRARIES}")
+                if(OPENBLAS_INCLUDE_DIR)
+                    target_include_directories(mel_spectrogram PRIVATE ${OPENBLAS_INCLUDE_DIR})
+                endif()
+            endif()
+        endif()
+    endif()
+
+    # 3. Fallback to generic BLAS
+    if(NOT BLAS_FOUND)
+        find_package(BLAS QUIET)
+        if(BLAS_FOUND)
+            message(STATUS "Generic BLAS found: ${BLAS_LIBRARIES}")
+        endif()
+    endif()
+
     if(BLAS_FOUND)
-        message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
         target_link_libraries(mel_spectrogram PRIVATE
             Threads::Threads
             ${BLAS_LIBRARIES}
@@ -225,10 +319,156 @@ target_link_libraries(qwen3-asr-cli PRIVATE
     logger
 )
 
-# Test executable for mel spectrogram
-add_executable(test_mel
-    tests/test_mel.cpp
-)
+# Test executables (controlled by QWEN3_ASR_BUILD_TESTS option)
+option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
+
+if(QWEN3_ASR_BUILD_TESTS)
+    # Test executable for mel spectrogram
+    add_executable(test_mel
+        tests/test_mel.cpp
+    )
+    target_link_libraries(test_mel PRIVATE
+        mel_spectrogram
+        Threads::Threads
+    )
+
+    # Test executable for audio encoder
+    add_executable(test_encoder
+        tests/test_encoder.cpp
+    )
+    target_link_libraries(test_encoder PRIVATE
+        audio_encoder
+        Threads::Threads
+    )
+
+    # Test executable for text decoder
+    add_executable(test_decoder
+        tests/test_decoder.cpp
+    )
+    target_link_libraries(test_decoder PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test executable for audio injection
+    add_executable(test_injection
+        tests/test_injection.cpp
+    )
+    target_link_libraries(test_injection PRIVATE
+        audio_injection
+    )
+
+    # Simple decoder test
+    add_executable(test_decoder_simple
+        tests/test_decoder_simple.cpp
+    )
+    target_link_libraries(test_decoder_simple PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Embedding test
+    add_executable(test_embedding
+        tests/test_embedding.cpp
+    )
+    target_include_directories(test_embedding PRIVATE
+        ${GGML_DIR}/include
+    )
+    target_link_directories(test_embedding PRIVATE
+        ${GGML_BUILD_DIR}/src
+    )
+    target_link_libraries(test_embedding PRIVATE
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_embedding PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_embedding PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+
+    # Debug decoder test
+    add_executable(test_decoder_debug
+        tests/test_decoder_debug.cpp
+    )
+    target_link_libraries(test_decoder_debug PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test decoder with reference audio
+    add_executable(test_decoder_with_audio
+        tests/test_decoder_with_audio.cpp
+    )
+    target_link_libraries(test_decoder_with_audio PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test decoder without audio (long sequence)
+    add_executable(test_decoder_no_audio
+        tests/test_decoder_no_audio.cpp
+    )
+    target_link_libraries(test_decoder_no_audio PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test decoder last position
+    add_executable(test_decoder_last_pos
+        tests/test_decoder_last_pos.cpp
+    )
+    target_link_libraries(test_decoder_last_pos PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test decoder lengths
+    add_executable(test_decoder_lengths
+        tests/test_decoder_lengths.cpp
+    )
+    target_link_libraries(test_decoder_lengths PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test attention comparison
+    add_executable(test_attention_compare
+        tests/test_attention_compare.cpp
+    )
+    target_link_libraries(test_attention_compare PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test Q/K comparison
+    add_executable(test_qkcompare
+        tests/test_qkcompare.cpp
+    )
+    target_link_libraries(test_qkcompare PRIVATE
+        text_decoder
+        Threads::Threads
+    )
+
+    # Test conv only (no chunking)
+    add_executable(test_conv_only
+        tests/test_conv_only.cpp
+    )
+    target_link_libraries(test_conv_only PRIVATE
+        audio_encoder
+        Threads::Threads
+    )
+
+    # Test encoder without chunking
+    add_executable(test_encoder_no_chunk
+        tests/test_encoder_no_chunk.cpp
+    )
+    target_link_libraries(test_encoder_no_chunk PRIVATE
+        audio_encoder
+        Threads::Threads
+    )
+endif()
 target_link_libraries(test_mel PRIVATE
     mel_spectrogram
     Threads::Threads
@@ -456,73 +696,80 @@ install(FILES src/qwen3asr_c_api.h src/mel_spectrogram.h src/audio_encoder.h src
     DESTINATION include
 )
 
-# C API test
-add_executable(test_c_api tests/test_c_api.cpp)
-target_link_libraries(test_c_api PRIVATE qwen3asr)
+# Additional test executables (only built when QWEN3_ASR_BUILD_TESTS is ON)
+if(QWEN3_ASR_BUILD_TESTS)
+    # C API test
+    add_executable(test_c_api tests/test_c_api.cpp)
+    target_link_libraries(test_c_api PRIVATE qwen3asr)
 
-if(APPLE)
-    set_target_properties(test_c_api PROPERTIES
-        BUILD_RPATH "${GGML_BUILD_DIR}/src;${GGML_BUILD_DIR}/src/ggml-metal"
-        INSTALL_RPATH "@executable_path/../lib"
-    )
-elseif(UNIX AND NOT APPLE)
-    set_target_properties(test_c_api PROPERTIES
-        BUILD_RPATH "${GGML_BUILD_DIR}/src"
-    )
-    if(GGML_CUDA_FOUND)
+    if(APPLE)
         set_target_properties(test_c_api PROPERTIES
-            BUILD_RPATH "${GGML_BUILD_DIR}/src;/usr/local/cuda/lib64"
+            BUILD_RPATH "${GGML_BUILD_DIR}/src;${GGML_BUILD_DIR}/src/ggml-metal"
+            INSTALL_RPATH "@executable_path/../lib"
         )
+    elseif(UNIX AND NOT APPLE)
+        set_target_properties(test_c_api PROPERTIES
+            BUILD_RPATH "${GGML_BUILD_DIR}/src"
+        )
+        if(GGML_CUDA_FOUND)
+            set(CUDA_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+            if(NOT CUDA_RPATH)
+                set(CUDA_RPATH "/usr/local/cuda/lib64")
+            endif()
+            set_target_properties(test_c_api PROPERTIES
+                BUILD_RPATH "${GGML_BUILD_DIR}/src;${CUDA_RPATH}"
+            )
+        endif()
     endif()
+
+    # CTest support
+    enable_testing()
+    add_test(NAME mel_spectrogram_test
+        COMMAND test_mel
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(NAME audio_encoder_test
+        COMMAND test_encoder
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(NAME text_decoder_test
+        COMMAND test_decoder
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(NAME audio_injection_test
+        COMMAND test_injection
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    # Test tokenization
+    add_executable(test_tokenization
+        tests/test_tokenization.cpp
+    )
+    target_link_libraries(test_tokenization PRIVATE
+        Threads::Threads
+    )
+
+    # Test audio utils
+    add_executable(test_audio_utils
+        tests/test_audio_utils.cpp
+    )
+    target_link_libraries(test_audio_utils PRIVATE
+        audio_utils
+        Threads::Threads
+    )
+
+    # Test conv1 output
+    add_executable(test_conv1
+        tests/test_conv1.cpp
+    )
+    target_include_directories(test_conv1 PRIVATE
+        ${GGML_DIR}/include
+    )
+    target_link_libraries(test_conv1 PRIVATE
+        audio_encoder
+        Threads::Threads
+    )
 endif()
-
-# CTest support
-enable_testing()
-add_test(NAME mel_spectrogram_test
-    COMMAND test_mel
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-add_test(NAME audio_encoder_test
-    COMMAND test_encoder
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-add_test(NAME text_decoder_test
-    COMMAND test_decoder
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-add_test(NAME audio_injection_test
-    COMMAND test_injection
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-# Test tokenization
-add_executable(test_tokenization
-    tests/test_tokenization.cpp
-)
-target_link_libraries(test_tokenization PRIVATE
-    Threads::Threads
-)
-
-# Test audio utils
-add_executable(test_audio_utils
-    tests/test_audio_utils.cpp
-)
-target_link_libraries(test_audio_utils PRIVATE
-    audio_utils
-    Threads::Threads
-)
-
-# Test conv1 output
-add_executable(test_conv1
-    tests/test_conv1.cpp
-)
-target_include_directories(test_conv1 PRIVATE
-    ${GGML_DIR}/include
-)
-target_link_libraries(test_conv1 PRIVATE
-    audio_encoder
-    Threads::Threads
-)
 
 # ============================================================================
 # HTTP Server (optional)
