@@ -456,6 +456,25 @@ if(QWEN3_ASR_BUILD_TESTS)
         target_link_libraries(test_decoder_module PRIVATE ggml-cuda CUDA::cudart)
     endif()
 
+    # Integration test: encoder + decoder pipeline
+    add_executable(integration_test
+        tests/integration_test.cpp
+    )
+    target_link_libraries(integration_test PRIVATE
+        encoder_module
+        decoder_module
+        mel_module
+        audio_codec
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(integration_test PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(integration_test PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+
     # Test executable for mel spectrogram
     add_executable(test_mel
         tests/test_mel.cpp
