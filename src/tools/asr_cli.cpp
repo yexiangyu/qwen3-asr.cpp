@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
     printf("Audio frames in sequence: %d\n", audio_features.n_frames);
     
     // Prefill
-    int audio_start_pos = 8;  // Position of audio_start_token in sequence
+    int audio_start_pos = 9;  // Position of first audio_pad token (audio_start_token at pos 8 stays as embedding)
     
     transcribe::decoder::PrefillInput prefill_input;
     prefill_input.tokens = tokens.data();

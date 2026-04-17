@@ -472,6 +472,23 @@ if(GGML_CUDA_FOUND)
     target_link_libraries(asr-cli PRIVATE ggml-cuda CUDA::cudart)
 endif()
 
+# Debug comparison tool
+add_executable(debug-compare src/tools/debug_compare.cpp)
+target_link_libraries(debug-compare PRIVATE
+    asr_codec
+    asr_mel
+    asr_transcribe_encoder
+    asr_transcribe_decoder
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(debug-compare PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(debug-compare PRIVATE ggml-cuda CUDA::cudart)
+endif()
+
 # Test executables (controlled by QWEN3_ASR_BUILD_TESTS option)
 option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
 

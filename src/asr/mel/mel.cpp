@@ -235,7 +235,26 @@ bool compute(const Input& input, MelSpectrum& output, const Config& config, Erro
             for (int k = 0; k < n_fft_bins; k++) {
                 sum += filters.data[m * n_fft_bins + k] * power_all[k * n_frames + f];
             }
-            output.data[m * n_frames + f] = logf(sum + 1e-10f);
+            output.data[m * n_frames + f] = log10f(std::max(sum, 1e-10f));
+        }
+    }
+    
+    // Clamping and normalization (matching original implementation)
+    float mmax = -1e20f;
+    for (int m = 0; m < config.n_mels; m++) {
+        for (int f = 0; f < n_frames; f++) {
+            float val = output.data[m * n_frames + f];
+            if (val > mmax) mmax = val;
+        }
+    }
+    
+    mmax -= 8.0f;
+    
+    for (int m = 0; m < config.n_mels; m++) {
+        for (int f = 0; f < n_frames; f++) {
+            float val = output.data[m * n_frames + f];
+            if (val < mmax) val = mmax;
+            output.data[m * n_frames + f] = (val + 4.0f) / 4.0f;
         }
     }
     
