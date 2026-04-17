@@ -266,6 +266,30 @@ if(GGML_CUDA_FOUND)
     target_compile_definitions(encoder_module PUBLIC GGML_USE_CUDA)
 endif()
 
+# Decoder module (new)
+add_library(decoder_module STATIC
+    src/modules/decoder/decoder.cpp
+)
+target_include_directories(decoder_module PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/decoder
+    ${GGML_DIR}/include
+)
+target_link_directories(decoder_module PUBLIC
+    ${GGML_BUILD_DIR}/src
+)
+target_link_libraries(decoder_module PUBLIC
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(decoder_module PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(decoder_module PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(decoder_module PUBLIC GGML_USE_CUDA)
+endif()
+
 # Audio encoder library (GGML-based)
 add_library(audio_encoder STATIC
     src/gguf_loader.cpp
@@ -414,6 +438,22 @@ if(QWEN3_ASR_BUILD_TESTS)
     if(GGML_CUDA_FOUND)
         target_link_directories(test_encoder_module PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
         target_link_libraries(test_encoder_module PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+
+    # Test decoder module
+    add_executable(test_decoder_module
+        src/modules/decoder/test_decoder.cpp
+    )
+    target_link_libraries(test_decoder_module PRIVATE
+        decoder_module
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_decoder_module PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_decoder_module PRIVATE ggml-cuda CUDA::cudart)
     endif()
 
     # Test executable for mel spectrogram
