@@ -8,7 +8,7 @@
 #include <map>
 
 namespace qwen3_asr {
-namespace encoder {
+namespace align_encoder {
 
 struct HyperParams {
     int n_mel_bins = 128;
@@ -21,7 +21,7 @@ struct HyperParams {
     int conv_channels = 480;
 };
 
-struct EncoderLayer {
+struct AlignEncoderLayer {
     ggml_tensor* attn_q_w = nullptr;
     ggml_tensor* attn_q_b = nullptr;
     ggml_tensor* attn_k_w = nullptr;
@@ -43,7 +43,7 @@ struct EncoderLayer {
     ggml_tensor* ffn_norm_b = nullptr;
 };
 
-struct EncoderModel {
+struct AlignEncoderModel {
     HyperParams hparams;
     
     ggml_tensor* conv2d1_w = nullptr;
@@ -62,7 +62,7 @@ struct EncoderModel {
     ggml_tensor* proj2_w = nullptr;
     ggml_tensor* proj2_b = nullptr;
     
-    std::vector<EncoderLayer> layers;
+    std::vector<AlignEncoderLayer> layers;
     
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -73,7 +73,7 @@ struct EncoderModel {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
-struct EncoderState {
+struct AlignEncoderState {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_gpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
@@ -83,12 +83,12 @@ struct EncoderState {
     ggml_tensor* embd_conv = nullptr;
     ggml_tensor* embd_enc = nullptr;
     
-    EncoderModel* model = nullptr;
+    AlignEncoderModel* model = nullptr;
 };
 
-bool load_model(const char* path, EncoderModel& model, modules::ErrorInfo* error);
+bool load_model(const char* path, AlignEncoderModel& model, modules::ErrorInfo* error);
 
-void free_encoder_model(EncoderModel& model);
+void free_align_encoder_model(AlignEncoderModel& model);
 
-} // namespace encoder
+} // namespace align_encoder
 } // namespace qwen3_asr

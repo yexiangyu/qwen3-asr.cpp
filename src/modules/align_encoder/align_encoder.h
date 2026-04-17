@@ -1,11 +1,11 @@
 #pragma once
 
 #include "../common/types.h"
-#include "encoder_model.h"
+#include "align_encoder_model.h"
 #include <string>
 
 namespace qwen3_asr {
-namespace encoder {
+namespace align_encoder {
 
 using modules::AudioFeatures;
 using modules::ErrorInfo;
@@ -17,7 +17,7 @@ struct Config {
     int max_ctx_length = 4096;
 };
 
-struct BatchInput {
+struct AlignBatchInput {
     std::vector<const float*> mel_data;
     std::vector<int> n_frames;
     int n_mels;
@@ -26,23 +26,23 @@ struct BatchInput {
     int batch_size() const { return mel_data.size(); }
 };
 
-struct BatchOutput {
+struct AlignBatchOutput {
     std::vector<AudioFeatures> features;
     
     int batch_size() const { return features.size(); }
 };
 
-EncoderState* init(const Config& config);
-void free(EncoderState* state);
+AlignEncoderState* init(const Config& config);
+void free(AlignEncoderState* state);
 
-bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& output, ErrorInfo* error = nullptr);
+bool encode_batch(AlignEncoderState* state, const AlignBatchInput& input, AlignBatchOutput& output, ErrorInfo* error = nullptr);
 
-const char* get_device_name(EncoderState* state);
-HyperParams get_hparams(EncoderState* state);
+const char* get_device_name(AlignEncoderState* state);
+HyperParams get_hparams(AlignEncoderState* state);
 
 bool load_ref_data(const char* path, std::vector<float>& data);
 bool save_ref_data(const char* path, const std::vector<float>& data);
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);
 
-} // namespace encoder
+} // namespace align_encoder
 } // namespace qwen3_asr

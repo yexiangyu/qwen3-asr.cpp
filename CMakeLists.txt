@@ -240,19 +240,19 @@ target_link_libraries(mel_module PUBLIC
     Threads::Threads
 )
 
-# Encoder module (new)
-add_library(encoder_module STATIC
-    src/modules/encoder/encoder.cpp
+# Align encoder module (new)
+add_library(align_encoder_module STATIC
+    src/modules/align_encoder/align_encoder.cpp
 )
-target_include_directories(encoder_module PUBLIC
+target_include_directories(align_encoder_module PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/modules
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/encoder
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/align_encoder
     ${GGML_DIR}/include
 )
-target_link_directories(encoder_module PUBLIC
+target_link_directories(align_encoder_module PUBLIC
     ${GGML_BUILD_DIR}/src
 )
-target_link_libraries(encoder_module PUBLIC
+target_link_libraries(align_encoder_module PUBLIC
     mel_module
     audio_codec
     ggml
@@ -261,9 +261,35 @@ target_link_libraries(encoder_module PUBLIC
     Threads::Threads
 )
 if(GGML_CUDA_FOUND)
-    target_link_directories(encoder_module PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
-    target_link_libraries(encoder_module PUBLIC ggml-cuda CUDA::cudart)
-    target_compile_definitions(encoder_module PUBLIC GGML_USE_CUDA)
+    target_link_directories(align_encoder_module PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(align_encoder_module PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(align_encoder_module PUBLIC GGML_USE_CUDA)
+endif()
+
+# ASR encoder module (new)
+add_library(asr_encoder_module STATIC
+    src/modules/asr_encoder/asr_encoder.cpp
+)
+target_include_directories(asr_encoder_module PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/asr_encoder
+    ${GGML_DIR}/include
+)
+target_link_directories(asr_encoder_module PUBLIC
+    ${GGML_BUILD_DIR}/src
+)
+target_link_libraries(asr_encoder_module PUBLIC
+    mel_module
+    audio_codec
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(asr_encoder_module PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(asr_encoder_module PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(asr_encoder_module PUBLIC GGML_USE_CUDA)
 endif()
 
 # Decoder module (new)
@@ -422,23 +448,41 @@ if(QWEN3_ASR_BUILD_TESTS)
         Threads::Threads
     )
 
-    # Test encoder module
-    add_executable(test_encoder_module
-        src/modules/encoder/test_encoder.cpp
-    )
-    target_link_libraries(test_encoder_module PRIVATE
-        encoder_module
-        mel_module
-        audio_codec
-        ggml
-        ggml-base
-        ggml-cpu
-        Threads::Threads
-    )
-    if(GGML_CUDA_FOUND)
-        target_link_directories(test_encoder_module PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
-        target_link_libraries(test_encoder_module PRIVATE ggml-cuda CUDA::cudart)
-    endif()
+# Test align_encoder module
+add_executable(test_align_encoder_module
+    src/modules/align_encoder/test_align_encoder.cpp
+)
+target_link_libraries(test_align_encoder_module PRIVATE
+    align_encoder_module
+    mel_module
+    audio_codec
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(test_align_encoder_module PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(test_align_encoder_module PRIVATE ggml-cuda CUDA::cudart)
+endif()
+
+# Test asr_encoder module
+add_executable(test_asr_encoder_module
+    src/modules/asr_encoder/test_asr_encoder.cpp
+)
+target_link_libraries(test_asr_encoder_module PRIVATE
+    asr_encoder_module
+    mel_module
+    audio_codec
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(test_asr_encoder_module PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(test_asr_encoder_module PRIVATE ggml-cuda CUDA::cudart)
+endif()
 
     # Test decoder module
     add_executable(test_decoder_module
@@ -456,24 +500,24 @@ if(QWEN3_ASR_BUILD_TESTS)
         target_link_libraries(test_decoder_module PRIVATE ggml-cuda CUDA::cudart)
     endif()
 
-    # Integration test: encoder + decoder pipeline
-    add_executable(integration_test
-        tests/integration_test.cpp
-    )
-    target_link_libraries(integration_test PRIVATE
-        encoder_module
-        decoder_module
-        mel_module
-        audio_codec
-        ggml
-        ggml-base
-        ggml-cpu
-        Threads::Threads
-    )
-    if(GGML_CUDA_FOUND)
-        target_link_directories(integration_test PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
-        target_link_libraries(integration_test PRIVATE ggml-cuda CUDA::cudart)
-    endif()
+# Integration test: asr_encoder + decoder pipeline (full ASR)
+add_executable(integration_test
+    tests/integration_test.cpp
+)
+target_link_libraries(integration_test PRIVATE
+    asr_encoder_module
+    decoder_module
+    mel_module
+    audio_codec
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(integration_test PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(integration_test PRIVATE ggml-cuda CUDA::cudart)
+endif()
 
     # Test executable for mel spectrogram
     add_executable(test_mel

@@ -1,5 +1,5 @@
-#include "encoder.h"
-#include "encoder_model.h"
+#include "align_encoder.h"
+#include "align_encoder_model.h"
 #include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -18,7 +18,7 @@
 #include <algorithm>
 
 namespace qwen3_asr {
-namespace encoder {
+namespace align_encoder {
 
 using modules::AudioFeatures;
 using modules::ErrorInfo;
@@ -59,7 +59,7 @@ static ggml_backend_buffer_type_t get_preferred_buft() {
     return ggml_backend_cpu_buffer_type();
 }
 
-bool load_model(const char* path, EncoderModel& model, ErrorInfo* error) {
+bool load_model(const char* path, AlignEncoderModel& model, ErrorInfo* error) {
     struct gguf_init_params params = { true, &model.ctx };
     struct gguf_context* ctx_gguf = gguf_init_from_file(path, params);
     if (!ctx_gguf) {
@@ -165,16 +165,16 @@ bool load_model(const char* path, EncoderModel& model, ErrorInfo* error) {
     return true;
 }
 
-void free_encoder_model(EncoderModel& model) {
+void free_align_encoder_model(AlignEncoderModel& model) {
     if (model.buffer) { ggml_backend_buffer_free(model.buffer); model.buffer = nullptr; }
     if (model.ctx) { ggml_free(model.ctx); model.ctx = nullptr; }
     if (model.mmap_addr) { munmap(model.mmap_addr, model.mmap_size); model.mmap_addr = nullptr; }
     model.layers.clear(); model.tensors.clear();
 }
 
-EncoderState* init(const Config& config) {
-    EncoderState* state = new EncoderState();
-    state->model = new EncoderModel();
+AlignEncoderState* init(const Config& config) {
+    AlignEncoderState* state = new AlignEncoderState();
+    state->model = new AlignEncoderModel();
     
     ErrorInfo err;
     if (!load_model(config.model_path.c_str(), *state->model, &err)) {
@@ -183,7 +183,7 @@ EncoderState* init(const Config& config) {
     }
     
     state->backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!state->backend_cpu) { free_encoder_model(*state->model); delete state->model; delete state; return nullptr; }
+    if (!state->backend_cpu) { free_align_encoder_model(*state->model); delete state->model; delete state; return nullptr; }
     
     if (!config.device_name.empty()) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_name(config.device_name.c_str());
@@ -199,31 +199,31 @@ EncoderState* init(const Config& config) {
     for (auto be : backends) bufts.push_back(ggml_backend_get_default_buffer_type(be));
     
     state->sched = ggml_backend_sched_new(backends.data(), bufts.data(), backends.size(), MAX_NODES, false, true);
-    if (!state->sched) { free_encoder_model(*state->model); delete state->model; delete state; return nullptr; }
+    if (!state->sched) { free_align_encoder_model(*state->model); delete state->model; delete state; return nullptr; }
     
     state->compute_meta.resize(ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead());
     return state;
 }
 
-void free(EncoderState* state) {
+void free(AlignEncoderState* state) {
     if (!state) return;
     if (state->sched) ggml_backend_sched_free(state->sched);
     if (state->backend_gpu) ggml_backend_free(state->backend_gpu);
     if (state->backend_cpu) ggml_backend_free(state->backend_cpu);
-    if (state->model) { free_encoder_model(*state->model); delete state->model; }
+    if (state->model) { free_align_encoder_model(*state->model); delete state->model; }
     delete state;
 }
 
-const char* get_device_name(EncoderState* state) {
+const char* get_device_name(AlignEncoderState* state) {
     return state && state->backend_gpu ? ggml_backend_name(state->backend_gpu) : "CPU";
 }
 
-HyperParams get_hparams(EncoderState* state) {
+HyperParams get_hparams(AlignEncoderState* state) {
     return state && state->model ? state->model->hparams : HyperParams();
 }
 
-static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, int batch_size) {
-    EncoderModel& m = *state->model;
+static ggml_cgraph* build_graph_conv_batch(AlignEncoderState* state, int n_frames, int batch_size) {
+    AlignEncoderModel& m = *state->model;
     int n_mel = m.hparams.n_mel_bins;
     int conv_ch = m.hparams.conv_channels;
     
@@ -266,8 +266,8 @@ static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, in
     return gf;
 }
 
-static ggml_cgraph* build_graph_encoder_batch(EncoderState* state, int n_ctx, int /*batch_size*/, int /*seq_len_per_item*/) {
-    EncoderModel& m = *state->model;
+static ggml_cgraph* build_graph_encoder_batch(AlignEncoderState* state, int n_ctx, int /*batch_size*/, int /*seq_len_per_item*/) {
+    AlignEncoderModel& m = *state->model;
     int n_state = m.hparams.d_model;
     int n_head = m.hparams.n_attention_heads;
     int n_layer = m.hparams.n_encoder_layers;
@@ -333,11 +333,11 @@ static ggml_cgraph* build_graph_encoder_batch(EncoderState* state, int n_ctx, in
     return gf;
 }
 
-bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& output, ErrorInfo* error) {
+bool encode_batch(AlignEncoderState* state, const AlignBatchInput& input, AlignBatchOutput& output, ErrorInfo* error) {
     if (!state || !state->model) { if (error) error->message = "State not initialized"; return false; }
     if (input.batch_size() == 0) { if (error) error->message = "Empty batch"; return false; }
     
-    EncoderModel& m = *state->model;
+    AlignEncoderModel& m = *state->model;
     int n_state = m.hparams.d_model;
     int n_mel = m.hparams.n_mel_bins;
     int batch_size = input.batch_size();
