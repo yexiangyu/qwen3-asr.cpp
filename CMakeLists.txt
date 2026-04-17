@@ -320,6 +320,30 @@ if(GGML_CUDA_FOUND)
     target_compile_definitions(asr_aligner_encoder PUBLIC GGML_USE_CUDA)
 endif()
 
+# Aligner decoder module
+add_library(asr_aligner_decoder STATIC
+    src/asr/aligner/decoder.cpp
+)
+target_include_directories(asr_aligner_decoder PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_directories(asr_aligner_decoder PUBLIC
+    ${GGML_BUILD_DIR}/src
+)
+target_link_libraries(asr_aligner_decoder PUBLIC
+    asr_common
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(asr_aligner_decoder PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(asr_aligner_decoder PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(asr_aligner_decoder PUBLIC GGML_USE_CUDA)
+endif()
+
 # Audio encoder library (GGML-based)
 add_library(audio_encoder STATIC
     src/gguf_loader.cpp
@@ -491,6 +515,38 @@ if(QWEN3_ASR_BUILD_TESTS)
     if(GGML_CUDA_FOUND)
         target_link_directories(test_aligner_encoder PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
         target_link_libraries(test_aligner_encoder PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+    
+    # Test aligner decoder module
+    add_executable(test_aligner_decoder tests/test_aligner_decoder.cpp)
+    target_include_directories(test_aligner_decoder PRIVATE ${GGML_DIR}/include)
+    target_link_directories(test_aligner_decoder PRIVATE ${GGML_BUILD_DIR}/src)
+    target_link_libraries(test_aligner_decoder PRIVATE
+        asr_aligner_decoder
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_aligner_decoder PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_aligner_decoder PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+    
+    # Test aligner decoder module (simple)
+    add_executable(test_aligner_decoder_simple tests/test_aligner_decoder_simple.cpp)
+    target_include_directories(test_aligner_decoder_simple PRIVATE ${GGML_DIR}/include)
+    target_link_directories(test_aligner_decoder_simple PRIVATE ${GGML_BUILD_DIR}/src)
+    target_link_libraries(test_aligner_decoder_simple PRIVATE
+        asr_aligner_decoder
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_aligner_decoder_simple PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_aligner_decoder_simple PRIVATE ggml-cuda CUDA::cudart)
     endif()
     
     # Integration test: transcribe encoder + decoder pipeline (full ASR)
