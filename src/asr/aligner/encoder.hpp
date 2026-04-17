@@ -4,7 +4,6 @@
 #include "asr/aligner/encoder_model.hpp"
 #include <string>
 
-namespace qwen3_asr {
 namespace asr::aligner::encoder {
 
 using asr::AudioFeatures;
@@ -45,4 +44,3 @@ bool save_ref_data(const char* path, const std::vector<float>& data);
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);
 
 } // namespace asr::aligner::encoder
-} // namespace qwen3_asr

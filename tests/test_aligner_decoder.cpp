@@ -4,7 +4,7 @@
 #include <vector>
 #include <fstream>
 
-using namespace qwen3_asr::asr::aligner::decoder;
+using namespace asr::aligner::decoder;
 
 int main(int argc, char** argv) {
     if (argc < 2) {

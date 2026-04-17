@@ -9,8 +9,8 @@
 #include <algorithm>
 
 int main() {
-    namespace encoder = qwen3_asr::asr::aligner::encoder;
-    namespace mel = qwen3_asr::asr::mel;
+    namespace encoder = asr::aligner::encoder;
+    namespace mel = asr::mel;
     
     const char* test_wav = "tests/data/test_audio.wav";
     const char* model_path = "models/qwen3-forced-aligner-0.6b-f16.gguf";

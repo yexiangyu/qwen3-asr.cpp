@@ -17,7 +17,6 @@
 #include <unistd.h>
 #include <algorithm>
 
-namespace qwen3_asr {
 namespace asr { namespace transcribe { namespace decoder {
 
 using asr::ErrorInfo;
@@ -834,4 +833,3 @@ bool decode(State* state, const DecodeInput& input, DecoderOutput& output, Error
 } // namespace decoder
 } // namespace transcribe
 } // namespace asr
-} // namespace qwen3_asr

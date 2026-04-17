@@ -3,7 +3,6 @@
 #include "asr/common/types.hpp"
 #include <string>
 
-namespace qwen3_asr {
 namespace asr::codec {
 
 using asr::Result;
@@ -32,4 +31,3 @@ void normalize_audio(std::vector<float>& samples);
 void pad_audio(std::vector<float>& samples, float min_duration_sec, int sample_rate);
 
 } // namespace asr::codec
-} // namespace qwen3_asr

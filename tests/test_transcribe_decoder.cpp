@@ -5,7 +5,7 @@
 #include <cmath>
 #include <vector>
 
-using namespace qwen3_asr::asr::transcribe::decoder;
+using namespace asr::transcribe::decoder;
 
 bool test_kv_cache_management(State* state, const Config& config) {
     fprintf(stderr, "\n=== Testing KV Cache Management ===\n");

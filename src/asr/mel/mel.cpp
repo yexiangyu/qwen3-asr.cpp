@@ -15,7 +15,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace qwen3_asr {
 namespace asr { namespace mel {
 
 static float hz_to_mel(float hz) {
@@ -308,4 +307,3 @@ bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>&
 
 } // namespace mel
 } // namespace asr
-} // namespace qwen3_asr

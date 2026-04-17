@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cassert>
 
-using namespace qwen3_asr;
+using namespace asr;
 
 static bool float_eq(float a, float b, float eps = 1e-6f) {
     return std::fabs(a - b) < eps;

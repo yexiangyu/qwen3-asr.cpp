@@ -7,7 +7,6 @@
 #include <vector>
 #include <map>
 
-namespace qwen3_asr {
 namespace asr::aligner::encoder {
 
 using asr::ErrorInfo;
@@ -93,4 +92,3 @@ bool load_model(const char* path, EncoderModel& model, ErrorInfo* error);
 void free_model(EncoderModel& model);
 
 } // namespace asr::aligner::encoder
-} // namespace qwen3_asr

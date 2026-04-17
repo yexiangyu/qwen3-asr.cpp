@@ -9,8 +9,8 @@
 #include <algorithm>
 
 int main() {
-    namespace encoder = qwen3_asr::asr::transcribe::encoder;
-    namespace mel = qwen3_asr::asr::mel;
+    namespace encoder = asr::transcribe::encoder;
+    namespace mel = asr::mel;
     
     const char* test_wav = "tests/data/test_audio.wav";
     const char* model_path = "models/qwen3-asr-1.7b-f16.gguf";

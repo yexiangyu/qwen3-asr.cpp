@@ -17,7 +17,6 @@
 #include <unistd.h>
 #include <algorithm>
 
-namespace qwen3_asr {
 namespace asr { namespace aligner { namespace encoder {
 
 using asr::AudioFeatures;
@@ -467,4 +466,3 @@ bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>&
 } // namespace encoder
 } // namespace aligner
 } // namespace asr
-} // namespace qwen3_asr

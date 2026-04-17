@@ -5,8 +5,8 @@
 #include <algorithm>
 
 int main() {
-    namespace mel = qwen3_asr::asr::mel;
-    namespace codec = qwen3_asr::asr::codec;
+    namespace mel = asr::mel;
+    namespace codec = asr::codec;
     
     const char* test_wav = "tests/data/test_audio.wav";
     const char* ref_mel_path = "tests/data/ref_mel.raw";

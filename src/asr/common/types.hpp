@@ -3,7 +3,6 @@
 #include <vector>
 #include <string>
 
-namespace qwen3_asr {
 namespace asr {
 
 constexpr int DEFAULT_SAMPLE_RATE = 16000;
@@ -50,4 +49,3 @@ struct ErrorInfo {
 };
 
 } // namespace asr
-} // namespace qwen3_asr

@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 
-namespace qwen3_asr {
 namespace asr::aligner::decoder {
 
 using asr::ErrorInfo;
@@ -54,4 +53,3 @@ bool save_ref_data(const char* path, const std::vector<float>& data);
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);
 
 } // namespace asr::aligner::decoder
-} // namespace qwen3_asr

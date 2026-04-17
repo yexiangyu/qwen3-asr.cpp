@@ -453,6 +453,25 @@ target_link_libraries(qwen3-asr-cli PRIVATE
     logger
 )
 
+# New modular ASR CLI
+add_executable(asr-cli src/tools/asr_cli.cpp)
+target_link_libraries(asr-cli PRIVATE
+    asr_codec
+    asr_mel
+    asr_transcribe_encoder
+    asr_transcribe_decoder
+    asr_aligner_encoder
+    asr_aligner_decoder
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(asr-cli PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(asr-cli PRIVATE ggml-cuda CUDA::cudart)
+endif()
+
 # Test executables (controlled by QWEN3_ASR_BUILD_TESTS option)
 option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
 

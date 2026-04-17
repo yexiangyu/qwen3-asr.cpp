@@ -7,7 +7,6 @@
 #include <vector>
 #include <map>
 
-namespace qwen3_asr {
 namespace asr::transcribe::encoder {
 
 using asr::ErrorInfo;
@@ -94,4 +93,3 @@ bool load_model(const char* path, EncoderModel& model, ErrorInfo* error);
 void free_model(EncoderModel& model);
 
 } // namespace asr::transcribe::encoder
-} // namespace qwen3_asr

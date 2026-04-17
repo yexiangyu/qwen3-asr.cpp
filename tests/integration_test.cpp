@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <vector>
 
-using namespace qwen3_asr::asr;
+using namespace asr;
 
 int main() {
     const char* test_wav = "tests/data/test_audio.wav";

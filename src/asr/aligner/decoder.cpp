@@ -17,7 +17,6 @@
 #include <unistd.h>
 #include <algorithm>
 
-namespace qwen3_asr {
 namespace asr::aligner::decoder {
 
 using asr::ErrorInfo;
@@ -717,4 +716,3 @@ bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>&
 }
 
 } // namespace asr::aligner::decoder
-} // namespace qwen3_asr

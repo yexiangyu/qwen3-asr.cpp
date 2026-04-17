@@ -98,7 +98,7 @@ int main() {
     }
     printf("Reference shape: [%lld, %lld]\n", (long long)ref_shape[0], (long long)ref_shape[1]);
     
-    qwen3_asr::AudioEncoder encoder;
+    asr::AudioEncoder encoder;
     if (!encoder.load_model("models/qwen3-asr-0.6b-f16.gguf")) {
         fprintf(stderr, "Failed to load model: %s\n", encoder.get_error().c_str());
         return 1;

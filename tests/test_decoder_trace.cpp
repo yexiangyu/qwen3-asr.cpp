@@ -111,7 +111,7 @@ static bool load_npy_f32(const std::string & path, std::vector<float> & data,
 int main() {
     printf("=== Decoder Trace Test ===\n\n");
     
-    qwen3_asr::TextDecoder decoder;
+    asr::TextDecoder decoder;
     
     printf("Loading model...\n");
     if (!decoder.load_model("models/qwen3-asr-0.6b-f16.gguf")) {

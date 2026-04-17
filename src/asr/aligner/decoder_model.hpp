@@ -6,7 +6,6 @@
 #include <map>
 #include <string>
 
-namespace qwen3_asr {
 namespace asr::aligner::decoder {
 
 struct HyperParams {
@@ -98,4 +97,3 @@ struct State {
 };
 
 } // namespace asr::aligner::decoder
-} // namespace qwen3_asr

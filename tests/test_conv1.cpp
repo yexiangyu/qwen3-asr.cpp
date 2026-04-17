@@ -78,7 +78,7 @@ int main() {
            (long long)conv1_shape[2], (long long)conv1_shape[3]);
     
     // Load model
-    qwen3_asr::AudioEncoder encoder;
+    asr::AudioEncoder encoder;
     if (!encoder.load_model("models/qwen3-asr-0.6b-f16.gguf")) {
         fprintf(stderr, "Failed to load model\n");
         return 1;

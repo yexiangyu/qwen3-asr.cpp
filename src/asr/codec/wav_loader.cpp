@@ -8,7 +8,6 @@
 #include <cmath>
 #include <algorithm>
 
-namespace qwen3_asr {
 namespace asr { namespace codec {
 
 using asr::ErrorInfo;
@@ -130,4 +129,3 @@ void pad_audio(std::vector<float>& samples, float min_duration_sec, int sample_r
 
 } // namespace codec
 } // namespace asr
-} // namespace qwen3_asr

@@ -6,7 +6,6 @@
 #include <cmath>
 #include <algorithm>
 
-namespace qwen3_asr {
 namespace asr::codec {
 
 bool load_ref_data(const char* path, std::vector<float>& data) {
@@ -51,11 +50,10 @@ void save_ref_data(const char* path, const std::vector<float>& data) {
 }
 
 } // namespace asr::codec
-} // namespace qwen3_asr
 
 int main(int argc, char** argv) {
-    using namespace qwen3_asr::asr::codec;
-    using qwen3_asr::asr::ErrorInfo;
+    using namespace asr::codec;
+    using asr::ErrorInfo;
     
     const char* test_wav = "tests/data/test_audio.wav";
     const char* ref_samples = "tests/data/ref_audio_samples.raw";

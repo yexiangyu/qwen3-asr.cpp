@@ -71,7 +71,7 @@ int main() {
            (long long)shape_weights[0], (long long)shape_weights[1], 
            (long long)shape_weights[2], (long long)shape_weights[3]);
     
-    qwen3_asr::TextDecoder decoder;
+    asr::TextDecoder decoder;
     if (!decoder.load_model("models/qwen3-asr-0.6b-f16.gguf")) {
         fprintf(stderr, "Failed to load model: %s\n", decoder.get_error().c_str());
         return 1;

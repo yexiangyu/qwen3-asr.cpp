@@ -5,7 +5,6 @@
 #include <vector>
 #include <map>
 
-namespace qwen3_asr {
 namespace asr::transcribe::decoder {
 
 using asr::ErrorInfo;
@@ -74,4 +73,3 @@ struct State {
 };
 
 } // namespace asr::transcribe::decoder
-} // namespace qwen3_asr

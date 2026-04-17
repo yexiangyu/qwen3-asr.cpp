@@ -3,7 +3,7 @@
 #include <cassert>
 #include <cmath>
 
-using namespace qwen3_asr;
+using namespace asr;
 
 void test_float_range_normalize() {
     std::cout << "=== Test float_range_normalize ===\n";

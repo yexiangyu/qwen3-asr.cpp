@@ -11,8 +11,8 @@
 
 int main() {
     // Load model
-    qwen3_asr::audio_encoder_model model;
-    qwen3_asr::GGUFLoader loader;
+    asr::audio_encoder_model model;
+    asr::GGUFLoader loader;
     if (!loader.load("models/qwen3-asr-0.6b-f32.gguf", model)) {
         printf("Failed to load model: %s\n", loader.get_error().c_str());
         return 1;
@@ -61,6 +61,6 @@ int main() {
     ggml_backend_tensor_get(conv1_b, bias_data.data(), 0, bias_data.size() * sizeof(float));
     printf("\nConv1 bias[0]: %.6f (expected: -0.062256)\n", bias_data[0]);
     
-    qwen3_asr::free_model(model);
+    asr::free_model(model);
     return 0;
 }
