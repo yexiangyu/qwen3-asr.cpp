@@ -226,6 +226,20 @@ target_link_libraries(audio_codec PUBLIC
     Threads::Threads
 )
 
+# Mel spectrogram module (new)
+add_library(mel_module STATIC
+    src/modules/mel/mel.cpp
+)
+target_include_directories(mel_module PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/mel
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/audio_codec
+)
+target_link_libraries(mel_module PUBLIC
+    audio_codec
+    Threads::Threads
+)
+
 # Audio encoder library (GGML-based)
 add_library(audio_encoder STATIC
     src/gguf_loader.cpp
@@ -344,6 +358,16 @@ if(QWEN3_ASR_BUILD_TESTS)
         src/modules/audio_codec/test_audio_codec.cpp
     )
     target_link_libraries(test_audio_codec PRIVATE
+        audio_codec
+        Threads::Threads
+    )
+
+    # Test mel module
+    add_executable(test_mel_module
+        src/modules/mel/test_mel.cpp
+    )
+    target_link_libraries(test_mel_module PRIVATE
+        mel_module
         audio_codec
         Threads::Threads
     )
