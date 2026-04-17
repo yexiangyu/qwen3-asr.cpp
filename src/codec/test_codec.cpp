@@ -1,5 +1,5 @@
-#include "audio_codec.h"
-#include "../common/types.h"
+#include "asr/codec/codec.h"
+#include "asr/common/types.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -7,7 +7,7 @@
 #include <algorithm>
 
 namespace qwen3_asr {
-namespace audio_codec {
+namespace asr::codec {
 
 bool load_ref_data(const char* path, std::vector<float>& data) {
     std::ifstream file(path, std::ios::binary);
@@ -50,11 +50,12 @@ void save_ref_data(const char* path, const std::vector<float>& data) {
     file.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
 }
 
-} // namespace audio_codec
+} // namespace asr::codec
 } // namespace qwen3_asr
 
 int main(int argc, char** argv) {
-    using namespace qwen3_asr::audio_codec;
+    using namespace qwen3_asr::asr::codec;
+    using qwen3_asr::asr::ErrorInfo;
     
     const char* test_wav = "tests/data/test_audio.wav";
     const char* ref_samples = "tests/data/ref_audio_samples.raw";

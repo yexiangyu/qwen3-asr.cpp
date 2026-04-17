@@ -8,21 +8,22 @@
 #include <map>
 
 namespace qwen3_asr {
-namespace asr_encoder {
+namespace asr::aligner::encoder {
+
+using asr::ErrorInfo;
 
 struct HyperParams {
     int n_mel_bins = 128;
-    int d_model = 896;
+    int d_model = 1024;
     int hidden_size = 1024;
-    int n_encoder_layers = 18;
-    int n_attention_heads = 14;
+    int n_encoder_layers = 24;
+    int n_attention_heads = 16;
     int head_dim = 64;
-    int ff_dim = 3584;
+    int ff_dim = 4096;
     int conv_channels = 480;
-    int conv_out_dim = 896;
 };
 
-struct ASREncoderLayer {
+struct EncoderLayer {
     ggml_tensor* attn_q_w = nullptr;
     ggml_tensor* attn_q_b = nullptr;
     ggml_tensor* attn_k_w = nullptr;
@@ -44,15 +45,15 @@ struct ASREncoderLayer {
     ggml_tensor* ffn_norm_b = nullptr;
 };
 
-struct ASREncoderModel {
+struct EncoderModel {
     HyperParams hparams;
     
-    ggml_tensor* conv1_w = nullptr;
-    ggml_tensor* conv1_b = nullptr;
-    ggml_tensor* conv2_w = nullptr;
-    ggml_tensor* conv2_b = nullptr;
-    ggml_tensor* conv3_w = nullptr;
-    ggml_tensor* conv3_b = nullptr;
+    ggml_tensor* conv2d1_w = nullptr;
+    ggml_tensor* conv2d1_b = nullptr;
+    ggml_tensor* conv2d2_w = nullptr;
+    ggml_tensor* conv2d2_b = nullptr;
+    ggml_tensor* conv2d3_w = nullptr;
+    ggml_tensor* conv2d3_b = nullptr;
     
     ggml_tensor* conv_out_w = nullptr;
     
@@ -63,7 +64,7 @@ struct ASREncoderModel {
     ggml_tensor* proj2_w = nullptr;
     ggml_tensor* proj2_b = nullptr;
     
-    std::vector<ASREncoderLayer> layers;
+    std::vector<EncoderLayer> layers;
     
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -74,7 +75,7 @@ struct ASREncoderModel {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
-struct ASREncoderState {
+struct EncoderState {
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_gpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
@@ -84,12 +85,12 @@ struct ASREncoderState {
     ggml_tensor* embd_conv = nullptr;
     ggml_tensor* embd_enc = nullptr;
     
-    ASREncoderModel* model = nullptr;
+    EncoderModel* model = nullptr;
 };
 
-bool load_model(const char* path, ASREncoderModel& model, modules::ErrorInfo* error);
+bool load_model(const char* path, EncoderModel& model, ErrorInfo* error);
 
-void free_asr_encoder_model(ASREncoderModel& model);
+void free_model(EncoderModel& model);
 
-} // namespace asr_encoder
+} // namespace asr::aligner::encoder
 } // namespace qwen3_asr

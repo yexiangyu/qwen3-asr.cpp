@@ -1,5 +1,5 @@
-#include "asr_encoder.h"
-#include "asr_encoder_model.h"
+#include "asr/transcribe/encoder.h"
+#include "asr/transcribe/encoder_model.h"
 #include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -18,10 +18,10 @@
 #include <algorithm>
 
 namespace qwen3_asr {
-namespace asr_encoder {
+namespace asr { namespace transcribe { namespace encoder {
 
-using modules::AudioFeatures;
-using modules::ErrorInfo;
+using asr::AudioFeatures;
+using asr::ErrorInfo;
 
 constexpr int MAX_NODES = 4096;
 
@@ -59,7 +59,7 @@ static ggml_backend_buffer_type_t get_preferred_buft() {
     return ggml_backend_cpu_buffer_type();
 }
 
-bool load_model(const char* path, ASREncoderModel& model, ErrorInfo* error) {
+bool load_model(const char* path, EncoderModel& model, ErrorInfo* error) {
     struct gguf_init_params params = { true, &model.ctx };
     struct gguf_context* ctx_gguf = gguf_init_from_file(path, params);
     if (!ctx_gguf) {
@@ -166,16 +166,16 @@ bool load_model(const char* path, ASREncoderModel& model, ErrorInfo* error) {
     return true;
 }
 
-void free_asr_encoder_model(ASREncoderModel& model) {
+void free_asr_encoder_model(EncoderModel& model) {
     if (model.buffer) { ggml_backend_buffer_free(model.buffer); model.buffer = nullptr; }
     if (model.ctx) { ggml_free(model.ctx); model.ctx = nullptr; }
     if (model.mmap_addr) { munmap(model.mmap_addr, model.mmap_size); model.mmap_addr = nullptr; }
     model.layers.clear(); model.tensors.clear();
 }
 
-ASREncoderState* init(const Config& config) {
-    ASREncoderState* state = new ASREncoderState();
-    state->model = new ASREncoderModel();
+EncoderState* init(const Config& config) {
+    EncoderState* state = new EncoderState();
+    state->model = new EncoderModel();
     
     ErrorInfo err;
     if (!load_model(config.model_path.c_str(), *state->model, &err)) {
@@ -206,7 +206,7 @@ ASREncoderState* init(const Config& config) {
     return state;
 }
 
-void free(ASREncoderState* state) {
+void free(EncoderState* state) {
     if (!state) return;
     if (state->sched) ggml_backend_sched_free(state->sched);
     if (state->backend_gpu) ggml_backend_free(state->backend_gpu);
@@ -215,16 +215,16 @@ void free(ASREncoderState* state) {
     delete state;
 }
 
-const char* get_device_name(ASREncoderState* state) {
+const char* get_device_name(EncoderState* state) {
     return state && state->backend_gpu ? ggml_backend_name(state->backend_gpu) : "CPU";
 }
 
-HyperParams get_hparams(ASREncoderState* state) {
+HyperParams get_hparams(EncoderState* state) {
     return state && state->model ? state->model->hparams : HyperParams();
 }
 
-static ggml_cgraph* build_graph_conv_batch(ASREncoderState* state, int n_frames, int batch_size) {
-    ASREncoderModel& m = *state->model;
+static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, int batch_size) {
+    EncoderModel& m = *state->model;
     int n_mel = m.hparams.n_mel_bins;
     int conv_ch = m.hparams.conv_channels;
     
@@ -267,8 +267,8 @@ static ggml_cgraph* build_graph_conv_batch(ASREncoderState* state, int n_frames,
     return gf;
 }
 
-static ggml_cgraph* build_graph_encoder_batch(ASREncoderState* state, int n_ctx) {
-    ASREncoderModel& m = *state->model;
+static ggml_cgraph* build_graph_encoder_batch(EncoderState* state, int n_ctx) {
+    EncoderModel& m = *state->model;
     int n_state = m.hparams.d_model;
     int n_head = m.hparams.n_attention_heads;
     int n_layer = m.hparams.n_encoder_layers;
@@ -345,11 +345,11 @@ static ggml_cgraph* build_graph_encoder_batch(ASREncoderState* state, int n_ctx)
     return gf;
 }
 
-bool encode_batch(ASREncoderState* state, const ASRBatchInput& input, ASRBatchOutput& output, ErrorInfo* error) {
+bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& output, ErrorInfo* error) {
     if (!state || !state->model) { if (error) error->message = "State not initialized"; return false; }
     if (input.batch_size() == 0) { if (error) error->message = "Empty batch"; return false; }
     
-    ASREncoderModel& m = *state->model;
+    EncoderModel& m = *state->model;
     int n_state = m.hparams.hidden_size;
     int n_mel = m.hparams.n_mel_bins;
     int batch_size = input.batch_size();
@@ -469,5 +469,7 @@ bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>&
     return true;
 }
 
-} // namespace asr_encoder
+} // namespace encoder
+} // namespace transcribe
+} // namespace asr
 } // namespace qwen3_asr

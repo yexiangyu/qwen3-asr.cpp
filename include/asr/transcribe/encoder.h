@@ -1,14 +1,14 @@
 #pragma once
 
 #include "../common/types.h"
-#include "asr_encoder_model.h"
+#include "encoder_model.h"
 #include <string>
 
 namespace qwen3_asr {
-namespace asr_encoder {
+namespace asr::transcribe::encoder {
 
-using modules::AudioFeatures;
-using modules::ErrorInfo;
+using asr::AudioFeatures;
+using asr::ErrorInfo;
 
 struct Config {
     std::string model_path;
@@ -17,7 +17,7 @@ struct Config {
     int max_ctx_length = 4096;
 };
 
-struct ASRBatchInput {
+struct BatchInput {
     std::vector<const float*> mel_data;
     std::vector<int> n_frames;
     int n_mels;
@@ -26,23 +26,23 @@ struct ASRBatchInput {
     int batch_size() const { return mel_data.size(); }
 };
 
-struct ASRBatchOutput {
+struct BatchOutput {
     std::vector<AudioFeatures> features;
     
     int batch_size() const { return features.size(); }
 };
 
-ASREncoderState* init(const Config& config);
-void free(ASREncoderState* state);
+EncoderState* init(const Config& config);
+void free(EncoderState* state);
 
-bool encode_batch(ASREncoderState* state, const ASRBatchInput& input, ASRBatchOutput& output, ErrorInfo* error = nullptr);
+bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& output, ErrorInfo* error = nullptr);
 
-const char* get_device_name(ASREncoderState* state);
-HyperParams get_hparams(ASREncoderState* state);
+const char* get_device_name(EncoderState* state);
+HyperParams get_hparams(EncoderState* state);
 
 bool load_ref_data(const char* path, std::vector<float>& data);
 bool save_ref_data(const char* path, const std::vector<float>& data);
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);
 
-} // namespace asr_encoder
+} // namespace asr::transcribe::encoder
 } // namespace qwen3_asr

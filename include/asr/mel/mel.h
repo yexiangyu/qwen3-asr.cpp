@@ -5,11 +5,11 @@
 #include <string>
 
 namespace qwen3_asr {
-namespace mel {
+namespace asr::mel {
 
-using modules::Result;
-using modules::MelSpectrum;
-using modules::ErrorInfo;
+using asr::Result;
+using asr::MelSpectrum;
+using asr::ErrorInfo;
 
 struct Config {
     int sample_rate = 16000;
@@ -51,5 +51,5 @@ bool save_ref_data(const char* path, const std::vector<float>& data);
 
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);
 
-} // namespace mel
+} // namespace asr::mel
 } // namespace qwen3_asr

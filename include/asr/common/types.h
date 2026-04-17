@@ -4,7 +4,7 @@
 #include <string>
 
 namespace qwen3_asr {
-namespace modules {
+namespace asr {
 
 constexpr int DEFAULT_SAMPLE_RATE = 16000;
 constexpr int DEFAULT_N_MELS = 128;
@@ -49,5 +49,5 @@ struct ErrorInfo {
     int code;
 };
 
-} // namespace modules
+} // namespace asr
 } // namespace qwen3_asr

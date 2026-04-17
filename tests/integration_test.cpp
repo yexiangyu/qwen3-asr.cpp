@@ -1,7 +1,7 @@
-#include "../src/modules/asr_encoder/asr_encoder.h"
-#include "../src/modules/decoder/decoder.h"
-#include "../src/modules/mel/mel.h"
-#include "../src/modules/audio_codec/audio_codec.h"
+#include "asr/transcribe/encoder.h"
+#include "asr/transcribe/decoder.h"
+#include "asr/mel/mel.h"
+#include "asr/codec/codec.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <vector>
 
-using namespace qwen3_asr;
+using namespace qwen3_asr::asr;
 
 int main() {
     const char* test_wav = "tests/data/test_audio.wav";
@@ -33,33 +33,33 @@ int main() {
     
     printf("Step 2: ASR Encoder\n");
     
-    asr_encoder::Config enc_config;
+    transcribe::encoder::Config enc_config;
     enc_config.model_path = "models/qwen3-asr-1.7b-f16.gguf";
     enc_config.n_threads = 4;
     enc_config.device_name = "CUDA0";
     
-    asr_encoder::ASREncoderState* enc_state = asr_encoder::init(enc_config);
+    transcribe::encoder::EncoderState* enc_state = transcribe::encoder::init(enc_config);
     if (!enc_state) {
         fprintf(stderr, "FAIL: Failed to init asr_encoder\n");
         return 1;
     }
     
-    auto enc_hparams = asr_encoder::get_hparams(enc_state);
+    auto enc_hparams = transcribe::encoder::get_hparams(enc_state);
     printf("  Model: qwen3-asr-1.7b-f16.gguf\n");
     printf("  Encoder hparams: hidden=%d\n", enc_hparams.hidden_size);
     
-    asr_encoder::ASRBatchInput batch_input;
+    transcribe::encoder::BatchInput batch_input;
     batch_input.mel_data.push_back(mel_spec.data.data());
     batch_input.n_frames.push_back(mel_spec.n_frames);
     batch_input.n_mels = mel_spec.n_mels;
     batch_input.max_frames = mel_spec.n_frames;
     
-    asr_encoder::ASRBatchOutput batch_output;
-    asr_encoder::ErrorInfo enc_error;
+    transcribe::encoder::BatchOutput batch_output;
+    transcribe::encoder::ErrorInfo enc_error;
     
-    if (!asr_encoder::encode_batch(enc_state, batch_input, batch_output, &enc_error)) {
+    if (!transcribe::encoder::encode_batch(enc_state, batch_input, batch_output, &enc_error)) {
         fprintf(stderr, "FAIL: ASR encoder encode failed: %s\n", enc_error.message.c_str());
-        asr_encoder::free(enc_state);
+        transcribe::encoder::free(enc_state);
         return 1;
     }
     
@@ -69,27 +69,27 @@ int main() {
     
     printf("Step 3: Decoder Prefill\n");
     
-    decoder::Config dec_config;
+    transcribe::decoder::Config dec_config;
     dec_config.model_path = "models/qwen3-asr-1.7b-f16.gguf";
     dec_config.n_threads = 4;
     dec_config.device_name = "CUDA0";
     dec_config.max_ctx_length = 4096;
     
-    decoder::DecoderState* dec_state = decoder::init(dec_config);
+    transcribe::decoder::State* dec_state = transcribe::decoder::init(dec_config);
     if (!dec_state) {
         fprintf(stderr, "FAIL: Failed to init decoder\n");
-        asr_encoder::free(enc_state);
+        transcribe::encoder::free(enc_state);
         return 1;
     }
     
-    auto dec_hparams = decoder::get_hparams(dec_state);
+    auto dec_hparams = transcribe::decoder::get_hparams(dec_state);
     printf("  Decoder hparams: vocab=%d, hidden=%d\n", dec_hparams.vocab_size, dec_hparams.hidden_size);
     
     if (audio_features.hidden_size != dec_hparams.hidden_size) {
         fprintf(stderr, "FAIL: Dimension mismatch! Encoder hidden=%d, Decoder hidden=%d\n",
                 audio_features.hidden_size, dec_hparams.hidden_size);
-        decoder::free(dec_state);
-        asr_encoder::free(enc_state);
+        transcribe::decoder::free(dec_state);
+        transcribe::encoder::free(enc_state);
         return 1;
     }
     
@@ -126,7 +126,7 @@ int main() {
     
     printf("  Tokens: [im_start, system, newline, im_end, newline, im_start, user, newline, audio_start, audio_pad*%d, audio_end, im_end, newline, im_start, assistant, newline]\n", audio_features.n_frames);
     
-    decoder::PrefillInput prefill_input;
+    transcribe::decoder::PrefillInput prefill_input;
     prefill_input.tokens = tokens.data();
     prefill_input.n_tokens = tokens.size();
     prefill_input.audio_features = audio_features.data.data();
@@ -134,17 +134,17 @@ int main() {
     prefill_input.audio_feature_dim = audio_features.hidden_size;
     prefill_input.audio_start_pos = -1;
     
-    decoder::DecoderOutput prefill_output;
-    decoder::ErrorInfo dec_error;
+    transcribe::decoder::DecoderOutput prefill_output;
+    transcribe::decoder::ErrorInfo dec_error;
     
-    if (!decoder::prefill(dec_state, prefill_input, prefill_output, &dec_error)) {
+    if (!transcribe::decoder::prefill(dec_state, prefill_input, prefill_output, &dec_error)) {
         fprintf(stderr, "FAIL: Decoder prefill failed: %s\n", dec_error.message.c_str());
-        decoder::free(dec_state);
-        asr_encoder::free(enc_state);
+        transcribe::decoder::free(dec_state);
+        transcribe::encoder::free(enc_state);
         return 1;
     }
     
-    int kv_used = decoder::get_kv_cache_used(dec_state);
+    int kv_used = transcribe::decoder::get_kv_cache_used(dec_state);
     printf("  KV cache: %d used\n\n", kv_used);
     
     printf("Step 4: Decode (generate tokens)\n");
@@ -158,8 +158,8 @@ int main() {
         if (i == 0) {
             if (prefill_output.logits.empty()) {
                 fprintf(stderr, "FAIL: Prefill output logits empty\n");
-                decoder::free(dec_state);
-                asr_encoder::free(enc_state);
+                transcribe::decoder::free(dec_state);
+                transcribe::encoder::free(enc_state);
                 return 1;
             }
             
@@ -183,21 +183,21 @@ int main() {
             }
             if (has_nan) {
                 fprintf(stderr, "FAIL: Prefill output contains NaN\n");
-                decoder::free(dec_state);
-                asr_encoder::free(enc_state);
+                transcribe::decoder::free(dec_state);
+                transcribe::encoder::free(enc_state);
                 return 1;
             }
         } else {
-            decoder::DecodeInput decode_input;
+            transcribe::decoder::DecodeInput decode_input;
             decode_input.tokens = &next_token;
             decode_input.n_tokens = 1;
             decode_input.n_past = n_past;
             
-            decoder::DecoderOutput decode_output;
-            if (!decoder::decode(dec_state, decode_input, decode_output, &dec_error)) {
+            transcribe::decoder::DecoderOutput decode_output;
+            if (!transcribe::decoder::decode(dec_state, decode_input, decode_output, &dec_error)) {
                 fprintf(stderr, "FAIL: Decoder decode failed: %s\n", dec_error.message.c_str());
-                decoder::free(dec_state);
-                asr_encoder::free(enc_state);
+                transcribe::decoder::free(dec_state);
+                transcribe::encoder::free(enc_state);
                 return 1;
             }
             
@@ -242,23 +242,23 @@ int main() {
         printf("  Tokens are varied (good)\n");
     }
     
-    decoder::free(dec_state);
-    asr_encoder::free(enc_state);
+    transcribe::decoder::free(dec_state);
+    transcribe::encoder::free(enc_state);
     
     printf("\nPASS: Complete ASR pipeline works\n\n");
     
     printf("=== Test Batch ASR Pipeline (batch_size=3) ===\n\n");
     
-    asr_encoder::ASREncoderState* enc_state2 = asr_encoder::init(enc_config);
+    transcribe::encoder::EncoderState* enc_state2 = transcribe::encoder::init(enc_config);
     if (!enc_state2) {
         fprintf(stderr, "FAIL: Failed to init asr_encoder for batch test\n");
         return 1;
     }
     
-    decoder::DecoderState* dec_state2 = decoder::init(dec_config);
+    transcribe::decoder::State* dec_state2 = transcribe::decoder::init(dec_config);
     if (!dec_state2) {
         fprintf(stderr, "FAIL: Failed to init decoder for batch test\n");
-        asr_encoder::free(enc_state2);
+        transcribe::encoder::free(enc_state2);
         return 1;
     }
     
@@ -287,7 +287,7 @@ int main() {
     
     printf("Batch mel inputs: sizes=[%d, %d, %d]\n", batch_frames[0], batch_frames[1], batch_frames[2]);
     
-    asr_encoder::ASRBatchInput batch_input2;
+    transcribe::encoder::BatchInput batch_input2;
     for (int b = 0; b < batch_size; ++b) {
         batch_input2.mel_data.push_back(batch_mels[b].data());
     }
@@ -295,12 +295,12 @@ int main() {
     batch_input2.n_mels = mel_spec.n_mels;
     batch_input2.max_frames = max_frames;
     
-    asr_encoder::ASRBatchOutput batch_output2;
+    transcribe::encoder::BatchOutput batch_output2;
     
-    if (!asr_encoder::encode_batch(enc_state2, batch_input2, batch_output2, &enc_error)) {
+    if (!transcribe::encoder::encode_batch(enc_state2, batch_input2, batch_output2, &enc_error)) {
         fprintf(stderr, "FAIL: Batch ASR encoder failed: %s\n", enc_error.message.c_str());
-        decoder::free(dec_state2);
-        asr_encoder::free(enc_state2);
+        transcribe::decoder::free(dec_state2);
+        transcribe::encoder::free(enc_state2);
         return 1;
     }
     
@@ -315,8 +315,8 @@ int main() {
         
         if (feat.data.empty() || std::isnan(min_v) || std::isnan(max_v)) {
             fprintf(stderr, "FAIL: Invalid output for batch item %d\n", b);
-            decoder::free(dec_state2);
-            asr_encoder::free(enc_state2);
+            transcribe::decoder::free(dec_state2);
+            transcribe::encoder::free(enc_state2);
             return 1;
         }
     }
@@ -338,7 +338,7 @@ int main() {
         tokens_b.push_back(assistant_token);
         tokens_b.push_back(198);
         
-        decoder::PrefillInput prefill_b;
+        transcribe::decoder::PrefillInput prefill_b;
         prefill_b.tokens = tokens_b.data();
         prefill_b.n_tokens = tokens_b.size();
         prefill_b.audio_features = feat.data.data();
@@ -346,13 +346,13 @@ int main() {
         prefill_b.audio_feature_dim = feat.hidden_size;
         prefill_b.audio_start_pos = -1;
         
-        decoder::DecoderOutput output_b;
-        decoder::clear_kv_cache(dec_state2);
+        transcribe::decoder::DecoderOutput output_b;
+        transcribe::decoder::clear_kv_cache(dec_state2);
         
-        if (!decoder::prefill(dec_state2, prefill_b, output_b, &dec_error)) {
+        if (!transcribe::decoder::prefill(dec_state2, prefill_b, output_b, &dec_error)) {
             fprintf(stderr, "FAIL: Decoder prefill for batch item %d failed: %s\n", b, dec_error.message.c_str());
-            decoder::free(dec_state2);
-            asr_encoder::free(enc_state2);
+            transcribe::decoder::free(dec_state2);
+            transcribe::encoder::free(enc_state2);
             return 1;
         }
         
@@ -364,16 +364,16 @@ int main() {
         
         if (output_b.logits.empty() || std::isnan(logit_min)) {
             fprintf(stderr, "FAIL: Invalid decoder output for batch item %d\n", b);
-            decoder::free(dec_state2);
-            asr_encoder::free(enc_state2);
+            transcribe::decoder::free(dec_state2);
+            transcribe::encoder::free(enc_state2);
             return 1;
         }
     }
     
     printf("PASS: Each batch item feeds decoder correctly\n\n");
     
-    decoder::free(dec_state2);
-    asr_encoder::free(enc_state2);
+    transcribe::decoder::free(dec_state2);
+    transcribe::encoder::free(enc_state2);
     
     printf("=== ALL TESTS PASSED ===\n");
     printf("\nVerified:\n");

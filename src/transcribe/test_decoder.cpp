@@ -1,13 +1,13 @@
-#include "decoder.h"
+#include "asr/transcribe/decoder.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <vector>
 
-using namespace qwen3_asr::decoder;
+using namespace qwen3_asr::asr::transcribe::decoder;
 
-bool test_kv_cache_management(DecoderState* state, const Config& config) {
+bool test_kv_cache_management(State* state, const Config& config) {
     fprintf(stderr, "\n=== Testing KV Cache Management ===\n");
     bool passed = true;
     
@@ -37,7 +37,7 @@ bool test_kv_cache_management(DecoderState* state, const Config& config) {
     return passed;
 }
 
-bool test_prefill_without_audio(DecoderState* state) {
+bool test_prefill_without_audio(State* state) {
     fprintf(stderr, "\n=== Testing Prefill (No Audio) ===\n");
     bool passed = true;
     
@@ -89,7 +89,7 @@ bool test_prefill_without_audio(DecoderState* state) {
     return passed;
 }
 
-bool test_prefill_with_audio(DecoderState* state) {
+bool test_prefill_with_audio(State* state) {
     fprintf(stderr, "\n=== Testing Prefill (With Audio) ===\n");
     bool passed = true;
     
@@ -153,7 +153,7 @@ bool test_prefill_with_audio(DecoderState* state) {
     return passed;
 }
 
-bool test_prefill_auto_detect_audio_positions(DecoderState* state) {
+bool test_prefill_auto_detect_audio_positions(State* state) {
     fprintf(stderr, "\n=== Testing Prefill (Auto-detect Audio Positions) ===\n");
     bool passed = true;
     
@@ -227,7 +227,7 @@ static bool validate_logits(const std::vector<float>& logits, const char* name) 
     return true;
 }
 
-bool test_decode_after_prefill(DecoderState* state) {
+bool test_decode_after_prefill(State* state) {
     fprintf(stderr, "\n=== Testing Decode After Prefill ===\n");
     bool passed = true;
     
@@ -298,7 +298,7 @@ bool test_decode_after_prefill(DecoderState* state) {
     return passed;
 }
 
-bool test_autoregressive_generation(DecoderState* state) {
+bool test_autoregressive_generation(State* state) {
     fprintf(stderr, "\n=== Testing Autoregressive Generation ===\n");
     bool passed = true;
     
@@ -386,7 +386,7 @@ int main(int argc, char** argv) {
     
     fprintf(stderr, "Loading decoder model from: %s\n", config.model_path.c_str());
     
-    DecoderState* state = init(config);
+    State* state = init(config);
     if (!state) {
         fprintf(stderr, "Failed to initialize decoder\n");
         return 1;

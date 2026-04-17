@@ -1,12 +1,12 @@
-#include "mel.h"
-#include "../audio_codec/audio_codec.h"
+#include "asr/mel/mel.h"
+#include "asr/codec/codec.h"
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 
 int main() {
-    namespace mel = qwen3_asr::mel;
-    namespace audio_codec = qwen3_asr::audio_codec;
+    namespace mel = qwen3_asr::asr::mel;
+    namespace codec = qwen3_asr::asr::codec;
     
     const char* test_wav = "tests/data/test_audio.wav";
     const char* ref_mel_path = "tests/data/ref_mel.raw";
@@ -17,7 +17,7 @@ int main() {
     int sample_rate;
     mel::ErrorInfo error;
     
-    if (!audio_codec::decode_file(test_wav, samples, sample_rate, &error)) {
+    if (!codec::decode_file(test_wav, samples, sample_rate, &error)) {
         fprintf(stderr, "FAIL: Failed to load audio: %s\n", error.message.c_str());
         return 1;
     }

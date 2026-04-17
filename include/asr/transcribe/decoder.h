@@ -5,9 +5,9 @@
 #include <vector>
 
 namespace qwen3_asr {
-namespace decoder {
+namespace asr::transcribe::decoder {
 
-using modules::ErrorInfo;
+using asr::ErrorInfo;
 
 struct Config {
     std::string model_path;
@@ -34,7 +34,7 @@ struct HyperParams {
     int eos_token = 151645;
 };
 
-struct DecoderState;
+struct State;
 
 struct PrefillInput {
     const int* tokens;
@@ -56,22 +56,22 @@ struct DecoderOutput {
     int vocab_size;
 };
 
-DecoderState* init(const Config& config);
-void free(DecoderState* state);
+State* init(const Config& config);
+void free(State* state);
 
-bool prefill(DecoderState* state, const PrefillInput& input, DecoderOutput& output, ErrorInfo* error = nullptr);
-bool decode(DecoderState* state, const DecodeInput& input, DecoderOutput& output, ErrorInfo* error = nullptr);
+bool prefill(State* state, const PrefillInput& input, DecoderOutput& output, ErrorInfo* error = nullptr);
+bool decode(State* state, const DecodeInput& input, DecoderOutput& output, ErrorInfo* error = nullptr);
 
-void clear_kv_cache(DecoderState* state);
-int get_kv_cache_used(DecoderState* state);
-int get_kv_cache_capacity(DecoderState* state);
+void clear_kv_cache(State* state);
+int get_kv_cache_used(State* state);
+int get_kv_cache_capacity(State* state);
 
-const char* get_device_name(DecoderState* state);
-HyperParams get_hparams(DecoderState* state);
+const char* get_device_name(State* state);
+HyperParams get_hparams(State* state);
 
 bool load_ref_data(const char* path, std::vector<float>& data);
 bool save_ref_data(const char* path, const std::vector<float>& data);
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);
 
-} // namespace decoder
+} // namespace asr::transcribe::decoder
 } // namespace qwen3_asr

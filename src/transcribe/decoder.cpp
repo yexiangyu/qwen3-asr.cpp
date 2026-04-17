@@ -1,5 +1,5 @@
-#include "decoder.h"
-#include "decoder_model.h"
+#include "asr/transcribe/decoder.h"
+#include "asr/transcribe/decoder_model.h"
 #include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -18,9 +18,9 @@
 #include <algorithm>
 
 namespace qwen3_asr {
-namespace decoder {
+namespace asr { namespace transcribe { namespace decoder {
 
-using modules::ErrorInfo;
+using asr::ErrorInfo;
 
 constexpr int MAX_NODES = 8192;
 
@@ -38,7 +38,7 @@ static ggml_backend_buffer_type_t get_preferred_buft() {
     return ggml_backend_cpu_buffer_type();
 }
 
-static bool load_model_internal(const char* path, DecoderModel& model, ErrorInfo* error) {
+static bool load_model_internal(const char* path, Model& model, ErrorInfo* error) {
     struct gguf_init_params params = { true, &model.ctx };
     struct gguf_context* ctx_gguf = gguf_init_from_file(path, params);
     if (!ctx_gguf) {
@@ -174,7 +174,7 @@ static bool load_model_internal(const char* path, DecoderModel& model, ErrorInfo
     return true;
 }
 
-static void free_decoder_model(DecoderModel& model) {
+static void free_decoder_model(Model& model) {
     if (model.buffer) {
         ggml_backend_buffer_free(model.buffer);
         model.buffer = nullptr;
@@ -192,7 +192,7 @@ static void free_decoder_model(DecoderModel& model) {
     model.tensors.clear();
 }
 
-static bool init_kv_cache(DecoderState* state, int n_ctx) {
+static bool init_kv_cache(State* state, int n_ctx) {
     const auto& hp = state->model->hparams;
     
     state->kv_cache.n_ctx = n_ctx;
@@ -239,7 +239,7 @@ static bool init_kv_cache(DecoderState* state, int n_ctx) {
     return true;
 }
 
-static void free_kv_cache(KVCache& cache) {
+static void free_kv_cache(Cache& cache) {
     if (cache.buffer) {
         ggml_backend_buffer_free(cache.buffer);
         cache.buffer = nullptr;
@@ -254,9 +254,9 @@ static void free_kv_cache(KVCache& cache) {
     cache.n_used = 0;
 }
 
-DecoderState* init(const Config& config) {
-    DecoderState* state = new DecoderState();
-    state->model = new DecoderModel();
+State* init(const Config& config) {
+    State* state = new State();
+    state->model = new Model();
     
     ErrorInfo err;
     if (!load_model_internal(config.model_path.c_str(), *state->model, &err)) {
@@ -320,7 +320,7 @@ DecoderState* init(const Config& config) {
     return state;
 }
 
-void free(DecoderState* state) {
+void free(State* state) {
     if (!state) return;
     
     free_kv_cache(state->kv_cache);
@@ -346,7 +346,7 @@ void free(DecoderState* state) {
     delete state;
 }
 
-void clear_kv_cache(DecoderState* state) {
+void clear_kv_cache(State* state) {
     if (!state) return;
     state->kv_cache.n_used = 0;
     
@@ -360,22 +360,22 @@ void clear_kv_cache(DecoderState* state) {
     }
 }
 
-int get_kv_cache_used(DecoderState* state) {
+int get_kv_cache_used(State* state) {
     if (!state) return 0;
     return state->kv_cache.n_used;
 }
 
-int get_kv_cache_capacity(DecoderState* state) {
+int get_kv_cache_capacity(State* state) {
     if (!state) return 0;
     return state->kv_cache.n_ctx;
 }
 
-const char* get_device_name(DecoderState* state) {
+const char* get_device_name(State* state) {
     if (!state) return "CPU";
     return state->backend_gpu ? ggml_backend_name(state->backend_gpu) : "CPU";
 }
 
-HyperParams get_hparams(DecoderState* state) {
+HyperParams get_hparams(State* state) {
     if (!state || !state->model) return HyperParams();
     return state->model->hparams;
 }
@@ -415,7 +415,7 @@ bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>&
 }
 
 static ggml_cgraph* build_prefill_graph(
-    DecoderState* state,
+    State* state,
     const int* tokens, int n_tokens,
     const float* audio_features, int n_audio_frames, int audio_start_pos,
     int n_past) {
@@ -618,7 +618,7 @@ static std::vector<int32_t> find_audio_pad_positions(
     return positions;
 }
 
-bool prefill(DecoderState* state, const PrefillInput& input, DecoderOutput& output, ErrorInfo* error) {
+bool prefill(State* state, const PrefillInput& input, DecoderOutput& output, ErrorInfo* error) {
     if (!state || !state->model) {
         if (error) error->message = "State or model not initialized";
         return false;
@@ -738,7 +738,7 @@ bool prefill(DecoderState* state, const PrefillInput& input, DecoderOutput& outp
     return true;
 }
 
-bool decode(DecoderState* state, const DecodeInput& input, DecoderOutput& output, ErrorInfo* error) {
+bool decode(State* state, const DecodeInput& input, DecoderOutput& output, ErrorInfo* error) {
     if (!state || !state->model) {
         if (error) error->message = "State or model not initialized";
         return false;
@@ -831,4 +831,7 @@ bool decode(DecoderState* state, const DecodeInput& input, DecoderOutput& output
     return true;
 }
 
-}}
+} // namespace decoder
+} // namespace transcribe
+} // namespace asr
+} // namespace qwen3_asr

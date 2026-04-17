@@ -1,5 +1,5 @@
-#include "mel.h"
-#include "../audio_codec/audio_codec.h"
+#include "asr/mel/mel.h"
+#include "asr/codec/codec.h"
 
 #include <algorithm>
 #include <cmath>
@@ -16,7 +16,7 @@
 #endif
 
 namespace qwen3_asr {
-namespace mel {
+namespace asr { namespace mel {
 
 static float hz_to_mel(float hz) {
     return 2595.0f * log10f(1.0f + hz / 700.0f);
@@ -247,7 +247,7 @@ bool compute_from_file(const char* wav_path, MelSpectrum& output, const Config& 
     std::vector<float> samples;
     int sample_rate;
     
-    if (!audio_codec::decode_file(wav_path, samples, sample_rate, error)) {
+    if (!codec::decode_file(wav_path, samples, sample_rate, error)) {
         return false;
     }
     
@@ -307,4 +307,5 @@ bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>&
 }
 
 } // namespace mel
+} // namespace asr
 } // namespace qwen3_asr

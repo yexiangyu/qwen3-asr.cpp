@@ -1,5 +1,5 @@
-#include "audio_codec.h"
-#include "../common/types.h"
+#include "asr/codec/codec.h"
+#include "asr/common/types.h"
 
 #include <fstream>
 #include <cstdint>
@@ -9,7 +9,9 @@
 #include <algorithm>
 
 namespace qwen3_asr {
-namespace audio_codec {
+namespace asr { namespace codec {
+
+using asr::ErrorInfo;
 
 bool load_wav(const char* path, std::vector<float>& samples, int& sample_rate, ErrorInfo* error) {
     std::ifstream file(path, std::ios::binary);
@@ -126,5 +128,6 @@ void pad_audio(std::vector<float>& samples, float min_duration_sec, int sample_r
     }
 }
 
-} // namespace audio_codec
+} // namespace codec
+} // namespace asr
 } // namespace qwen3_asr

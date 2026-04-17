@@ -6,9 +6,11 @@
 #include <map>
 
 namespace qwen3_asr {
-namespace decoder {
+namespace asr::transcribe::decoder {
 
-struct DecoderLayer {
+using asr::ErrorInfo;
+
+struct Layer {
     ggml_tensor* attn_norm = nullptr;
     
     ggml_tensor* attn_q = nullptr;
@@ -26,14 +28,14 @@ struct DecoderLayer {
     ggml_tensor* ffn_down = nullptr;
 };
 
-struct DecoderModel {
+struct Model {
     HyperParams hparams;
     
     ggml_tensor* token_embd = nullptr;
     ggml_tensor* output_norm = nullptr;
     ggml_tensor* output = nullptr;
     
-    std::vector<DecoderLayer> layers;
+    std::vector<Layer> layers;
     
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -44,7 +46,7 @@ struct DecoderModel {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
-struct KVCache {
+struct Cache {
     std::vector<ggml_tensor*> k_cache;
     std::vector<ggml_tensor*> v_cache;
     
@@ -58,9 +60,9 @@ struct KVCache {
     int n_layers = 0;
 };
 
-struct DecoderState {
-    DecoderModel* model = nullptr;
-    KVCache kv_cache;
+struct State {
+    Model* model = nullptr;
+    Cache kv_cache;
     
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t backend_gpu = nullptr;
@@ -71,5 +73,5 @@ struct DecoderState {
     ggml_tensor* result_logits = nullptr;
 };
 
-} // namespace decoder
+} // namespace asr::transcribe::decoder
 } // namespace qwen3_asr

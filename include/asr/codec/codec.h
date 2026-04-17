@@ -4,11 +4,11 @@
 #include <string>
 
 namespace qwen3_asr {
-namespace audio_codec {
+namespace asr::codec {
 
-using modules::Result;
-using modules::AudioSamples;
-using modules::ErrorInfo;
+using asr::Result;
+using asr::AudioSamples;
+using asr::ErrorInfo;
 
 struct Config {
     int target_sample_rate = 16000;
@@ -31,5 +31,5 @@ void normalize_audio(std::vector<float>& samples);
 
 void pad_audio(std::vector<float>& samples, float min_duration_sec, int sample_rate);
 
-} // namespace audio_codec
+} // namespace asr::codec
 } // namespace qwen3_asr

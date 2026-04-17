@@ -1,5 +1,5 @@
-#include "audio_codec.h"
-#include "../common/types.h"
+#include "asr/codec/codec.h"
+#include "asr/common/types.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -7,7 +7,7 @@
 #include <algorithm>
 
 namespace qwen3_asr {
-namespace audio_codec {
+namespace asr { namespace codec {
 
 bool ffmpeg_decode(const char* path, std::vector<float>& samples, int& sample_rate, ErrorInfo* error) {
     char cmd[512];
@@ -72,5 +72,6 @@ bool decode_file(const char* path, std::vector<float>& samples, int& sample_rate
     return false;
 }
 
-} // namespace audio_codec
+} // namespace codec
+} // namespace asr
 } // namespace qwen3_asr
