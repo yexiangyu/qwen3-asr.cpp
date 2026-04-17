@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../common/types.h"
+#include "asr/common/types.hpp"
 #include <string>
 
 namespace qwen3_asr {

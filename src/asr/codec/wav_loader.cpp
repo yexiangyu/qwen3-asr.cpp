@@ -1,5 +1,5 @@
-#include "asr/codec/codec.h"
-#include "asr/common/types.h"
+#include "asr/codec/codec.hpp"
+#include "asr/common/types.hpp"
 
 #include <fstream>
 #include <cstdint>

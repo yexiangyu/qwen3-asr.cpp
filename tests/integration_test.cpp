@@ -1,7 +1,7 @@
-#include "asr/transcribe/encoder.h"
-#include "asr/transcribe/decoder.h"
-#include "asr/mel/mel.h"
-#include "asr/codec/codec.h"
+#include "asr/transcribe/encoder.hpp"
+#include "asr/transcribe/decoder.hpp"
+#include "asr/mel/mel.hpp"
+#include "asr/codec/codec.hpp"
 
 #include <cstdio>
 #include <cstdlib>

@@ -1,5 +1,5 @@
-#include "asr/mel/mel.h"
-#include "asr/codec/codec.h"
+#include "asr/mel/mel.hpp"
+#include "asr/codec/codec.hpp"
 
 #include <algorithm>
 #include <cmath>

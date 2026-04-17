@@ -1,4 +1,4 @@
-#include "asr/transcribe/decoder.h"
+#include "asr/transcribe/decoder.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../common/types.h"
-#include "encoder_model.h"
+#include "asr/common/types.hpp"
+#include "asr/transcribe/encoder_model.hpp"
 #include <string>
 
 namespace qwen3_asr {

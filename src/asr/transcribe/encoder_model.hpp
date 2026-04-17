@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../common/types.h"
+#include "asr/common/types.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <string>

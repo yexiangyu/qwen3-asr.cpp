@@ -1,5 +1,5 @@
-#include "asr/transcribe/decoder.h"
-#include "asr/transcribe/decoder_model.h"
+#include "asr/transcribe/decoder.hpp"
+#include "asr/transcribe/decoder_model.hpp"
 #include "gguf.h"
 
 #ifdef GGML_USE_CUDA

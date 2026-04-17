@@ -217,16 +217,16 @@ endif()
 # Common types (header only)
 add_library(asr_common INTERFACE)
 target_include_directories(asr_common INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # Codec module
 add_library(asr_codec STATIC
-    src/codec/codec.cpp
-    src/codec/wav_loader.cpp
+    src/asr/codec/codec.cpp
+    src/asr/codec/wav_loader.cpp
 )
 target_include_directories(asr_codec PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(asr_codec PUBLIC
     asr_common
@@ -235,10 +235,10 @@ target_link_libraries(asr_codec PUBLIC
 
 # Mel module
 add_library(asr_mel STATIC
-    src/mel/mel.cpp
+    src/asr/mel/mel.cpp
 )
 target_include_directories(asr_mel PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(asr_mel PUBLIC
     asr_common
@@ -248,10 +248,10 @@ target_link_libraries(asr_mel PUBLIC
 
 # Transcribe encoder module
 add_library(asr_transcribe_encoder STATIC
-    src/transcribe/encoder.cpp
+    src/asr/transcribe/encoder.cpp
 )
 target_include_directories(asr_transcribe_encoder PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${GGML_DIR}/include
 )
 target_link_directories(asr_transcribe_encoder PUBLIC
@@ -273,10 +273,10 @@ endif()
 
 # Transcribe decoder module
 add_library(asr_transcribe_decoder STATIC
-    src/transcribe/decoder.cpp
+    src/asr/transcribe/decoder.cpp
 )
 target_include_directories(asr_transcribe_decoder PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${GGML_DIR}/include
 )
 target_link_directories(asr_transcribe_decoder PUBLIC
@@ -297,10 +297,10 @@ endif()
 
 # Aligner encoder module
 add_library(asr_aligner_encoder STATIC
-    src/aligner/encoder.cpp
+    src/asr/aligner/encoder.cpp
 )
 target_include_directories(asr_aligner_encoder PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${GGML_DIR}/include
 )
 target_link_directories(asr_aligner_encoder PUBLIC
@@ -434,15 +434,15 @@ option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
 
 if(QWEN3_ASR_BUILD_TESTS)
     # Test codec module
-    add_executable(test_codec src/codec/test_codec.cpp)
+    add_executable(test_codec tests/test_codec_module.cpp)
     target_link_libraries(test_codec PRIVATE asr_codec)
     
     # Test mel module
-    add_executable(test_mel src/mel/test_mel.cpp)
+    add_executable(test_mel tests/test_mel_module.cpp)
     target_link_libraries(test_mel PRIVATE asr_mel asr_codec)
     
     # Test transcribe encoder module
-    add_executable(test_transcribe_encoder src/transcribe/test_encoder.cpp)
+    add_executable(test_transcribe_encoder tests/test_transcribe_encoder.cpp)
     target_include_directories(test_transcribe_encoder PRIVATE ${GGML_DIR}/include)
     target_link_directories(test_transcribe_encoder PRIVATE ${GGML_BUILD_DIR}/src)
     target_link_libraries(test_transcribe_encoder PRIVATE
@@ -460,7 +460,7 @@ if(QWEN3_ASR_BUILD_TESTS)
     endif()
     
     # Test transcribe decoder module
-    add_executable(test_transcribe_decoder src/transcribe/test_decoder.cpp)
+    add_executable(test_transcribe_decoder tests/test_transcribe_decoder.cpp)
     target_include_directories(test_transcribe_decoder PRIVATE ${GGML_DIR}/include)
     target_link_directories(test_transcribe_decoder PRIVATE ${GGML_BUILD_DIR}/src)
     target_link_libraries(test_transcribe_decoder PRIVATE
@@ -476,7 +476,7 @@ if(QWEN3_ASR_BUILD_TESTS)
     endif()
     
     # Test aligner encoder module
-    add_executable(test_aligner_encoder src/aligner/test_encoder.cpp)
+    add_executable(test_aligner_encoder tests/test_aligner_encoder.cpp)
     target_include_directories(test_aligner_encoder PRIVATE ${GGML_DIR}/include)
     target_link_directories(test_aligner_encoder PRIVATE ${GGML_BUILD_DIR}/src)
     target_link_libraries(test_aligner_encoder PRIVATE
