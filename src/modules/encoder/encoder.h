@@ -23,10 +23,26 @@ struct Input {
     int n_frames;
 };
 
+struct BatchInput {
+    std::vector<const float*> mel_data;
+    std::vector<int> n_frames;
+    int n_mels;
+    int max_frames;
+    
+    int batch_size() const { return mel_data.size(); }
+};
+
+struct BatchOutput {
+    std::vector<AudioFeatures> features;
+    
+    int batch_size() const { return features.size(); }
+};
+
 EncoderState* init(const Config& config);
 void free(EncoderState* state);
 
 bool encode(EncoderState* state, const Input& input, AudioFeatures& output, ErrorInfo* error = nullptr);
+bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& output, ErrorInfo* error = nullptr);
 
 const char* get_device_name(EncoderState* state);
 HyperParams get_hparams(EncoderState* state);

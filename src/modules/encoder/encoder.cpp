@@ -323,6 +323,224 @@ static ggml_cgraph* build_graph_encoder(EncoderState* state, int n_ctx) {
     return gf;
 }
 
+static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, int batch_size) {
+    EncoderModel& m = *state->model;
+    int n_mel = m.hparams.n_mel_bins;
+    int conv_ch = m.hparams.conv_channels;
+    
+    ggml_init_params params = { state->compute_meta.size(), state->compute_meta.data(), true };
+    ggml_context* ctx = ggml_init(params);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    
+    ggml_tensor* mel_batch = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_frames, n_mel, 1, batch_size);
+    ggml_set_name(mel_batch, "mel_batch"); ggml_set_input(mel_batch);
+    
+    ggml_tensor* cur = ggml_conv_2d(ctx, m.conv2d1_w, mel_batch, 2, 2, 1, 1, 1, 1);
+    if (m.conv2d1_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d1_b, 1, 1, conv_ch, 1));
+    cur = ggml_gelu(ctx, cur);
+    
+    cur = ggml_conv_2d(ctx, m.conv2d2_w, cur, 2, 2, 1, 1, 1, 1);
+    if (m.conv2d2_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d2_b, 1, 1, conv_ch, 1));
+    cur = ggml_gelu(ctx, cur);
+    
+    cur = ggml_conv_2d(ctx, m.conv2d3_w, cur, 2, 2, 1, 1, 1, 1);
+    if (m.conv2d3_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d3_b, 1, 1, conv_ch, 1));
+    cur = ggml_gelu(ctx, cur);
+    
+    int64_t out_w = cur->ne[0];
+    int64_t out_h = cur->ne[1];
+    int64_t out_c = cur->ne[2];
+    int64_t feat_dim = out_c * out_h;
+    int64_t total_seq = out_w * batch_size;
+    
+    cur = ggml_reshape_4d(ctx, cur, out_w, out_h * out_c, batch_size, 1);
+    cur = ggml_cont(ctx, ggml_permute(ctx, cur, 1, 0, 2, 3));
+    cur = ggml_reshape_2d(ctx, cur, feat_dim, total_seq);
+    
+    if (m.conv_out_w) cur = ggml_mul_mat(ctx, m.conv_out_w, cur);
+    
+    ggml_set_name(cur, "embd_conv_batch"); ggml_set_output(cur);
+    state->embd_conv = cur;
+    
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx);
+    return gf;
+}
+
+static ggml_cgraph* build_graph_encoder_batch(EncoderState* state, int n_ctx, int /*batch_size*/, int /*seq_len_per_item*/) {
+    EncoderModel& m = *state->model;
+    int n_state = m.hparams.d_model;
+    int n_head = m.hparams.n_attention_heads;
+    int n_layer = m.hparams.n_encoder_layers;
+    int head_dim = n_state / n_head;
+    float eps = 1e-5f, scale = 1.0f / sqrtf(head_dim);
+    
+    ggml_init_params params = { state->compute_meta.size(), state->compute_meta.data(), true };
+    ggml_context* ctx = ggml_init(params);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+    
+    ggml_tensor* inpL = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+    ggml_set_name(inpL, "enc_input_batch"); ggml_set_input(inpL);
+    
+    ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ctx, n_ctx);
+    ggml_set_name(mask, "attn_mask"); ggml_set_input(mask);
+    
+    ggml_tensor* cur = inpL;
+    for (int L = 0; L < n_layer; ++L) {
+        auto& l = m.layers[L];
+        cur = ggml_norm(ctx, inpL, eps);
+        if (l.attn_norm_w) cur = ggml_mul(ctx, cur, l.attn_norm_w);
+        if (l.attn_norm_b) cur = ggml_add(ctx, cur, l.attn_norm_b);
+        
+        ggml_tensor* Qcur = ggml_mul_mat(ctx, l.attn_q_w, cur);
+        if (l.attn_q_b) Qcur = ggml_add(ctx, Qcur, l.attn_q_b);
+        ggml_tensor* Q = ggml_permute(ctx, ggml_reshape_3d(ctx, Qcur, head_dim, n_head, n_ctx), 0, 2, 1, 3);
+        
+        ggml_tensor* Kcur = ggml_mul_mat(ctx, l.attn_k_w, cur);
+        if (l.attn_k_b) Kcur = ggml_add(ctx, Kcur, l.attn_k_b);
+        ggml_tensor* K = ggml_permute(ctx, ggml_reshape_3d(ctx, Kcur, head_dim, n_head, n_ctx), 0, 2, 1, 3);
+        
+        ggml_tensor* Vcur = ggml_mul_mat(ctx, l.attn_v_w, cur);
+        if (l.attn_v_b) Vcur = ggml_add(ctx, Vcur, l.attn_v_b);
+        ggml_tensor* V = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, Vcur, head_dim, n_head, n_ctx), 1, 2, 0, 3));
+        
+        ggml_tensor* attn = ggml_mul_mat(ctx, V, ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, K, Q), mask, scale, 0.0f));
+        cur = ggml_cont_2d(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3), n_state, n_ctx);
+        
+        cur = ggml_mul_mat(ctx, l.attn_out_w, cur);
+        if (l.attn_out_b) cur = ggml_add(ctx, cur, l.attn_out_b);
+        cur = ggml_add(ctx, cur, inpL);
+        
+        ggml_tensor* ffn_in = cur;
+        cur = ggml_norm(ctx, ffn_in, eps);
+        if (l.ffn_norm_w) cur = ggml_mul(ctx, cur, l.ffn_norm_w);
+        if (l.ffn_norm_b) cur = ggml_add(ctx, cur, l.ffn_norm_b);
+        cur = ggml_gelu(ctx, ggml_mul_mat(ctx, l.ffn_up_w, cur));
+        if (l.ffn_up_b) cur = ggml_add(ctx, cur, l.ffn_up_b);
+        cur = ggml_mul_mat(ctx, l.ffn_down_w, cur);
+        if (l.ffn_down_b) cur = ggml_add(ctx, cur, l.ffn_down_b);
+        inpL = ggml_add(ctx, cur, ffn_in);
+    }
+    
+    cur = inpL;
+    if (m.ln_post_w) { cur = ggml_norm(ctx, cur, eps); cur = ggml_mul(ctx, cur, m.ln_post_w); if (m.ln_post_b) cur = ggml_add(ctx, cur, m.ln_post_b); }
+    if (m.proj1_w) { cur = ggml_gelu(ctx, ggml_mul_mat(ctx, m.proj1_w, cur)); if (m.proj1_b) cur = ggml_add(ctx, cur, m.proj1_b); }
+    if (m.proj2_w) { cur = ggml_mul_mat(ctx, m.proj2_w, cur); if (m.proj2_b) cur = ggml_add(ctx, cur, m.proj2_b); }
+    
+    ggml_set_name(cur, "embd_enc_batch"); ggml_set_output(cur);
+    state->embd_enc = cur;
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx);
+    return gf;
+}
+
+bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& output, ErrorInfo* error) {
+    if (!state || !state->model) { if (error) error->message = "State not initialized"; return false; }
+    if (input.batch_size() == 0) { if (error) error->message = "Empty batch"; return false; }
+    
+    EncoderModel& m = *state->model;
+    int n_state = m.hparams.d_model;
+    int n_mel = m.hparams.n_mel_bins;
+    int batch_size = input.batch_size();
+    int max_frames = input.max_frames;
+    int seq_len_per_item = compute_conv_output_len(max_frames);
+    
+    std::vector<float> mel_padded(batch_size * n_mel * max_frames, 0.0f);
+    for (int b = 0; b < batch_size; ++b) {
+        int n_frames = input.n_frames[b];
+        for (int m = 0; m < n_mel; ++m) {
+            for (int f = 0; f < n_frames; ++f) {
+                mel_padded[b * n_mel * max_frames + m * max_frames + f] = input.mel_data[b][m * n_frames + f];
+            }
+        }
+    }
+    
+    ggml_cgraph* gf_conv = build_graph_conv_batch(state, max_frames, batch_size);
+    if (!ggml_backend_sched_alloc_graph(state->sched, gf_conv)) { if (error) error->message = "alloc conv batch failed"; return false; }
+    
+    ggml_tensor* mel_t = ggml_graph_get_tensor(gf_conv, "mel_batch");
+    ggml_backend_tensor_set(mel_t, mel_padded.data(), 0, mel_padded.size() * sizeof(float));
+    
+    if (ggml_backend_sched_graph_compute(state->sched, gf_conv) != GGML_STATUS_SUCCESS) { if (error) error->message = "compute conv batch failed"; ggml_backend_sched_reset(state->sched); return false; }
+    
+    ggml_tensor* embd_conv = ggml_graph_get_tensor(gf_conv, "embd_conv_batch");
+    int64_t feat_dim = embd_conv->ne[0];
+    int64_t total_seq = embd_conv->ne[1];
+    
+    std::vector<float> conv_out(feat_dim * total_seq);
+    ggml_backend_tensor_get(embd_conv, conv_out.data(), 0, conv_out.size() * sizeof(float));
+    
+    std::vector<int> out_frames(batch_size);
+    for (int b = 0; b < batch_size; ++b) {
+        out_frames[b] = compute_conv_output_len(input.n_frames[b]);
+    }
+    
+    std::vector<float> pe(seq_len_per_item * feat_dim);
+    compute_sinusoidal_pe(pe.data(), seq_len_per_item, feat_dim);
+    
+    for (int b = 0; b < batch_size; ++b) {
+        int frame_offset = b * seq_len_per_item;
+        int valid_len = out_frames[b];
+        for (int f = 0; f < valid_len; ++f) {
+            for (int h = 0; h < feat_dim; ++h) {
+                conv_out[(frame_offset + f) * feat_dim + h] += pe[f * feat_dim + h];
+            }
+        }
+    }
+    
+std::vector<float> attn_mask(total_seq * total_seq, -INFINITY);
+    for (int b = 0; b < batch_size; ++b) {
+        int frame_start = b * seq_len_per_item;
+        int valid_len = out_frames[b];
+        
+        for (int r = frame_start; r < frame_start + valid_len; ++r) {
+            for (int c = frame_start; c < frame_start + valid_len; ++c) {
+                attn_mask[r * total_seq + c] = 0.0f;
+            }
+        }
+        
+        for (int r = frame_start + valid_len; r < frame_start + seq_len_per_item; ++r) {
+            for (int c = frame_start; c < frame_start + valid_len; ++c) {
+                attn_mask[r * total_seq + c] = 0.0f;
+            }
+        }
+    }
+    
+    ggml_backend_sched_reset(state->sched);
+    
+    ggml_cgraph* gf_enc = build_graph_encoder_batch(state, total_seq, batch_size, seq_len_per_item);
+    if (!ggml_backend_sched_alloc_graph(state->sched, gf_enc)) { if (error) error->message = "alloc enc batch failed"; return false; }
+    
+    ggml_tensor* enc_in = ggml_graph_get_tensor(gf_enc, "enc_input_batch");
+    ggml_backend_tensor_set(enc_in, conv_out.data(), 0, conv_out.size() * sizeof(float));
+    
+    ggml_tensor* mask_t = ggml_graph_get_tensor(gf_enc, "attn_mask");
+    ggml_backend_tensor_set(mask_t, attn_mask.data(), 0, attn_mask.size() * sizeof(float));
+    
+    if (ggml_backend_sched_graph_compute(state->sched, gf_enc) != GGML_STATUS_SUCCESS) { if (error) error->message = "compute enc batch failed"; ggml_backend_sched_reset(state->sched); return false; }
+    
+    ggml_tensor* embd_enc = ggml_graph_get_tensor(gf_enc, "embd_enc_batch");
+    std::vector<float> all_out(n_state * total_seq);
+    ggml_backend_tensor_get(embd_enc, all_out.data(), 0, all_out.size() * sizeof(float));
+    
+    output.features.resize(batch_size);
+    for (int b = 0; b < batch_size; ++b) {
+        int actual_out = out_frames[b];
+        int offset = b * seq_len_per_item;
+        output.features[b].hidden_size = n_state;
+        output.features[b].n_frames = actual_out;
+        output.features[b].data.resize(actual_out * n_state);
+        for (int f = 0; f < actual_out; ++f) {
+            for (int h = 0; h < n_state; ++h) {
+                output.features[b].data[f * n_state + h] = all_out[(offset + f) * n_state + h];
+            }
+        }
+    }
+    
+    ggml_backend_sched_reset(state->sched);
+    return true;
+}
+
 bool encode(EncoderState* state, const Input& input, AudioFeatures& output, ErrorInfo* error) {
     if (!state || !state->model) { if (error) error->message = "State not initialized"; return false; }
     
