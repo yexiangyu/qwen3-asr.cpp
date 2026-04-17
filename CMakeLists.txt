@@ -240,6 +240,32 @@ target_link_libraries(mel_module PUBLIC
     Threads::Threads
 )
 
+# Encoder module (new)
+add_library(encoder_module STATIC
+    src/modules/encoder/encoder.cpp
+)
+target_include_directories(encoder_module PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/encoder
+    ${GGML_DIR}/include
+)
+target_link_directories(encoder_module PUBLIC
+    ${GGML_BUILD_DIR}/src
+)
+target_link_libraries(encoder_module PUBLIC
+    mel_module
+    audio_codec
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(encoder_module PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(encoder_module PUBLIC ggml-cuda CUDA::cudart)
+    target_compile_definitions(encoder_module PUBLIC GGML_USE_CUDA)
+endif()
+
 # Audio encoder library (GGML-based)
 add_library(audio_encoder STATIC
     src/gguf_loader.cpp
@@ -371,6 +397,24 @@ if(QWEN3_ASR_BUILD_TESTS)
         audio_codec
         Threads::Threads
     )
+
+    # Test encoder module
+    add_executable(test_encoder_module
+        src/modules/encoder/test_encoder.cpp
+    )
+    target_link_libraries(test_encoder_module PRIVATE
+        encoder_module
+        mel_module
+        audio_codec
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_encoder_module PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_encoder_module PRIVATE ggml-cuda CUDA::cudart)
+    endif()
 
     # Test executable for mel spectrogram
     add_executable(test_mel
