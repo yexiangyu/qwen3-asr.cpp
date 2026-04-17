@@ -242,27 +242,62 @@ int main(int argc, char** argv) {
     printf("Audio features: hidden=%d, frames=%d\n", 
            audio_features.hidden_size, audio_features.n_frames);
     
-    // Build token sequence for prefill
+    // Build token sequence for prefill (matching original qwen3_asr.cpp format)
+    const int32_t im_start = 151644;
+    const int32_t im_end = 151645;
+    const int32_t system_token = 8948;
+    const int32_t user_token = 872;
+    const int32_t assistant_token = 77091;
+    const int32_t newline = 198;
+    
     std::vector<int> tokens;
+    
+    // System message
+    tokens.push_back(im_start);
+    tokens.push_back(system_token);
+    tokens.push_back(newline);
+    tokens.push_back(im_end);
+    tokens.push_back(newline);
+    
+    // User message with audio
+    tokens.push_back(im_start);
+    tokens.push_back(user_token);
+    tokens.push_back(newline);
+    
+    // Audio tokens
     tokens.push_back(dec_hparams.audio_start_token);
     for (int i = 0; i < audio_features.n_frames; ++i) {
         tokens.push_back(dec_hparams.audio_pad_token);
     }
     tokens.push_back(dec_hparams.audio_end_token);
-    tokens.push_back(151644);  // im_start
-    tokens.push_back(89463);   // assistant
-    tokens.push_back(198);     // newline
     
-    printf("Prefill tokens: %zu\n", tokens.size());
+    tokens.push_back(im_end);
+    tokens.push_back(newline);
+    
+    // Assistant message
+    tokens.push_back(im_start);
+    tokens.push_back(assistant_token);
+    tokens.push_back(newline);
+    
+    // Language prompt (optional)
+    if (!config.language.empty()) {
+        // TODO: tokenize language prompt properly
+        // For now, just add a generic prompt
+    }
+    
+    printf("Token sequence: %zu tokens\n", tokens.size());
+    printf("Audio frames in sequence: %d\n", audio_features.n_frames);
     
     // Prefill
+    int audio_start_pos = 8;  // Position of audio_start_token in sequence
+    
     transcribe::decoder::PrefillInput prefill_input;
     prefill_input.tokens = tokens.data();
     prefill_input.n_tokens = tokens.size();
     prefill_input.audio_features = audio_features.data.data();
     prefill_input.n_audio_frames = audio_features.n_frames;
     prefill_input.audio_feature_dim = audio_features.hidden_size;
-    prefill_input.audio_start_pos = -1;
+    prefill_input.audio_start_pos = audio_start_pos;
     
     transcribe::decoder::DecoderOutput prefill_output;
     
@@ -293,13 +328,27 @@ int main(int argc, char** argv) {
     }
     next_token = max_idx;
     
-    if (next_token != dec_hparams.eos_token) {
-        generated_tokens.push_back(next_token);
-        n_past++;
+    printf("First token from prefill: %d (logit=%.3f)\n", next_token, max_val);
+    printf("EOS token ID: %d\n", dec_hparams.eos_token);
+    
+    // Show top 10 tokens
+    std::vector<std::pair<float, int>> logits_sorted;
+    for (int i = 0; i < prefill_output.vocab_size; ++i) {
+        logits_sorted.push_back({prefill_output.logits[i], i});
+    }
+    std::sort(logits_sorted.begin(), logits_sorted.end(), std::greater<std::pair<float,int>>());
+    printf("Top 10 tokens:\n");
+    for (int i = 0; i < 10; ++i) {
+        printf("  token %d: id=%d, logit=%.3f\n", i, logits_sorted[i].second, logits_sorted[i].first);
+    }
+    
+    // Generate tokens
+    if (next_token != dec_hparams.eos_token && next_token != im_end) {
+        generated_tokens.push_back(next_token);  // Add first generated token
         
         printf("Decoding...\n");
         
-        for (int step = 1; step < config.max_tokens && next_token != dec_hparams.eos_token; ++step) {
+        for (int step = 1; step < config.max_tokens; ++step) {
             transcribe::decoder::DecodeInput decode_input;
             decode_input.tokens = &next_token;
             decode_input.n_tokens = 1;
@@ -322,7 +371,12 @@ int main(int argc, char** argv) {
             }
             next_token = max_idx;
             
-            if (next_token == dec_hparams.eos_token || next_token == 151645) {
+            if (step % 10 == 0 || step < 10) {
+                printf("  Step %d: token=%d, logit=%.3f, n_past=%d\n", step, next_token, max_val, n_past);
+            }
+            
+            if (next_token == dec_hparams.eos_token || next_token == im_end) {
+                printf("  EOS/im_end token at step %d: token=%d\n", step, next_token);
                 break;
             }
             
