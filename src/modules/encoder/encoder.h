@@ -17,12 +17,6 @@ struct Config {
     int max_ctx_length = 4096;
 };
 
-struct Input {
-    const float* mel_data;
-    int n_mels;
-    int n_frames;
-};
-
 struct BatchInput {
     std::vector<const float*> mel_data;
     std::vector<int> n_frames;
@@ -41,7 +35,6 @@ struct BatchOutput {
 EncoderState* init(const Config& config);
 void free(EncoderState* state);
 
-bool encode(EncoderState* state, const Input& input, AudioFeatures& output, ErrorInfo* error = nullptr);
 bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& output, ErrorInfo* error = nullptr);
 
 const char* get_device_name(EncoderState* state);
