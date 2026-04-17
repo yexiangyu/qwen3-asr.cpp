@@ -12,11 +12,13 @@ namespace encoder {
 
 struct HyperParams {
     int n_mel_bins = 128;
-    int d_model = 480;
+    int d_model = 1024;
     int hidden_size = 1024;
     int n_encoder_layers = 24;
-    int n_attention_heads = 24;
-    int n_state = 3840;
+    int n_attention_heads = 16;
+    int head_dim = 64;
+    int ff_dim = 4096;
+    int conv_channels = 480;
 };
 
 struct EncoderLayer {
@@ -80,7 +82,11 @@ struct EncoderState {
     
     ggml_tensor* embd_conv = nullptr;
     ggml_tensor* embd_enc = nullptr;
+    
+    EncoderModel* model = nullptr;
 };
+
+bool load_model(const char* path, EncoderModel& model, modules::ErrorInfo* error);
 
 void free_encoder_model(EncoderModel& model);
 
