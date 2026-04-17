@@ -210,6 +210,22 @@ else()
     endif()
 endif()
 
+# ============================================================================
+# Audio Codec Library (New modular component)
+# ============================================================================
+
+add_library(audio_codec STATIC
+    src/modules/audio_codec/audio_codec.cpp
+    src/modules/audio_codec/wav_loader.cpp
+)
+target_include_directories(audio_codec PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/modules/audio_codec
+)
+target_link_libraries(audio_codec PUBLIC
+    Threads::Threads
+)
+
 # Audio encoder library (GGML-based)
 add_library(audio_encoder STATIC
     src/gguf_loader.cpp
@@ -323,6 +339,15 @@ target_link_libraries(qwen3-asr-cli PRIVATE
 option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
 
 if(QWEN3_ASR_BUILD_TESTS)
+    # Test audio codec (new module)
+    add_executable(test_audio_codec
+        src/modules/audio_codec/test_audio_codec.cpp
+    )
+    target_link_libraries(test_audio_codec PRIVATE
+        audio_codec
+        Threads::Threads
+    )
+
     # Test executable for mel spectrogram
     add_executable(test_mel
         tests/test_mel.cpp

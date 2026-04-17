@@ -50,3 +50,18 @@ compile_commands.json
 # Sisyphus working files
 .sisyphus/notepads/
 .cache/
+
+# Test data (reference outputs)
+tests/data/*.raw
+tests/data/*.npy
+tests/data/*.bin
+tests/data/ref_*
+
+# Generated test audio
+tests/data/test_*.wav
+tests/data/test_*.raw
+
+# Keep only original test audio
+!tests/data/1.wav
+!tests/data/2.wav
+!tests/data/3.wav
