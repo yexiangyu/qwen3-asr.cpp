@@ -278,9 +278,31 @@ struct ggml_cgraph * AudioEncoder::build_graph_encoder(int n_ctx) {
     
     cur = inpL;
     
+    if (model_.ln_post_w) {
+        cur = ggml_norm(ctx0, cur, eps);
+        cur = ggml_mul(ctx0, cur, model_.ln_post_w);
+        if (model_.ln_post_b) {
+            cur = ggml_add(ctx0, cur, model_.ln_post_b);
+        }
+    }
+    
+    if (model_.proj1_w) {
+        cur = ggml_mul_mat(ctx0, model_.proj1_w, cur);
+        if (model_.proj1_b) {
+            cur = ggml_add(ctx0, cur, model_.proj1_b);
+        }
+        cur = ggml_gelu(ctx0, cur);
+    }
+    
+    if (model_.proj2_w) {
+        cur = ggml_mul_mat(ctx0, model_.proj2_w, cur);
+        if (model_.proj2_b) {
+            cur = ggml_add(ctx0, cur, model_.proj2_b);
+        }
+    }
+    
     ggml_set_name(cur, "embd_enc");
     ggml_set_output(cur);
-    state_.embd_enc = cur;
     
     ggml_build_forward_expand(gf, cur);
     
