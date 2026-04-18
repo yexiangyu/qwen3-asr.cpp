@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -99,10 +100,6 @@ bool parse_args(int argc, char** argv, CliConfig& config) {
     }
     
     return true;
-}
-
-std::string tokens_to_text(const std::vector<int>& tokens, const transcribe::decoder::HyperParams& hparams) {
-    return "Generated text placeholder";  // TODO: implement proper tokenizer
 }
 
 int main(int argc, char** argv) {
@@ -279,10 +276,14 @@ int main(int argc, char** argv) {
     tokens.push_back(assistant_token);
     tokens.push_back(newline);
     
-    // Language prompt (optional)
-    if (!config.language.empty()) {
-        // TODO: tokenize language prompt properly
-        // For now, just add a generic prompt
+    // Language prompt (when specified by user)
+    bool user_specified_language = !config.language.empty();
+    if (user_specified_language) {
+        std::string lang_prompt = "language " + config.language + "\n";
+        std::vector<int> lang_tokens = transcribe::decoder::tokenize(dec_state, lang_prompt);
+        for (int t : lang_tokens) {
+            tokens.push_back(t);
+        }
     }
     
     printf("Token sequence: %zu tokens\n", tokens.size());
@@ -328,25 +329,9 @@ int main(int argc, char** argv) {
     }
     next_token = max_idx;
     
-    printf("First token from prefill: %d (logit=%.3f)\n", next_token, max_val);
-    printf("EOS token ID: %d\n", dec_hparams.eos_token);
-    
-    // Show top 10 tokens
-    std::vector<std::pair<float, int>> logits_sorted;
-    for (int i = 0; i < prefill_output.vocab_size; ++i) {
-        logits_sorted.push_back({prefill_output.logits[i], i});
-    }
-    std::sort(logits_sorted.begin(), logits_sorted.end(), std::greater<std::pair<float,int>>());
-    printf("Top 10 tokens:\n");
-    for (int i = 0; i < 10; ++i) {
-        printf("  token %d: id=%d, logit=%.3f\n", i, logits_sorted[i].second, logits_sorted[i].first);
-    }
-    
     // Generate tokens
     if (next_token != dec_hparams.eos_token && next_token != im_end) {
-        generated_tokens.push_back(next_token);  // Add first generated token
-        
-        printf("Decoding...\n");
+        generated_tokens.push_back(next_token);
         
         for (int step = 1; step < config.max_tokens; ++step) {
             transcribe::decoder::DecodeInput decode_input;
@@ -371,12 +356,7 @@ int main(int argc, char** argv) {
             }
             next_token = max_idx;
             
-            if (step % 10 == 0 || step < 10) {
-                printf("  Step %d: token=%d, logit=%.3f, n_past=%d\n", step, next_token, max_val, n_past);
-            }
-            
             if (next_token == dec_hparams.eos_token || next_token == im_end) {
-                printf("  EOS/im_end token at step %d: token=%d\n", step, next_token);
                 break;
             }
             
@@ -387,25 +367,111 @@ int main(int argc, char** argv) {
     
     printf("Generated %zu tokens\n", generated_tokens.size());
     
+    // Process output based on whether user specified language
+    std::string detected_language;
+    std::string text_content;
+    
+    if (user_specified_language) {
+        // User specified language: use it directly
+        detected_language = config.language;
+        // Normalize to lowercase
+        for (auto& c : detected_language) c = std::tolower(static_cast<unsigned char>(c));
+        // Decode all tokens as text
+        text_content = transcribe::decoder::decode_tokens(dec_state, generated_tokens);
+    } else {
+        // User didn't specify language: model auto-detected it
+        // Need to parse from generated tokens
+        
+        // Decode first few tokens to check for "language" prefix
+        // Check if first token decodes to "language" or starts with it
+        std::string first_token_text = transcribe::decoder::decode_token(dec_state, generated_tokens[0]);
+        
+        int tokens_to_skip = 0;
+        if (first_token_text == "language" || first_token_text.find("language") == 0) {
+            // Model output includes language detection
+            // Find how many tokens make up the language part
+            std::string lang_part;
+            int idx = 0;
+            
+            // First token is "language"
+            lang_part = first_token_text;
+            tokens_to_skip = 1;
+            idx = 1;
+            
+            // Collect tokens until we hit non-alpha content (like newline or Chinese characters)
+            while (idx < (int)generated_tokens.size()) {
+                std::string tok_text = transcribe::decoder::decode_token(dec_state, generated_tokens[idx]);
+                if (tok_text.empty()) {
+                    idx++;
+                    tokens_to_skip++;
+                    continue;
+                }
+                
+                // Check if this is part of language name (alphabetic)
+                bool is_alpha = true;
+                for (char c : tok_text) {
+                    if (!std::isalpha(static_cast<unsigned char>(c)) && c != ' ' && c != '\t') {
+                        is_alpha = false;
+                        break;
+                    }
+                }
+                
+                if (is_alpha) {
+                    lang_part += tok_text;
+                    tokens_to_skip++;
+                    idx++;
+                } else {
+                    break;
+                }
+            }
+            
+            // Extract language name from "language <Language>"
+            if (lang_part.find("language ") == 0 || lang_part == "language") {
+                size_t pos = lang_part.find("language ");
+                if (pos == 0) {
+                    detected_language = lang_part.substr(9);
+                } else if (lang_part == "language") {
+                    // "language" alone followed by language name tokens
+                    detected_language = lang_part.substr(8);
+                }
+                // Normalize: strip whitespace, convert to lowercase
+                size_t start = detected_language.find_first_not_of(" \t");
+                size_t end = detected_language.find_last_not_of(" \t");
+                if (start != std::string::npos && end != std::string::npos) {
+                    detected_language = detected_language.substr(start, end - start + 1);
+                }
+                for (auto& c : detected_language) c = std::tolower(static_cast<unsigned char>(c));
+            }
+            
+            // Decode remaining tokens as text
+            std::vector<int> text_tokens;
+            for (int i = tokens_to_skip; i < (int)generated_tokens.size(); ++i) {
+                text_tokens.push_back(generated_tokens[i]);
+            }
+            text_content = transcribe::decoder::decode_tokens(dec_state, text_tokens);
+        } else {
+            // No language prefix in output
+            text_content = transcribe::decoder::decode_tokens(dec_state, generated_tokens);
+        }
+    }
+    
+    // Strip leading whitespace from text
+    size_t start = text_content.find_first_not_of(" \t\n\r");
+    if (start != std::string::npos) {
+        text_content = text_content.substr(start);
+    }
+    
     if (config.json_output) {
         printf("\n--- Output (JSON) ---\n");
         printf("{\n");
-        printf("  \"text\": \"");
-        for (int t : generated_tokens) {
-            printf("%d ", t);
-        }
-        printf("\",\n");
+        printf("  \"language\": \"%s\",\n", detected_language.c_str());
+        printf("  \"text\": \"%s\",\n", text_content.c_str());
         printf("  \"n_tokens\": %zu\n", generated_tokens.size());
         printf("}\n");
     } else {
         printf("\n--- Output ---\n");
-        printf("Generated tokens: [");
-        for (size_t i = 0; i < std::min(generated_tokens.size(), (size_t)20); ++i) {
-            printf("%d", generated_tokens[i]);
-            if (i < generated_tokens.size() - 1) printf(", ");
-        }
-        if (generated_tokens.size() > 20) printf("...");
-        printf("]\n");
+        printf("Language: %s\n", detected_language.empty() ? "unknown" : detected_language.c_str());
+        printf("Text: %s\n", text_content.c_str());
     }
     
     // Cleanup

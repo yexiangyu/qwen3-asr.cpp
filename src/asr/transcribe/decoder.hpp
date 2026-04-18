@@ -68,6 +68,10 @@ int get_kv_cache_capacity(State* state);
 const char* get_device_name(State* state);
 HyperParams get_hparams(State* state);
 
+std::string decode_token(const State* state, int token_id);
+std::string decode_tokens(const State* state, const std::vector<int>& tokens);
+std::vector<int> tokenize(const State* state, const std::string& text);
+
 bool load_ref_data(const char* path, std::vector<float>& data);
 bool save_ref_data(const char* path, const std::vector<float>& data);
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);

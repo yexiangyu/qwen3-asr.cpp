@@ -4,6 +4,7 @@
 #include "ggml-backend.h"
 #include <vector>
 #include <map>
+#include <string>
 
 namespace asr::transcribe::decoder {
 
@@ -35,6 +36,10 @@ struct Model {
     ggml_tensor* output = nullptr;
     
     std::vector<Layer> layers;
+    
+    std::vector<std::string> vocab;
+    std::map<std::string, int> token_to_id;
+    std::map<std::string, int> bpe_ranks;
     
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;

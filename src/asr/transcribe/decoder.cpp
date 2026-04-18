@@ -9,8 +9,10 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <climits>
 #include <vector>
 #include <fstream>
+#include <sstream>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -166,6 +168,27 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
         munmap(mmap_addr, st.st_size);
         model.mmap_addr = nullptr;
         model.mmap_size = 0;
+    }
+    
+    // Load vocabulary
+    int64_t tokens_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
+    if (tokens_idx >= 0) {
+        int64_t n_vocab = gguf_get_arr_n(ctx_gguf, tokens_idx);
+        model.vocab.resize(n_vocab);
+        for (int64_t i = 0; i < n_vocab; ++i) {
+            model.vocab[i] = gguf_get_arr_str(ctx_gguf, tokens_idx, i);
+            model.token_to_id[model.vocab[i]] = static_cast<int>(i);
+        }
+    }
+    
+    // Load BPE merges
+    int64_t merges_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.merges");
+    if (merges_idx >= 0) {
+        int64_t n_merges = gguf_get_arr_n(ctx_gguf, merges_idx);
+        for (int64_t i = 0; i < n_merges; ++i) {
+            std::string merge = gguf_get_arr_str(ctx_gguf, merges_idx, i);
+            model.bpe_ranks[merge] = static_cast<int>(i);
+        }
     }
     
     gguf_free(ctx_gguf);
@@ -828,6 +851,252 @@ bool decode(State* state, const DecodeInput& input, DecoderOutput& output, Error
     ggml_backend_sched_reset(state->sched);
     
     return true;
+}
+
+static std::vector<int> build_unicode_to_byte_table() {
+    std::vector<int> byte_to_cp(256, 0);
+    std::vector<bool> assigned(256, false);
+
+    auto mark = [&](int lo, int hi) {
+        for (int b = lo; b <= hi; ++b) {
+            byte_to_cp[b] = b;
+            assigned[b] = true;
+        }
+    };
+    mark(0x21, 0x7E);
+    mark(0xA1, 0xAC);
+    mark(0xAE, 0xFF);
+
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (!assigned[b]) {
+            byte_to_cp[b] = 256 + n;
+            ++n;
+        }
+    }
+
+    std::vector<int> cp_to_byte(512, -1);
+    for (int b = 0; b < 256; ++b) {
+        cp_to_byte[byte_to_cp[b]] = b;
+    }
+    return cp_to_byte;
+}
+
+std::string decode_token(const State* state, int token_id) {
+    if (!state || !state->model) return "";
+    if (token_id < 0 || token_id >= (int)state->model->vocab.size()) return "";
+
+    const std::string& token = state->model->vocab[token_id];
+
+    if (token.size() >= 3 && token[0] == '<' && token[1] == '|' &&
+        token[token.size()-1] == '>' && token[token.size()-2] == '|') {
+        return "";
+    }
+    if (token.size() >= 5 && token.substr(0, 4) == "[PAD") {
+        return "";
+    }
+
+    static const std::vector<int> cp_to_byte = build_unicode_to_byte_table();
+
+    std::string bytes;
+    bytes.reserve(token.size());
+
+    size_t i = 0;
+    while (i < token.size()) {
+        uint32_t cp = 0;
+        unsigned char c = static_cast<unsigned char>(token[i]);
+        size_t len = 0;
+
+        if (c < 0x80) {
+            cp = c; len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            cp = c & 0x1F; len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            cp = c & 0x0F; len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            cp = c & 0x07; len = 4;
+        } else {
+            bytes += static_cast<char>(c);
+            ++i;
+            continue;
+        }
+
+        if (i + len > token.size()) {
+            while (i < token.size()) {
+                bytes += token[i++];
+            }
+            break;
+        }
+
+        for (size_t j = 1; j < len; ++j) {
+            cp = (cp << 6) | (static_cast<unsigned char>(token[i + j]) & 0x3F);
+        }
+        i += len;
+
+        if (cp < cp_to_byte.size() && cp_to_byte[cp] >= 0) {
+            bytes += static_cast<char>(cp_to_byte[cp]);
+        } else {
+            if (cp < 0x80) {
+                bytes += static_cast<char>(cp);
+            } else if (cp < 0x800) {
+                bytes += static_cast<char>(0xC0 | (cp >> 6));
+                bytes += static_cast<char>(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                bytes += static_cast<char>(0xE0 | (cp >> 12));
+                bytes += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                bytes += static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+                bytes += static_cast<char>(0xF0 | (cp >> 18));
+                bytes += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                bytes += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                bytes += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+        }
+    }
+
+    return bytes;
+}
+
+std::string decode_tokens(const State* state, const std::vector<int>& tokens) {
+    std::string result;
+    for (int token : tokens) {
+        result += decode_token(state, token);
+    }
+    return result;
+}
+
+static std::vector<std::string> get_byte_to_unicode_table() {
+    static std::vector<std::string> table;
+    if (!table.empty()) return table;
+    table.resize(256);
+
+    std::vector<int> byte_to_cp(256, 0);
+    std::vector<bool> assigned(256, false);
+
+    auto mark = [&](int lo, int hi) {
+        for (int b = lo; b <= hi; ++b) {
+            byte_to_cp[b] = b;
+            assigned[b] = true;
+        }
+    };
+    mark(0x21, 0x7E);
+    mark(0xA1, 0xAC);
+    mark(0xAE, 0xFF);
+
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (!assigned[b]) {
+            byte_to_cp[b] = 256 + n;
+            ++n;
+        }
+    }
+
+    auto cp_to_utf8 = [](int cp) -> std::string {
+        std::string s;
+        if (cp < 0x80) {
+            s += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            s += static_cast<char>(0xC0 | (cp >> 6));
+            s += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            s += static_cast<char>(0xE0 | (cp >> 12));
+            s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            s += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        return s;
+    };
+
+    for (int b = 0; b < 256; ++b) {
+        table[b] = cp_to_utf8(byte_to_cp[b]);
+    }
+    return table;
+}
+
+static std::string bytes_to_bpe_string(const std::string& text) {
+    const auto& table = get_byte_to_unicode_table();
+    std::string result;
+    result.reserve(text.size() * 2);
+    for (unsigned char c : text) {
+        result += table[c];
+    }
+    return result;
+}
+
+static std::vector<std::string> bpe_encode_word(const std::string& word, const std::map<std::string, int>& bpe_ranks) {
+    if (word.empty()) return {};
+
+    std::vector<std::string> symbols;
+    size_t i = 0;
+    while (i < word.size()) {
+        unsigned char c = static_cast<unsigned char>(word[i]);
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (i + len > word.size()) len = 1;
+        symbols.push_back(word.substr(i, len));
+        i += len;
+    }
+
+    if (symbols.size() == 1) return symbols;
+
+    std::map<std::string, int> ranks = bpe_ranks;
+
+    while (symbols.size() > 1) {
+        int min_rank = INT_MAX;
+        size_t min_idx = 0;
+
+        for (size_t j = 0; j < symbols.size() - 1; ++j) {
+            std::string pair = symbols[j] + symbols[j + 1];
+            auto it = ranks.find(pair);
+            if (it != ranks.end() && it->second < min_rank) {
+                min_rank = it->second;
+                min_idx = j;
+            }
+        }
+
+        if (min_rank == INT_MAX) break;
+
+        std::vector<std::string> new_symbols;
+        for (size_t j = 0; j < symbols.size(); ++j) {
+            if (j == min_idx) {
+                new_symbols.push_back(symbols[j] + symbols[j + 1]);
+                ++j;
+            } else {
+                new_symbols.push_back(symbols[j]);
+            }
+        }
+        symbols = std::move(new_symbols);
+        if (symbols.size() == 1) break;
+    }
+
+    return symbols;
+}
+
+std::vector<int> tokenize(const State* state, const std::string& text) {
+    if (!state || !state->model) return {};
+
+    std::vector<int> tokens;
+    std::istringstream iss(text);
+    std::string word;
+    bool first = true;
+
+    while (iss >> word) {
+        std::string to_encode = first ? word : (" " + word);
+        first = false;
+
+        std::string bpe_str = bytes_to_bpe_string(to_encode);
+        std::vector<std::string> subwords = bpe_encode_word(bpe_str, state->model->bpe_ranks);
+
+        for (const auto& sw : subwords) {
+            auto it = state->model->token_to_id.find(sw);
+            if (it != state->model->token_to_id.end()) {
+                tokens.push_back(it->second);
+            }
+        }
+    }
+
+    return tokens;
 }
 
 } // namespace decoder
