@@ -553,6 +553,22 @@ if(QWEN3_ASR_BUILD_TESTS)
         target_link_libraries(test_transcribe_decoder PRIVATE ggml-cuda CUDA::cudart)
     endif()
     
+    # Test batch decode
+    add_executable(test_batch_decode tests/test_batch_decode.cpp)
+    target_include_directories(test_batch_decode PRIVATE ${GGML_DIR}/include)
+    target_link_directories(test_batch_decode PRIVATE ${GGML_BUILD_DIR}/src)
+    target_link_libraries(test_batch_decode PRIVATE
+        asr_transcribe_decoder
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_batch_decode PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_batch_decode PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+    
     # Test aligner encoder module
     add_executable(test_aligner_encoder tests/test_aligner_encoder.cpp)
     target_include_directories(test_aligner_encoder PRIVATE ${GGML_DIR}/include)

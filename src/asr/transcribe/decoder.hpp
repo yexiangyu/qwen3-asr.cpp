@@ -108,4 +108,75 @@ bool load_ref_data(const char* path, std::vector<float>& data);
 bool save_ref_data(const char* path, const std::vector<float>& data);
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose = false);
 
+struct BatchDecodeState;
+
+struct BatchConfig {
+    std::string model_path;
+    std::string device_name;
+    int n_threads = 4;
+    int max_batch_size = 4;
+    int max_total_capacity = 16384;
+};
+
+struct BatchSequenceInput {
+    const float* audio_features;
+    int n_audio_frames;
+    int audio_feature_dim;
+    int max_tokens = 256;
+    std::string language;
+    std::string context;
+    std::string hotwords;
+    std::string prompt;
+};
+
+struct BatchSequenceOutput {
+    int slot_id;
+    std::string language;
+    std::string text;
+    std::vector<int> tokens;
+    int n_tokens;
+    bool is_eos;
+};
+
+BatchDecodeState* init_batch(const Config& config, int max_batch_size, int max_total_capacity);
+void free_batch(BatchDecodeState* state);
+
+int batch_add_sequence(BatchDecodeState* state,
+                       const std::vector<int>& prefill_tokens,
+                       const float* audio_features,
+                       int n_audio_frames,
+                       int audio_feature_dim,
+                       int audio_start_pos,
+                       int max_tokens,
+                       const std::string& language,
+                       ErrorInfo* error);
+
+void batch_remove_sequence(BatchDecodeState* state, int slot_id);
+
+bool batch_decode_step(BatchDecodeState* state, ErrorInfo* error);
+
+std::vector<int> batch_get_active_slots(BatchDecodeState* state);
+std::vector<int> batch_get_eos_slots(BatchDecodeState* state);
+std::string batch_get_text(BatchDecodeState* state, int slot_id);
+std::vector<int> batch_get_tokens(BatchDecodeState* state, int slot_id);
+int batch_get_seq_id(BatchDecodeState* state, int slot_id);
+
+int batch_get_n_active(BatchDecodeState* state);
+int batch_get_capacity(BatchDecodeState* state);
+int batch_get_slot_capacity(BatchDecodeState* state, int slot_id);
+int batch_get_slot_used(BatchDecodeState* state, int slot_id);
+
+void batch_clear(BatchDecodeState* state);
+
+HyperParams batch_get_hparams(BatchDecodeState* state);
+const char* batch_get_device_name(BatchDecodeState* state);
+
+std::vector<int> batch_build_token_sequence(
+    BatchDecodeState* state,
+    int n_audio_frames,
+    const std::string& language,
+    const std::string& context,
+    const std::string& hotwords,
+    const std::string& prompt);
+
 } // namespace asr::transcribe::decoder

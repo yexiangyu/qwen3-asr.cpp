@@ -64,6 +64,33 @@ struct Cache {
     int n_layers = 0;
 };
 
+struct SequenceSlot {
+    int seq_id = -1;
+    int start_pos = 0;
+    int n_used = 0;
+    int capacity = 0;
+    bool is_active = false;
+    std::vector<int> generated_tokens;
+    int next_token = -1;
+    std::string language;
+};
+
+struct UnifiedCache {
+    std::vector<ggml_tensor*> k_cache;
+    std::vector<ggml_tensor*> v_cache;
+    
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    
+    int total_capacity = 0;
+    int head_dim = 0;
+    int n_kv_heads = 0;
+    int n_layers = 0;
+    
+    std::vector<SequenceSlot> slots;
+    int next_seq_id = 0;
+};
+
 struct State {
     Model* model = nullptr;
     Cache kv_cache;
@@ -75,6 +102,18 @@ struct State {
     std::vector<uint8_t> compute_meta;
     
     ggml_tensor* result_logits = nullptr;
+};
+
+struct BatchDecodeState {
+    Model* model = nullptr;
+    UnifiedCache unified_cache;
+    
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend_gpu = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    
+    std::vector<uint8_t> compute_meta;
+    int max_batch_size;
 };
 
 } // namespace asr::transcribe::decoder
