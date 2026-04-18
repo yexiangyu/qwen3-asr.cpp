@@ -24,6 +24,8 @@ struct CliConfig {
     std::string aligner_model_path = "models/qwen3-forced-aligner-0.6b-f16.gguf";
     std::string output_path;
     std::string language;
+    std::string context;
+    std::string hotwords;
     std::string text_for_align;
     std::string device = "CUDA0";
     int threads = 4;
@@ -42,6 +44,8 @@ void print_usage(const char* prog_name) {
     printf("  --device <name>          Device (default: CUDA0)\n");
     printf("  --threads <n>            Number of threads (default: 4)\n");
     printf("  --language <lang>        Language hint (e.g., chinese, korean)\n");
+    printf("  --context <text>         Previous transcription for streaming\n");
+    printf("  --hotwords <words>       Words to emphasize (comma-separated)\n");
     printf("  --max-tokens <n>         Max tokens to generate (default: 512)\n");
     printf("  --output <path>          Output file path\n");
     printf("  --format <fmt>           Output format: text, json (default: text)\n");
@@ -72,6 +76,10 @@ bool parse_args(int argc, char** argv, CliConfig& config) {
             config.threads = std::atoi(argv[++i]);
         } else if (arg == "--language" && i + 1 < argc) {
             config.language = argv[++i];
+        } else if (arg == "--context" && i + 1 < argc) {
+            config.context = argv[++i];
+        } else if (arg == "--hotwords" && i + 1 < argc) {
+            config.hotwords = argv[++i];
         } else if (arg == "--max-tokens" && i + 1 < argc) {
             config.max_tokens = std::atoi(argv[++i]);
         } else if (arg == "--output" && i + 1 < argc) {
@@ -239,71 +247,20 @@ int main(int argc, char** argv) {
     printf("Audio features: hidden=%d, frames=%d\n", 
            audio_features.hidden_size, audio_features.n_frames);
     
-    // Build token sequence for prefill (matching original qwen3_asr.cpp format)
-    const int32_t im_start = 151644;
-    const int32_t im_end = 151645;
-    const int32_t system_token = 8948;
-    const int32_t user_token = 872;
-    const int32_t assistant_token = 77091;
-    const int32_t newline = 198;
+    // Use new transcribe API
+    transcribe::decoder::TranscribeInput transcribe_in;
+    transcribe_in.audio_features = audio_features.data.data();
+    transcribe_in.n_audio_frames = audio_features.n_frames;
+    transcribe_in.audio_feature_dim = audio_features.hidden_size;
+    transcribe_in.max_tokens = config.max_tokens;
+    transcribe_in.language = config.language;
+    transcribe_in.context = config.context;
+    transcribe_in.hotwords = config.hotwords;
     
-    std::vector<int> tokens;
+    transcribe::decoder::TranscribeOutput transcribe_out;
     
-    // System message
-    tokens.push_back(im_start);
-    tokens.push_back(system_token);
-    tokens.push_back(newline);
-    tokens.push_back(im_end);
-    tokens.push_back(newline);
-    
-    // User message with audio
-    tokens.push_back(im_start);
-    tokens.push_back(user_token);
-    tokens.push_back(newline);
-    
-    // Audio tokens
-    tokens.push_back(dec_hparams.audio_start_token);
-    for (int i = 0; i < audio_features.n_frames; ++i) {
-        tokens.push_back(dec_hparams.audio_pad_token);
-    }
-    tokens.push_back(dec_hparams.audio_end_token);
-    
-    tokens.push_back(im_end);
-    tokens.push_back(newline);
-    
-    // Assistant message
-    tokens.push_back(im_start);
-    tokens.push_back(assistant_token);
-    tokens.push_back(newline);
-    
-    // Language prompt (when specified by user)
-    bool user_specified_language = !config.language.empty();
-    if (user_specified_language) {
-        std::string lang_prompt = "language " + config.language + "\n";
-        std::vector<int> lang_tokens = transcribe::decoder::tokenize(dec_state, lang_prompt);
-        for (int t : lang_tokens) {
-            tokens.push_back(t);
-        }
-    }
-    
-    printf("Token sequence: %zu tokens\n", tokens.size());
-    printf("Audio frames in sequence: %d\n", audio_features.n_frames);
-    
-    // Prefill
-    int audio_start_pos = 9;  // Position of first audio_pad token (audio_start_token at pos 8 stays as embedding)
-    
-    transcribe::decoder::PrefillInput prefill_input;
-    prefill_input.tokens = tokens.data();
-    prefill_input.n_tokens = tokens.size();
-    prefill_input.audio_features = audio_features.data.data();
-    prefill_input.n_audio_frames = audio_features.n_frames;
-    prefill_input.audio_feature_dim = audio_features.hidden_size;
-    prefill_input.audio_start_pos = audio_start_pos;
-    
-    transcribe::decoder::DecoderOutput prefill_output;
-    
-    if (!transcribe::decoder::prefill(dec_state, prefill_input, prefill_output, &error)) {
-        fprintf(stderr, "Error: Decoder prefill failed: %s\n", error.message.c_str());
+    if (!transcribe::decoder::transcribe(dec_state, transcribe_in, transcribe_out, &error)) {
+        fprintf(stderr, "Error: Transcribe failed: %s\n", error.message.c_str());
         if (align_dec_state) aligner::decoder::free(align_dec_state);
         if (align_enc_state) aligner::encoder::free(align_enc_state);
         transcribe::decoder::free(dec_state);
@@ -311,167 +268,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    printf("Prefill complete, KV cache: %d\n", transcribe::decoder::get_kv_cache_used(dec_state));
-    
-    // Generate tokens
-    std::vector<int> generated_tokens;
-    int n_past = tokens.size();
-    int next_token = 0;
-    
-    // Get first token from prefill output
-    int max_idx = 0;
-    float max_val = prefill_output.logits[0];
-    for (int i = 1; i < prefill_output.vocab_size; ++i) {
-        if (prefill_output.logits[i] > max_val) {
-            max_val = prefill_output.logits[i];
-            max_idx = i;
-        }
-    }
-    next_token = max_idx;
-    
-    // Generate tokens
-    if (next_token != dec_hparams.eos_token && next_token != im_end) {
-        generated_tokens.push_back(next_token);
-        
-        for (int step = 1; step < config.max_tokens; ++step) {
-            transcribe::decoder::DecodeInput decode_input;
-            decode_input.tokens = &next_token;
-            decode_input.n_tokens = 1;
-            decode_input.n_past = n_past;
-            
-            transcribe::decoder::DecoderOutput decode_output;
-            
-            if (!transcribe::decoder::decode(dec_state, decode_input, decode_output, &error)) {
-                fprintf(stderr, "Warning: Decode step %d failed: %s\n", step, error.message.c_str());
-                break;
-            }
-            
-            max_idx = 0;
-            max_val = decode_output.logits[0];
-            for (int i = 1; i < decode_output.vocab_size; ++i) {
-                if (decode_output.logits[i] > max_val) {
-                    max_val = decode_output.logits[i];
-                    max_idx = i;
-                }
-            }
-            next_token = max_idx;
-            
-            if (next_token == dec_hparams.eos_token || next_token == im_end) {
-                break;
-            }
-            
-            generated_tokens.push_back(next_token);
-            n_past++;
-        }
-    }
-    
-    printf("Generated %zu tokens\n", generated_tokens.size());
-    
-    // Process output based on whether user specified language
-    std::string detected_language;
-    std::string text_content;
-    
-    if (user_specified_language) {
-        // User specified language: use it directly
-        detected_language = config.language;
-        // Normalize to lowercase
-        for (auto& c : detected_language) c = std::tolower(static_cast<unsigned char>(c));
-        // Decode all tokens as text
-        text_content = transcribe::decoder::decode_tokens(dec_state, generated_tokens);
-    } else {
-        // User didn't specify language: model auto-detected it
-        // Need to parse from generated tokens
-        
-        // Decode first few tokens to check for "language" prefix
-        // Check if first token decodes to "language" or starts with it
-        std::string first_token_text = transcribe::decoder::decode_token(dec_state, generated_tokens[0]);
-        
-        int tokens_to_skip = 0;
-        if (first_token_text == "language" || first_token_text.find("language") == 0) {
-            // Model output includes language detection
-            // Find how many tokens make up the language part
-            std::string lang_part;
-            int idx = 0;
-            
-            // First token is "language"
-            lang_part = first_token_text;
-            tokens_to_skip = 1;
-            idx = 1;
-            
-            // Collect tokens until we hit non-alpha content (like newline or Chinese characters)
-            while (idx < (int)generated_tokens.size()) {
-                std::string tok_text = transcribe::decoder::decode_token(dec_state, generated_tokens[idx]);
-                if (tok_text.empty()) {
-                    idx++;
-                    tokens_to_skip++;
-                    continue;
-                }
-                
-                // Check if this is part of language name (alphabetic)
-                bool is_alpha = true;
-                for (char c : tok_text) {
-                    if (!std::isalpha(static_cast<unsigned char>(c)) && c != ' ' && c != '\t') {
-                        is_alpha = false;
-                        break;
-                    }
-                }
-                
-                if (is_alpha) {
-                    lang_part += tok_text;
-                    tokens_to_skip++;
-                    idx++;
-                } else {
-                    break;
-                }
-            }
-            
-            // Extract language name from "language <Language>"
-            if (lang_part.find("language ") == 0 || lang_part == "language") {
-                size_t pos = lang_part.find("language ");
-                if (pos == 0) {
-                    detected_language = lang_part.substr(9);
-                } else if (lang_part == "language") {
-                    // "language" alone followed by language name tokens
-                    detected_language = lang_part.substr(8);
-                }
-                // Normalize: strip whitespace, convert to lowercase
-                size_t start = detected_language.find_first_not_of(" \t");
-                size_t end = detected_language.find_last_not_of(" \t");
-                if (start != std::string::npos && end != std::string::npos) {
-                    detected_language = detected_language.substr(start, end - start + 1);
-                }
-                for (auto& c : detected_language) c = std::tolower(static_cast<unsigned char>(c));
-            }
-            
-            // Decode remaining tokens as text
-            std::vector<int> text_tokens;
-            for (int i = tokens_to_skip; i < (int)generated_tokens.size(); ++i) {
-                text_tokens.push_back(generated_tokens[i]);
-            }
-            text_content = transcribe::decoder::decode_tokens(dec_state, text_tokens);
-        } else {
-            // No language prefix in output
-            text_content = transcribe::decoder::decode_tokens(dec_state, generated_tokens);
-        }
-    }
-    
-    // Strip leading whitespace from text
-    size_t start = text_content.find_first_not_of(" \t\n\r");
-    if (start != std::string::npos) {
-        text_content = text_content.substr(start);
-    }
+    printf("Generated %d tokens\n", transcribe_out.n_tokens);
     
     if (config.json_output) {
         printf("\n--- Output (JSON) ---\n");
         printf("{\n");
-        printf("  \"language\": \"%s\",\n", detected_language.c_str());
-        printf("  \"text\": \"%s\",\n", text_content.c_str());
-        printf("  \"n_tokens\": %zu\n", generated_tokens.size());
+        printf("  \"language\": \"%s\",\n", transcribe_out.language.c_str());
+        printf("  \"text\": \"%s\",\n", transcribe_out.text.c_str());
+        printf("  \"n_tokens\": %d\n", transcribe_out.n_tokens);
         printf("}\n");
     } else {
         printf("\n--- Output ---\n");
-        printf("Language: %s\n", detected_language.empty() ? "unknown" : detected_language.c_str());
-        printf("Text: %s\n", text_content.c_str());
+        printf("Language: %s\n", transcribe_out.language.empty() ? "unknown" : transcribe_out.language.c_str());
+        printf("Text: %s\n", transcribe_out.text.c_str());
     }
     
     // Cleanup

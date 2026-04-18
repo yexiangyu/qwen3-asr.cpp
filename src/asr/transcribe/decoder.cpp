@@ -1099,6 +1099,344 @@ std::vector<int> tokenize(const State* state, const std::string& text) {
     return tokens;
 }
 
+static std::string build_hotwords_prompt(const std::string& hotwords) {
+    if (hotwords.empty()) return "";
+    
+    std::vector<std::string> words;
+    std::istringstream iss(hotwords);
+    std::string word;
+    while (std::getline(iss, word, ',')) {
+        size_t start = word.find_first_not_of(" \t");
+        size_t end = word.find_last_not_of(" \t");
+        if (start != std::string::npos && end != std::string::npos && start <= end) {
+            words.push_back(word.substr(start, end - start + 1));
+        }
+    }
+    
+    if (words.empty()) return "";
+    
+    std::string prompt = "请注意识别以下词汇: ";
+    for (size_t i = 0; i < words.size(); ++i) {
+        prompt += words[i];
+        if (i < words.size() - 1) prompt += "、";
+    }
+    
+    return prompt;
+}
+
+std::vector<int> build_token_sequence(
+    const State* state,
+    int n_audio_frames,
+    const std::string& language,
+    const std::string& context,
+    const std::string& hotwords,
+    const std::string& prompt) {
+    
+    if (!state || !state->model) return {};
+    
+    const auto& hp = state->model->hparams;
+    
+    const int im_start = 151644;
+    const int im_end = hp.eos_token;
+    const int system_token = 8948;
+    const int user_token = 872;
+    const int assistant_token = 77091;
+    const int newline = 198;
+    
+    std::vector<int> tokens;
+    
+    // System message
+    tokens.push_back(im_start);
+    tokens.push_back(system_token);
+    tokens.push_back(newline);
+    
+    // Context (streaming: previous transcription)
+    if (!context.empty()) {
+        std::vector<int> ctx_tokens = tokenize(state, context);
+        for (int t : ctx_tokens) tokens.push_back(t);
+        tokens.push_back(newline);
+    }
+    
+    // Hotwords prompt
+    std::string hw_prompt = build_hotwords_prompt(hotwords);
+    if (!hw_prompt.empty()) {
+        std::vector<int> hw_tokens = tokenize(state, hw_prompt);
+        for (int t : hw_tokens) tokens.push_back(t);
+        tokens.push_back(newline);
+    }
+    
+    // Custom prompt (overrides default construction)
+    if (!prompt.empty()) {
+        std::vector<int> p_tokens = tokenize(state, prompt);
+        for (int t : p_tokens) tokens.push_back(t);
+        tokens.push_back(newline);
+    }
+    
+    tokens.push_back(im_end);
+    tokens.push_back(newline);
+    
+    // User message with audio
+    tokens.push_back(im_start);
+    tokens.push_back(user_token);
+    tokens.push_back(newline);
+    
+    tokens.push_back(hp.audio_start_token);
+    for (int i = 0; i < n_audio_frames; ++i) {
+        tokens.push_back(hp.audio_pad_token);
+    }
+    tokens.push_back(hp.audio_end_token);
+    
+    tokens.push_back(im_end);
+    tokens.push_back(newline);
+    
+    // Assistant message
+    tokens.push_back(im_start);
+    tokens.push_back(assistant_token);
+    tokens.push_back(newline);
+    
+    // Language prompt (if specified)
+    if (!language.empty()) {
+        std::string lang_prompt = "language " + language + "\n";
+        std::vector<int> lang_tokens = tokenize(state, lang_prompt);
+        for (int t : lang_tokens) tokens.push_back(t);
+    }
+    
+    return tokens;
+}
+
+static int find_audio_start_pos(const std::vector<int>& tokens, int audio_start_token) {
+    for (int i = 0; i < (int)tokens.size(); ++i) {
+        if (tokens[i] == audio_start_token) {
+            return i + 1;
+        }
+    }
+    return -1;
+}
+
+static int argmax(const std::vector<float>& logits) {
+    if (logits.empty()) return -1;
+    int max_idx = 0;
+    float max_val = logits[0];
+    for (int i = 1; i < (int)logits.size(); ++i) {
+        if (logits[i] > max_val) {
+            max_val = logits[i];
+            max_idx = i;
+        }
+    }
+    return max_idx;
+}
+
+static std::string extract_language_from_tokens(
+    const State* state,
+    const std::vector<int>& tokens,
+    const std::string& user_language) {
+    
+    if (!user_language.empty()) {
+        std::string lang = user_language;
+        for (auto& c : lang) c = std::tolower(static_cast<unsigned char>(c));
+        return lang;
+    }
+    
+    if (tokens.empty()) return "";
+    
+    std::string first_token = decode_token(state, tokens[0]);
+    if (first_token != "language" && first_token.find("language") != 0) {
+        return "";
+    }
+    
+    std::string lang_part = first_token;
+    int idx = 1;
+    
+    while (idx < (int)tokens.size()) {
+        std::string tok = decode_token(state, tokens[idx]);
+        if (tok.empty()) {
+            idx++;
+            continue;
+        }
+        
+        bool is_alpha = true;
+        for (char c : tok) {
+            if (!std::isalpha(static_cast<unsigned char>(c)) && c != ' ' && c != '\t') {
+                is_alpha = false;
+                break;
+            }
+        }
+        
+        if (is_alpha) {
+            lang_part += tok;
+            idx++;
+        } else {
+            break;
+        }
+    }
+    
+    if (lang_part.find("language ") == 0) {
+        std::string lang = lang_part.substr(9);
+        size_t start = lang.find_first_not_of(" \t");
+        size_t end = lang.find_last_not_of(" \t");
+        if (start != std::string::npos && end != std::string::npos) {
+            lang = lang.substr(start, end - start + 1);
+        }
+        for (auto& c : lang) c = std::tolower(static_cast<unsigned char>(c));
+        return lang;
+    }
+    
+    return "";
+}
+
+static std::string extract_text_from_tokens(
+    const State* state,
+    const std::vector<int>& tokens,
+    bool user_specified_language) {
+    
+    if (user_specified_language) {
+        return decode_tokens(state, tokens);
+    }
+    
+    if (tokens.empty()) return "";
+    
+    std::string first_token = decode_token(state, tokens[0]);
+    if (first_token != "language" && first_token.find("language") != 0) {
+        return decode_tokens(state, tokens);
+    }
+    
+    int tokens_to_skip = 1;
+    int idx = 1;
+    
+    while (idx < (int)tokens.size()) {
+        std::string tok = decode_token(state, tokens[idx]);
+        if (tok.empty()) {
+            idx++;
+            tokens_to_skip++;
+            continue;
+        }
+        
+        bool is_alpha = true;
+        for (char c : tok) {
+            if (!std::isalpha(static_cast<unsigned char>(c)) && c != ' ' && c != '\t') {
+                is_alpha = false;
+                break;
+            }
+        }
+        
+        if (is_alpha) {
+            tokens_to_skip++;
+            idx++;
+        } else {
+            break;
+        }
+    }
+    
+    std::vector<int> text_tokens;
+    for (int i = tokens_to_skip; i < (int)tokens.size(); ++i) {
+        text_tokens.push_back(tokens[i]);
+    }
+    
+    std::string text = decode_tokens(state, text_tokens);
+    size_t start = text.find_first_not_of(" \t\n\r");
+    if (start != std::string::npos) {
+        text = text.substr(start);
+    }
+    
+    return text;
+}
+
+bool transcribe(State* state, 
+                const TranscribeInput& input, 
+                TranscribeOutput& output, 
+                ErrorInfo* error) {
+    
+    if (!state || !state->model) {
+        if (error) error->message = "State not initialized";
+        return false;
+    }
+    
+    if (!input.audio_features || input.n_audio_frames <= 0) {
+        if (error) error->message = "Invalid audio features";
+        return false;
+    }
+    
+    const auto& hp = state->model->hparams;
+    const int im_end = hp.eos_token;
+    
+    clear_kv_cache(state);
+    
+    // Build token sequence
+    std::vector<int> tokens = build_token_sequence(
+        state, input.n_audio_frames,
+        input.language, input.context,
+        input.hotwords, input.prompt);
+    
+    if (tokens.empty()) {
+        if (error) error->message = "Failed to build token sequence";
+        return false;
+    }
+    
+    int audio_start_pos = find_audio_start_pos(tokens, hp.audio_start_token);
+    if (audio_start_pos < 0) {
+        if (error) error->message = "Failed to find audio_start_token in sequence";
+        return false;
+    }
+    
+    // Prefill
+    PrefillInput prefill_in;
+    prefill_in.tokens = tokens.data();
+    prefill_in.n_tokens = tokens.size();
+    prefill_in.audio_features = input.audio_features;
+    prefill_in.n_audio_frames = input.n_audio_frames;
+    prefill_in.audio_feature_dim = input.audio_feature_dim;
+    prefill_in.audio_start_pos = audio_start_pos;
+    
+    DecoderOutput prefill_out;
+    if (!prefill(state, prefill_in, prefill_out, error)) {
+        return false;
+    }
+    
+    // Generate tokens
+    std::vector<int> generated_tokens;
+    int n_past = tokens.size();
+    int next_token = argmax(prefill_out.logits);
+    
+    if (next_token < 0) {
+        if (error) error->message = "Invalid prefill output";
+        return false;
+    }
+    
+    if (next_token != im_end) {
+        generated_tokens.push_back(next_token);
+        
+        for (int step = 1; step < input.max_tokens; ++step) {
+            DecodeInput decode_in;
+            decode_in.tokens = &next_token;
+            decode_in.n_tokens = 1;
+            decode_in.n_past = n_past;
+            
+            DecoderOutput decode_out;
+            if (!decode(state, decode_in, decode_out, error)) {
+                break;
+            }
+            
+            next_token = argmax(decode_out.logits);
+            if (next_token < 0 || next_token == im_end) {
+                break;
+            }
+            
+            generated_tokens.push_back(next_token);
+            n_past++;
+        }
+    }
+    
+    // Parse output
+    output.tokens = generated_tokens;
+    output.n_tokens = generated_tokens.size();
+    
+    bool user_specified_language = !input.language.empty();
+    output.language = extract_language_from_tokens(state, generated_tokens, input.language);
+    output.text = extract_text_from_tokens(state, generated_tokens, user_specified_language);
+    
+    return true;
+}
+
 } // namespace decoder
 } // namespace transcribe
 } // namespace asr

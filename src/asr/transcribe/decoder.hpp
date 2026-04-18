@@ -55,6 +55,25 @@ struct DecoderOutput {
     int vocab_size;
 };
 
+struct TranscribeInput {
+    const float* audio_features;
+    int n_audio_frames;
+    int audio_feature_dim;
+    int max_tokens = 1024;
+    
+    std::string language;
+    std::string context;
+    std::string hotwords;
+    std::string prompt;
+};
+
+struct TranscribeOutput {
+    std::string language;
+    std::string text;
+    std::vector<int> tokens;
+    int n_tokens;
+};
+
 State* init(const Config& config);
 void free(State* state);
 
@@ -71,6 +90,19 @@ HyperParams get_hparams(State* state);
 std::string decode_token(const State* state, int token_id);
 std::string decode_tokens(const State* state, const std::vector<int>& tokens);
 std::vector<int> tokenize(const State* state, const std::string& text);
+
+std::vector<int> build_token_sequence(
+    const State* state,
+    int n_audio_frames,
+    const std::string& language,
+    const std::string& context,
+    const std::string& hotwords,
+    const std::string& prompt);
+
+bool transcribe(State* state, 
+                const TranscribeInput& input, 
+                TranscribeOutput& output, 
+                ErrorInfo* error = nullptr);
 
 bool load_ref_data(const char* path, std::vector<float>& data);
 bool save_ref_data(const char* path, const std::vector<float>& data);
