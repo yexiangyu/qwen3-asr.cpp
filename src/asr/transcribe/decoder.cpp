@@ -1150,26 +1150,23 @@ std::vector<int> build_token_sequence(
     tokens.push_back(system_token);
     tokens.push_back(newline);
     
-    // Context (streaming: previous transcription)
+    // Context (streaming: previous transcription) - NO extra newline after context
     if (!context.empty()) {
         std::vector<int> ctx_tokens = tokenize(state, context);
         for (int t : ctx_tokens) tokens.push_back(t);
-        tokens.push_back(newline);
     }
     
-    // Hotwords prompt
+    // Hotwords prompt - NO extra newline after hotwords
     std::string hw_prompt = build_hotwords_prompt(hotwords);
     if (!hw_prompt.empty()) {
         std::vector<int> hw_tokens = tokenize(state, hw_prompt);
         for (int t : hw_tokens) tokens.push_back(t);
-        tokens.push_back(newline);
     }
     
-    // Custom prompt (overrides default construction)
+    // Custom prompt - NO extra newline after prompt
     if (!prompt.empty()) {
         std::vector<int> p_tokens = tokenize(state, prompt);
         for (int t : p_tokens) tokens.push_back(t);
-        tokens.push_back(newline);
     }
     
     tokens.push_back(im_end);
