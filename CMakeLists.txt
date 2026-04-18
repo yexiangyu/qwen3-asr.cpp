@@ -519,6 +519,24 @@ if(QWEN3_ASR_BUILD_TESTS)
         target_link_libraries(test_transcribe_encoder PRIVATE ggml-cuda CUDA::cudart)
     endif()
     
+    # Test batch encode correctness
+    add_executable(test_batch_encode tests/test_batch_encode.cpp)
+    target_include_directories(test_batch_encode PRIVATE ${GGML_DIR}/include)
+    target_link_directories(test_batch_encode PRIVATE ${GGML_BUILD_DIR}/src)
+    target_link_libraries(test_batch_encode PRIVATE
+        asr_transcribe_encoder
+        asr_mel
+        asr_codec
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_batch_encode PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_batch_encode PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+    
     # Test transcribe decoder module
     add_executable(test_transcribe_decoder tests/test_transcribe_decoder.cpp)
     target_include_directories(test_transcribe_decoder PRIVATE ${GGML_DIR}/include)
