@@ -35,11 +35,37 @@ struct TimestampResult {
     int n_words;
 };
 
+struct AlignedWord {
+    std::string word;
+    float start;
+    float end;
+};
+
+struct AlignInput {
+    const float* audio_features;
+    int n_audio_frames;
+    int audio_feature_dim;
+    std::string text;
+    std::string language;
+};
+
+struct AlignOutput {
+    std::vector<AlignedWord> words;
+    float audio_duration;
+    bool success;
+};
+
 State* init(const Config& config);
 void free(State* state);
 
 bool decode(State* state, const Input& input, Output& output, ErrorInfo* error = nullptr);
 TimestampResult convert_to_timestamps(const Output& output, int timestamp_segment_time_ms = 80);
+
+bool align(State* state, const AlignInput& input, AlignOutput& output, ErrorInfo* error = nullptr);
+
+std::vector<int32_t> tokenize(State* state, const std::string& text, std::vector<std::string>& words);
+std::string decode_token(State* state, int32_t token_id);
+std::vector<int32_t> build_token_sequence(State* state, int n_audio_frames, const std::vector<int32_t>& text_tokens);
 
 void clear_kv_cache(State* state);
 int get_kv_cache_used(State* state);

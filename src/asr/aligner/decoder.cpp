@@ -125,8 +125,32 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
             model.vocab[i] = gguf_get_arr_str(ctx_gguf, tokens_idx, i);
         }
         for (int64_t i = 0; i < n_vocab; ++i) {
-            model.token_to_id[model.vocab[i]] = static_cast<int32_t>(i);
+            if (!model.vocab[i].empty()) {
+                model.token_to_id[model.vocab[i]] = static_cast<int32_t>(i);
+            }
         }
+        fprintf(stderr, "Loaded vocabulary: %lld tokens, token_to_id size: %zu\n", 
+                (long long)n_vocab, model.token_to_id.size());
+        if (n_vocab > 0) {
+            fprintf(stderr, "  First 10 tokens: [%s, %s, %s, %s, %s, %s, %s, %s, %s, %s]\n",
+                    model.vocab[0].c_str(), model.vocab[1].c_str(),
+                    model.vocab[2].c_str(), model.vocab[3].c_str(),
+                    model.vocab[4].c_str(), model.vocab[5].c_str(),
+                    model.vocab[6].c_str(), model.vocab[7].c_str(),
+                    model.vocab[8].c_str(), model.vocab[9].c_str());
+        }
+        // Try to find Chinese characters
+        std::string test_chars[] = {"知", "道", "规", "则", "吗"};
+        for (const auto& ch : test_chars) {
+            auto it = model.token_to_id.find(ch);
+            if (it != model.token_to_id.end()) {
+                fprintf(stderr, "  Found '%s' at id=%d\n", ch.c_str(), it->second);
+            } else {
+                fprintf(stderr, "  '%s' NOT FOUND in vocab\n", ch.c_str());
+            }
+        }
+    } else {
+        fprintf(stderr, "Warning: tokenizer.ggml.tokens not found in model\n");
     }
     
     int fd = open(path, O_RDONLY);
@@ -712,6 +736,230 @@ bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>&
         if (verbose) fprintf(stderr, "Max diff: %.6f > %.6f\n", max_diff, tolerance);
         return false;
     }
+    return true;
+}
+
+static bool is_cjk(uint32_t cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FFF) ||
+           (cp >= 0x3400 && cp <= 0x4DBF) ||
+           (cp >= 0x20000 && cp <= 0x2A6DF) ||
+           (cp >= 0x2A700 && cp <= 0x2B73F);
+}
+
+static std::vector<uint32_t> utf8_to_codepoints(const std::string& s) {
+    std::vector<uint32_t> cps;
+    size_t i = 0;
+    while (i < s.size()) {
+        uint32_t cp = 0;
+        uint8_t c = s[i];
+        if ((c & 0x80) == 0) {
+            cp = c; i += 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            if (i + 1 < s.size()) {
+                cp = ((c & 0x1F) << 6) | (s[i+1] & 0x3F);
+                i += 2;
+            } else i += 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            if (i + 2 < s.size()) {
+                cp = ((c & 0x0F) << 12) | ((s[i+1] & 0x3F) << 6) | (s[i+2] & 0x3F);
+                i += 3;
+            } else i += 1;
+        } else if ((c & 0xF8) == 0xF0) {
+            if (i + 3 < s.size()) {
+                cp = ((c & 0x07) << 18) | ((s[i+1] & 0x3F) << 12) | ((s[i+2] & 0x3F) << 6) | (s[i+3] & 0x3F);
+                i += 4;
+            } else i += 1;
+        } else {
+            i += 1;
+        }
+        cps.push_back(cp);
+    }
+    return cps;
+}
+
+static std::string codepoint_to_utf8(uint32_t cp) {
+    std::string s;
+    if (cp < 0x80) {
+        s = char(cp);
+    } else if (cp < 0x800) {
+        s = char(0xC0 | (cp >> 6));
+        s += char(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        s = char(0xE0 | (cp >> 12));
+        s += char(0x80 | ((cp >> 6) & 0x3F));
+        s += char(0x80 | (cp & 0x3F));
+    } else {
+        s = char(0xF0 | (cp >> 18));
+        s += char(0x80 | ((cp >> 12) & 0x3F));
+        s += char(0x80 | ((cp >> 6) & 0x3F));
+        s += char(0x80 | (cp & 0x3F));
+    }
+    return s;
+}
+
+std::vector<std::string> tokenize_text(const std::string& text) {
+    std::vector<std::string> words;
+    auto cps = utf8_to_codepoints(text);
+    
+    std::string latin_seq;
+    for (auto cp : cps) {
+        if (is_cjk(cp)) {
+            if (!latin_seq.empty()) {
+                words.push_back(latin_seq);
+                latin_seq.clear();
+            }
+            words.push_back(codepoint_to_utf8(cp));
+        } else if (cp < 0x80 && (isalpha(cp) || cp == '\'')) {
+            latin_seq += char(cp);
+        } else {
+            if (!latin_seq.empty()) {
+                words.push_back(latin_seq);
+                latin_seq.clear();
+            }
+            if (cp < 0x80 && !isspace(cp)) {
+                words.push_back(codepoint_to_utf8(cp));
+            }
+        }
+    }
+    if (!latin_seq.empty()) {
+        words.push_back(latin_seq);
+    }
+    
+    return words;
+}
+
+std::string decode_token(State* state, int32_t token_id) {
+    if (!state || !state->model) return "";
+    if (token_id < 0 || token_id >= (int32_t)state->model->vocab.size()) return "";
+    return state->model->vocab[token_id];
+}
+
+std::vector<int32_t> tokenize(State* state, const std::string& text, std::vector<std::string>& words) {
+    if (!state || !state->model) return {};
+    
+    words = tokenize_text(text);
+    std::vector<int32_t> tokens;
+    
+    for (const auto& w : words) {
+        auto it = state->model->token_to_id.find(w);
+        if (it != state->model->token_to_id.end()) {
+            tokens.push_back(it->second);
+        } else {
+            auto cps = utf8_to_codepoints(w);
+            for (auto cp : cps) {
+                std::string ch = codepoint_to_utf8(cp);
+                auto it2 = state->model->token_to_id.find(ch);
+                if (it2 != state->model->token_to_id.end()) {
+                    tokens.push_back(it2->second);
+                }
+            }
+        }
+    }
+    
+    return tokens;
+}
+
+std::vector<int32_t> build_token_sequence(State* state, int n_audio_frames, const std::vector<int32_t>& text_tokens) {
+    if (!state || !state->model) return {};
+    
+    const auto& hp = state->model->hparams;
+    std::vector<int32_t> tokens;
+    
+    tokens.push_back(hp.audio_start_token_id);
+    for (int i = 0; i < n_audio_frames; ++i) {
+        tokens.push_back(hp.audio_pad_token_id);
+    }
+    tokens.push_back(hp.audio_end_token_id);
+    
+    for (auto tok : text_tokens) {
+        tokens.push_back(tok);
+        tokens.push_back(hp.timestamp_token_id);
+    }
+    
+    return tokens;
+}
+
+bool align(State* state, const AlignInput& input, AlignOutput& output, ErrorInfo* error) {
+    if (!state || !state->model) {
+        if (error) error->message = "State or model not initialized";
+        return false;
+    }
+    
+    if (!input.audio_features || input.n_audio_frames <= 0) {
+        if (error) error->message = "Invalid audio features";
+        return false;
+    }
+    
+    if (input.text.empty()) {
+        if (error) error->message = "Text is empty";
+        return false;
+    }
+    
+    if (state->model->vocab.empty()) {
+        if (error) error->message = "Model vocabulary is empty - cannot tokenize";
+        return false;
+    }
+    
+    std::vector<std::string> words;
+    std::vector<int32_t> text_tokens = tokenize(state, input.text, words);
+    
+    if (text_tokens.empty()) {
+        if (error) error->message = "Failed to tokenize text (no matching tokens found)";
+        return false;
+    }
+    
+    const auto& hp = state->model->hparams;
+    
+    if (input.audio_feature_dim != hp.hidden_size) {
+        if (error) error->message = "Audio feature dimension mismatch: got " + 
+            std::to_string(input.audio_feature_dim) + ", expected " + std::to_string(hp.hidden_size);
+        return false;
+    }
+    
+    std::vector<int32_t> tokens = build_token_sequence(state, input.n_audio_frames, text_tokens);
+    
+    int audio_start_pos = 0;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == hp.audio_start_token_id) {
+            audio_start_pos = i + 1;
+            break;
+        }
+    }
+    
+    Input dec_input;
+    dec_input.tokens = tokens.data();
+    dec_input.n_tokens = tokens.size();
+    dec_input.audio_features = input.audio_features;
+    dec_input.n_audio_frames = input.n_audio_frames;
+    dec_input.audio_start_pos = audio_start_pos;
+    
+    Output dec_output;
+    if (!decode(state, dec_input, dec_output, error)) {
+        return false;
+    }
+    
+    float segment_time = hp.timestamp_segment_time_ms / 1000.0f;
+    output.audio_duration = input.n_audio_frames * segment_time;
+    
+    output.words.clear();
+    int token_idx = input.n_audio_frames + 2;
+    
+    for (size_t w = 0; w < words.size() && w < text_tokens.size(); ++w) {
+        if (token_idx + 1 >= (int)dec_output.timestamp_indices.size()) break;
+        
+        int ts_idx = token_idx + 1;
+        int ts_class = dec_output.timestamp_indices[ts_idx];
+        
+        AlignedWord aw;
+        aw.word = words[w];
+        aw.start = ts_class * segment_time;
+        aw.end = aw.start + segment_time;
+        
+        output.words.push_back(aw);
+        token_idx += 2;
+    }
+    
+    output.success = true;
     return true;
 }
 
