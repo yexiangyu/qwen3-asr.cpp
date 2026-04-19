@@ -312,5 +312,83 @@ int main(int argc, char** argv) {
     printf("  Audio A: %s\n", match_a ? "MATCH" : "DIFFER");
     printf("  Audio B: %s\n", match_b ? "MATCH" : "DIFFER");
     
+    // ========================================
+    // Test 3: Batch=1 (single sequence via batch API)
+    // ========================================
+    printf("\n=== Test 3: Batch=1 (single sequence via batch API) ===\n");
+    
+    auto t_batch1_start = std::chrono::high_resolution_clock::now();
+    
+    // Batch encode (batch_size=1)
+    auto enc_state1 = transcribe::encoder::init(enc_config);
+    
+    transcribe::encoder::BatchInput enc_input1;
+    enc_input1.mel_data.push_back(mel_a.data.data());
+    enc_input1.n_frames.push_back(mel_a.n_frames);
+    enc_input1.n_mels = mel_a.n_mels;
+    enc_input1.max_frames = mel_a.n_frames;
+    
+    transcribe::encoder::BatchOutput enc_output1;
+    transcribe::encoder::encode_batch(enc_state1, enc_input1, enc_output1, &error);
+    
+    transcribe::encoder::free(enc_state1);
+    
+    // Batch decode (batch_size=1)
+    auto batch_state1 = transcribe::decoder::init_batch(dec_config, 1, 8192);
+    
+    auto hp1 = transcribe::decoder::batch_get_hparams(batch_state1);
+    
+    std::vector<int> tokens1 = transcribe::decoder::batch_build_token_sequence(
+        batch_state1, enc_output1.features[0].n_frames, "", "", "", "");
+    int audio_start_pos1 = -1;
+    for (int j = 0; j < (int)tokens1.size(); ++j) {
+        if (tokens1[j] == hp1.audio_start_token) {
+            audio_start_pos1 = j + 1;
+            break;
+        }
+    }
+    
+    int slot1 = transcribe::decoder::batch_add_sequence(
+        batch_state1, tokens1,
+        enc_output1.features[0].data.data(),
+        enc_output1.features[0].n_frames,
+        enc_output1.features[0].hidden_size,
+        audio_start_pos1, 256, "", &error);
+    
+    // Decode loop
+    int step1 = 0;
+    while (transcribe::decoder::batch_get_n_active(batch_state1) > 0 && step1 < 300) {
+        transcribe::decoder::batch_decode_step(batch_state1, &error);
+        step1++;
+    }
+    
+    auto t_batch1_end = std::chrono::high_resolution_clock::now();
+    auto t_batch1_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_batch1_end - t_batch1_start).count();
+    
+    std::string text1 = transcribe::decoder::batch_get_text(batch_state1, slot1);
+    auto gen_tokens1 = transcribe::decoder::batch_get_tokens(batch_state1, slot1);
+    
+    printf("Audio A via batch API: %zu tokens, %ld ms (%d steps)\n", gen_tokens1.size(), t_batch1_ms, step1);
+    
+    transcribe::decoder::free_batch(batch_state1);
+    
+    // Compare single sequence times
+    printf("\n=== Single Sequence Comparison (Audio A only) ===\n");
+    
+    // Estimate time for Audio A in non-batch (half of total)
+    long t_single_nonbatch_ms = t_nonbatch_ms / 2;
+    
+    printf("Non-batch (single): ~%ld ms (estimated half)\n", t_single_nonbatch_ms);
+    printf("Batch=1 (single):   %ld ms\n", t_batch1_ms);
+    
+    float overhead = (float)t_batch1_ms / t_single_nonbatch_ms;
+    printf("Batch API overhead: %.2fx\n", overhead > 1.0f ? overhead : 1.0f / overhead);
+    
+    if (overhead < 1.0f) {
+        printf("(Batch API is FASTER - likely due to unified cache efficiency)\n");
+    } else {
+        printf("(Batch API has overhead)\n");
+    }
+    
     return 0;
 }
