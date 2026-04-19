@@ -1,5 +1,6 @@
 #include "asr/transcribe/decoder.hpp"
 #include "asr/transcribe/decoder_model.hpp"
+#include "asr/common/hf_tokenizer.hpp"
 #include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -52,24 +53,28 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
         return idx < 0 ? def : (int32_t)gguf_get_val_u32(ctx_gguf, idx);
     };
     
-    auto get_f32 = [&](const char* key, float def) {
+    auto get_f32_or_f64 = [&](const char* key, float def) {
         int64_t idx = gguf_find_key(ctx_gguf, key);
-        return idx < 0 ? def : gguf_get_val_f32(ctx_gguf, idx);
+        if (idx < 0) return def;
+        enum gguf_type vtype = gguf_get_kv_type(ctx_gguf, idx);
+        if (vtype == GGUF_TYPE_FLOAT32) return gguf_get_val_f32(ctx_gguf, idx);
+        if (vtype == GGUF_TYPE_FLOAT64) return (float)gguf_get_val_f64(ctx_gguf, idx);
+        return def;
     };
     
-    model.hparams.vocab_size = get_u32("qwen3-asr.vocab_size", 151936);
-    model.hparams.hidden_size = get_u32("qwen3-asr.embedding_length", 1024);
-    model.hparams.n_layers = get_u32("qwen3-asr.block_count", 28);
-    model.hparams.n_heads = get_u32("qwen3-asr.attention.head_count", 16);
-    model.hparams.n_kv_heads = get_u32("qwen3-asr.attention.head_count_kv", 8);
-    model.hparams.intermediate_size = get_u32("qwen3-asr.feed_forward_length", 3072);
-    model.hparams.head_dim = get_u32("qwen3-asr.attention.key_length", 128);
-    model.hparams.rms_norm_eps = get_f32("qwen3-asr.attention.layer_norm_rms_epsilon", 1e-6f);
-    model.hparams.rope_theta = get_f32("qwen3-asr.rope.freq_base", 1000000.0f);
+    model.hparams.vocab_size = get_u32("qwen3_asr.text.vocab_size", get_u32("qwen3-asr.vocab_size", 151936));
+    model.hparams.hidden_size = get_u32("qwen3_asr.text.hidden_size", get_u32("qwen3-asr.embedding_length", 1024));
+    model.hparams.n_layers = get_u32("qwen3_asr.text.num_hidden_layers", get_u32("qwen3-asr.block_count", 28));
+    model.hparams.n_heads = get_u32("qwen3_asr.text.num_attention_heads", get_u32("qwen3-asr.attention.head_count", 16));
+    model.hparams.n_kv_heads = get_u32("qwen3_asr.text.num_key_value_heads", get_u32("qwen3-asr.attention.head_count_kv", 8));
+    model.hparams.intermediate_size = get_u32("qwen3_asr.text.intermediate_size", get_u32("qwen3-asr.feed_forward_length", 3072));
+    model.hparams.head_dim = get_u32("qwen3_asr.text.head_dim", get_u32("qwen3-asr.attention.key_length", 128));
+    model.hparams.rms_norm_eps = get_f32_or_f64("qwen3_asr.text.rms_norm_eps", get_f32_or_f64("qwen3-asr.attention.layer_norm_rms_epsilon", 1e-6f));
+    model.hparams.rope_theta = get_f32_or_f64("qwen3_asr.text.rope.freq_base", get_f32_or_f64("qwen3-asr.rope.freq_base", 1000000.0f));
     
-    model.hparams.audio_start_token = get_u32("qwen3-asr.audio.start_token_id", 151669);
-    model.hparams.audio_end_token = get_u32("qwen3-asr.audio.end_token_id", 151670);
-    model.hparams.audio_pad_token = get_u32("qwen3-asr.audio.pad_token_id", 151676);
+    model.hparams.audio_start_token = get_u32("qwen3_asr.audio_start_token_id", get_u32("qwen3-asr.audio.start_token_id", 151669));
+    model.hparams.audio_end_token = get_u32("qwen3_asr.audio_end_token_id", get_u32("qwen3-asr.audio.end_token_id", 151670));
+    model.hparams.audio_pad_token = get_u32("qwen3_asr.audio_token_id", get_u32("qwen3-asr.audio.pad_token_id", 151676));
     model.hparams.pad_token = 151643;
     model.hparams.eos_token = 151645;
     
@@ -78,38 +83,41 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
     for (ggml_tensor* t = ggml_get_first_tensor(model.ctx); t; t = ggml_get_next_tensor(model.ctx, t)) {
         const char* name = ggml_get_name(t);
         
-        if (strstr(name, "audio.encoder")) {
+        if (strstr(name, "audio_tower.") || strstr(name, "audio.encoder") || strstr(name, "conv2d") || strstr(name, "conv_out") || strstr(name, "ln_post") || strstr(name, "proj1") || strstr(name, "proj2")) {
             continue;
         }
         
         model.tensors[name] = t;
         
-        if (strstr(name, "blk.")) {
+        if (strstr(name, "layers.") || strstr(name, "blk.")) {
             int layer_idx = -1;
-            if (sscanf(name, "blk.%d.", &layer_idx) == 1 &&
-                layer_idx >= 0 && layer_idx < model.hparams.n_layers) {
-                auto& layer = model.layers[layer_idx];
-                
-                if (strstr(name, "attn_output.weight")) layer.attn_out = t;
-                else if (strstr(name, "attn_norm.weight")) layer.attn_norm = t;
-                else if (strstr(name, "attn_q_norm.weight")) layer.attn_q_norm = t;
-                else if (strstr(name, "attn_k_norm.weight")) layer.attn_k_norm = t;
-                else if (strstr(name, "attn_q.weight")) layer.attn_q = t;
-                else if (strstr(name, "attn_k.weight")) layer.attn_k = t;
-                else if (strstr(name, "attn_v.weight")) layer.attn_v = t;
-                else if (strstr(name, "ffn_norm.weight")) layer.ffn_norm = t;
-                else if (strstr(name, "ffn_gate.weight")) layer.ffn_gate = t;
-                else if (strstr(name, "ffn_up.weight")) layer.ffn_up = t;
-                else if (strstr(name, "ffn_down.weight")) layer.ffn_down = t;
+            if (sscanf(name, "thinker.model.layers.%d.", &layer_idx) == 1 ||
+                sscanf(name, "model.layers.%d.", &layer_idx) == 1 ||
+                sscanf(name, "blk.%d.", &layer_idx) == 1) {
+                if (layer_idx >= 0 && layer_idx < model.hparams.n_layers) {
+                    auto& layer = model.layers[layer_idx];
+                    
+                    if (strstr(name, "o_proj.weight") || strstr(name, "attn_output.weight")) layer.attn_out = t;
+                    else if (strstr(name, "input_layernorm.weight") || strstr(name, "attn_norm.weight")) layer.attn_norm = t;
+                    else if (strstr(name, "q_norm.weight") || strstr(name, "attn_q_norm.weight")) layer.attn_q_norm = t;
+                    else if (strstr(name, "k_norm.weight") || strstr(name, "attn_k_norm.weight")) layer.attn_k_norm = t;
+                    else if (strstr(name, "q_proj.weight") || strstr(name, "attn_q.weight")) layer.attn_q = t;
+                    else if (strstr(name, "k_proj.weight") || strstr(name, "attn_k.weight")) layer.attn_k = t;
+                    else if (strstr(name, "v_proj.weight") || strstr(name, "attn_v.weight")) layer.attn_v = t;
+                    else if (strstr(name, "post_attention_layernorm.weight") || strstr(name, "ffn_norm.weight")) layer.ffn_norm = t;
+                    else if (strstr(name, "gate_proj.weight") || strstr(name, "ffn_gate.weight")) layer.ffn_gate = t;
+                    else if (strstr(name, "up_proj.weight") || strstr(name, "ffn_up.weight")) layer.ffn_up = t;
+                    else if (strstr(name, "down_proj.weight") || strstr(name, "ffn_down.weight")) layer.ffn_down = t;
+                }
             }
         }
-        else if (strstr(name, "token_embd.weight")) {
+        else if (strstr(name, "embed_tokens.weight") || strstr(name, "token_embd.weight")) {
             model.token_embd = t;
         }
-        else if (strstr(name, "output_norm.weight")) {
+        else if (strstr(name, "model.norm.weight") || strstr(name, "output_norm.weight")) {
             model.output_norm = t;
         }
-        else if (strstr(name, "output.weight")) {
+        else if (strstr(name, "lm_head.weight") || strstr(name, "output.weight")) {
             model.output = t;
         }
     }
@@ -189,6 +197,35 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
             std::string merge = gguf_get_arr_str(ctx_gguf, merges_idx, i);
             model.bpe_ranks[merge] = static_cast<int>(i);
         }
+    }
+
+    // Fallback: parse tokenizer from tokenizer.huggingface.json
+    if (model.vocab.empty() || model.bpe_ranks.empty()) {
+        int64_t hf_idx = gguf_find_key(ctx_gguf, "tokenizer.huggingface.json");
+        if (hf_idx >= 0) {
+            const char* hf_json = gguf_get_val_str(ctx_gguf, hf_idx);
+            if (hf_json) {
+                asr::HfTokenizerData hf_data;
+                if (asr::load_tokenizer_from_hf_json(hf_json, model.hparams.vocab_size, hf_data)) {
+                    model.vocab = std::move(hf_data.vocab);
+                    model.token_to_id = std::move(hf_data.token_to_id);
+                    model.bpe_ranks = std::move(hf_data.bpe_ranks);
+                }
+            }
+        }
+    }
+
+    if (model.vocab.empty()) {
+        if (error) error->message = "No tokenizer data found in GGUF (missing tokenizer.ggml.tokens and tokenizer.huggingface.json)";
+        munmap(model.mmap_addr, model.mmap_size);
+        model.mmap_addr = nullptr;
+        model.mmap_size = 0;
+        ggml_backend_buffer_free(model.buffer);
+        model.buffer = nullptr;
+        ggml_free(model.ctx);
+        model.ctx = nullptr;
+        gguf_free(ctx_gguf);
+        return false;
     }
     
     gguf_free(ctx_gguf);

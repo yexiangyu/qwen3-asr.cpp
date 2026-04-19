@@ -22,7 +22,7 @@ namespace asr { namespace aligner { namespace encoder {
 using asr::AudioFeatures;
 using asr::ErrorInfo;
 
-constexpr int MAX_NODES = 4096;
+constexpr int MAX_NODES = 16384;
 
 static void compute_sinusoidal_pe(float* pe, int n_ctx, int d_model) {
     const int half_dim = d_model / 2;
@@ -36,11 +36,9 @@ static void compute_sinusoidal_pe(float* pe, int n_ctx, int d_model) {
     }
 }
 
-static int compute_conv_output_len(int input_len) {
-    int len = input_len;
-    len = (len - 1) / 2 + 1;
-    len = (len - 1) / 2 + 1;
-    len = (len - 1) / 2 + 1;
+static int chunk_output_len(int chunk_frames) {
+    int len = chunk_frames;
+    for (int i = 0; i < 3; ++i) len = (len - 1) / 2 + 1;
     return len;
 }
 
@@ -221,17 +219,17 @@ HyperParams get_hparams(EncoderState* state) {
     return state && state->model ? state->model->hparams : HyperParams();
 }
 
-static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, int batch_size) {
+static ggml_cgraph* build_conv_graph(EncoderState* state, int max_chunk_len, int n_mel, int n_chunks) {
     EncoderModel& m = *state->model;
-    int n_mel = m.hparams.n_mel_bins;
     int conv_ch = m.hparams.conv_channels;
     
     ggml_init_params params = { state->compute_meta.size(), state->compute_meta.data(), true };
     ggml_context* ctx = ggml_init(params);
-    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
     
-    ggml_tensor* mel_batch = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_frames, n_mel, 1, batch_size);
-    ggml_set_name(mel_batch, "mel_batch"); ggml_set_input(mel_batch);
+    ggml_tensor* mel_batch = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, max_chunk_len, n_mel, 1, n_chunks);
+    ggml_set_name(mel_batch, "mel_batch");
+    ggml_set_input(mel_batch);
     
     ggml_tensor* cur = ggml_conv_2d(ctx, m.conv2d1_w, mel_batch, 2, 2, 1, 1, 1, 1);
     if (m.conv2d1_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d1_b, 1, 1, conv_ch, 1));
@@ -245,47 +243,51 @@ static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, in
     if (m.conv2d3_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d3_b, 1, 1, conv_ch, 1));
     cur = ggml_gelu(ctx, cur);
     
-    int64_t out_w = cur->ne[0];
-    int64_t out_h = cur->ne[1];
-    int64_t out_c = cur->ne[2];
-    int64_t feat_dim = out_c * out_h;
-    int64_t total_seq = out_w * batch_size;
+    int64_t conv_out_w = cur->ne[0];
+    int64_t conv_out_h = cur->ne[1];
+    int64_t conv_out_c = cur->ne[2];
+    int64_t feat_dim = conv_out_c * conv_out_h;
     
-    cur = ggml_reshape_4d(ctx, cur, out_w, out_h * out_c, batch_size, 1);
+    cur = ggml_reshape_3d(ctx, cur, conv_out_w, feat_dim, n_chunks);
     cur = ggml_cont(ctx, ggml_permute(ctx, cur, 1, 0, 2, 3));
-    cur = ggml_reshape_2d(ctx, cur, feat_dim, total_seq);
-    
+    cur = ggml_reshape_2d(ctx, cur, feat_dim, conv_out_w * n_chunks);
     if (m.conv_out_w) cur = ggml_mul_mat(ctx, m.conv_out_w, cur);
     
-    ggml_set_name(cur, "embd_conv_batch"); ggml_set_output(cur);
-    state->embd_conv = cur;
+    int n_state = m.hparams.d_model;
+    cur = ggml_reshape_3d(ctx, cur, n_state, conv_out_w, n_chunks);
+    
+    ggml_set_name(cur, "conv_out");
+    ggml_set_output(cur);
     
     ggml_build_forward_expand(gf, cur);
     ggml_free(ctx);
     return gf;
 }
 
-static ggml_cgraph* build_graph_encoder_batch(EncoderState* state, int n_ctx, int /*batch_size*/, int /*seq_len_per_item*/) {
+static ggml_cgraph* build_transformer_graph(EncoderState* state, int n_ctx) {
     EncoderModel& m = *state->model;
     int n_state = m.hparams.d_model;
     int n_head = m.hparams.n_attention_heads;
     int n_layer = m.hparams.n_encoder_layers;
     int head_dim = n_state / n_head;
-    float eps = 1e-5f, scale = 1.0f / sqrtf(head_dim);
+    float eps = 1e-5f;
+    float scale = 1.0f / sqrtf(float(head_dim));
     
     ggml_init_params params = { state->compute_meta.size(), state->compute_meta.data(), true };
     ggml_context* ctx = ggml_init(params);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
     
     ggml_tensor* inpL = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
-    ggml_set_name(inpL, "enc_input_batch"); ggml_set_input(inpL);
+    ggml_set_name(inpL, "inp_hidden");
+    ggml_set_input(inpL);
     
     ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ctx, n_ctx);
-    ggml_set_name(mask, "attn_mask"); ggml_set_input(mask);
+    ggml_set_name(mask, "attn_mask");
+    ggml_set_input(mask);
     
     ggml_tensor* cur = inpL;
-    for (int L = 0; L < n_layer; ++L) {
-        auto& l = m.layers[L];
+    for (int il = 0; il < n_layer; ++il) {
+        auto& l = m.layers[il];
         cur = ggml_norm(ctx, inpL, eps);
         if (l.attn_norm_w) cur = ggml_mul(ctx, cur, l.attn_norm_w);
         if (l.attn_norm_b) cur = ggml_add(ctx, cur, l.attn_norm_b);
@@ -309,24 +311,37 @@ static ggml_cgraph* build_graph_encoder_batch(EncoderState* state, int n_ctx, in
         if (l.attn_out_b) cur = ggml_add(ctx, cur, l.attn_out_b);
         cur = ggml_add(ctx, cur, inpL);
         
-        ggml_tensor* ffn_in = cur;
-        cur = ggml_norm(ctx, ffn_in, eps);
+        ggml_tensor* inpFF = cur;
+        cur = ggml_norm(ctx, inpFF, eps);
         if (l.ffn_norm_w) cur = ggml_mul(ctx, cur, l.ffn_norm_w);
         if (l.ffn_norm_b) cur = ggml_add(ctx, cur, l.ffn_norm_b);
-        cur = ggml_gelu(ctx, ggml_mul_mat(ctx, l.ffn_up_w, cur));
+        cur = ggml_mul_mat(ctx, l.ffn_up_w, cur);
         if (l.ffn_up_b) cur = ggml_add(ctx, cur, l.ffn_up_b);
+        cur = ggml_gelu(ctx, cur);
         cur = ggml_mul_mat(ctx, l.ffn_down_w, cur);
         if (l.ffn_down_b) cur = ggml_add(ctx, cur, l.ffn_down_b);
-        inpL = ggml_add(ctx, cur, ffn_in);
+        inpL = ggml_add(ctx, cur, inpFF);
     }
     
     cur = inpL;
-    if (m.ln_post_w) { cur = ggml_norm(ctx, cur, eps); cur = ggml_mul(ctx, cur, m.ln_post_w); if (m.ln_post_b) cur = ggml_add(ctx, cur, m.ln_post_b); }
-    if (m.proj1_w) { cur = ggml_gelu(ctx, ggml_mul_mat(ctx, m.proj1_w, cur)); if (m.proj1_b) cur = ggml_add(ctx, cur, m.proj1_b); }
-    if (m.proj2_w) { cur = ggml_mul_mat(ctx, m.proj2_w, cur); if (m.proj2_b) cur = ggml_add(ctx, cur, m.proj2_b); }
+    if (m.ln_post_w) {
+        cur = ggml_norm(ctx, cur, eps);
+        cur = ggml_mul(ctx, cur, m.ln_post_w);
+        if (m.ln_post_b) cur = ggml_add(ctx, cur, m.ln_post_b);
+    }
+    if (m.proj1_w) {
+        cur = ggml_mul_mat(ctx, m.proj1_w, cur);
+        if (m.proj1_b) cur = ggml_add(ctx, cur, m.proj1_b);
+        cur = ggml_gelu(ctx, cur);
+    }
+    if (m.proj2_w) {
+        cur = ggml_mul_mat(ctx, m.proj2_w, cur);
+        if (m.proj2_b) cur = ggml_add(ctx, cur, m.proj2_b);
+    }
     
-    ggml_set_name(cur, "embd_enc_batch"); ggml_set_output(cur);
-    state->embd_enc = cur;
+    ggml_set_name(cur, "audio_enc_out");
+    ggml_set_output(cur);
+    
     ggml_build_forward_expand(gf, cur);
     ggml_free(ctx);
     return gf;
@@ -340,102 +355,168 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
     int n_state = m.hparams.d_model;
     int n_mel = m.hparams.n_mel_bins;
     int batch_size = input.batch_size();
-    int max_frames = input.max_frames;
-    int seq_len_per_item = compute_conv_output_len(max_frames);
     
-    std::vector<float> mel_padded(batch_size * n_mel * max_frames, 0.0f);
+    constexpr int32_t chunk_mel_size = 100;
+    constexpr int32_t n_window_infer = 800;
+    int32_t max_chunk_len = chunk_mel_size;
+    int32_t max_out_w = chunk_output_len(max_chunk_len);
+    int32_t window_aftercnn = max_out_w * (n_window_infer / chunk_mel_size);
+    
+    std::vector<std::vector<int32_t>> clip_chunk_lengths(batch_size);
+    std::vector<std::vector<int32_t>> clip_chunk_out_lens(batch_size);
+    std::vector<int> clip_total_out_frames(batch_size, 0);
+    std::vector<int> clip_n_chunks(batch_size);
+    int total_chunks = 0;
+    
     for (int b = 0; b < batch_size; ++b) {
         int n_frames = input.n_frames[b];
-        for (int m = 0; m < n_mel; ++m) {
-            for (int f = 0; f < n_frames; ++f) {
-                mel_padded[b * n_mel * max_frames + m * max_frames + f] = input.mel_data[b][m * n_frames + f];
+        int n_chunks = (n_frames + chunk_mel_size - 1) / chunk_mel_size;
+        clip_n_chunks[b] = n_chunks;
+        total_chunks += n_chunks;
+        
+        clip_chunk_lengths[b].resize(n_chunks);
+        clip_chunk_out_lens[b].resize(n_chunks);
+        for (int32_t c = 0; c < n_chunks; ++c) {
+            if (c < n_chunks - 1) clip_chunk_lengths[b][c] = chunk_mel_size;
+            else {
+                clip_chunk_lengths[b][c] = n_frames - c * chunk_mel_size;
+                if (clip_chunk_lengths[b][c] == 0) clip_chunk_lengths[b][c] = chunk_mel_size;
             }
+            clip_chunk_out_lens[b][c] = chunk_output_len(clip_chunk_lengths[b][c]);
+            clip_total_out_frames[b] += clip_chunk_out_lens[b][c];
         }
     }
     
-    ggml_cgraph* gf_conv = build_graph_conv_batch(state, max_frames, batch_size);
-    if (!ggml_backend_sched_alloc_graph(state->sched, gf_conv)) { if (error) error->message = "alloc conv batch failed"; return false; }
+    ggml_cgraph* gf_conv = build_conv_graph(state, max_chunk_len, n_mel, total_chunks);
+    if (!ggml_backend_sched_alloc_graph(state->sched, gf_conv)) {
+        if (error) error->message = "alloc conv graph failed";
+        return false;
+    }
+    
+    size_t mel_batch_size = (size_t)max_chunk_len * n_mel * 1 * total_chunks;
+    std::vector<float> mel_batch_data(mel_batch_size, 0.0f);
+    
+    int chunk_idx = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        const float* mel_data = input.mel_data[b];
+        int n_frames = input.n_frames[b];
+        int n_chunks = clip_n_chunks[b];
+        
+        for (int32_t c = 0; c < n_chunks; ++c) {
+            int32_t clen = clip_chunk_lengths[b][c];
+            int32_t start_frame = c * chunk_mel_size;
+            for (int mi = 0; mi < n_mel; ++mi) {
+                for (int32_t f = 0; f < clen; ++f) {
+                    size_t idx = (size_t)f + (size_t)mi * max_chunk_len + (size_t)chunk_idx * max_chunk_len * n_mel;
+                    mel_batch_data[idx] = mel_data[mi * n_frames + start_frame + f];
+                }
+            }
+            chunk_idx++;
+        }
+    }
     
     ggml_tensor* mel_t = ggml_graph_get_tensor(gf_conv, "mel_batch");
-    ggml_backend_tensor_set(mel_t, mel_padded.data(), 0, mel_padded.size() * sizeof(float));
+    ggml_backend_tensor_set(mel_t, mel_batch_data.data(), 0, mel_batch_data.size() * sizeof(float));
     
-    if (ggml_backend_sched_graph_compute(state->sched, gf_conv) != GGML_STATUS_SUCCESS) { if (error) error->message = "compute conv batch failed"; ggml_backend_sched_reset(state->sched); return false; }
-    
-    ggml_tensor* embd_conv = ggml_graph_get_tensor(gf_conv, "embd_conv_batch");
-    int64_t feat_dim = embd_conv->ne[0];
-    int64_t total_seq = embd_conv->ne[1];
-    
-    std::vector<float> conv_out(feat_dim * total_seq);
-    ggml_backend_tensor_get(embd_conv, conv_out.data(), 0, conv_out.size() * sizeof(float));
-    
-    std::vector<int> out_frames(batch_size);
-    for (int b = 0; b < batch_size; ++b) {
-        out_frames[b] = compute_conv_output_len(input.n_frames[b]);
+    if (ggml_backend_sched_graph_compute(state->sched, gf_conv) != GGML_STATUS_SUCCESS) {
+        if (error) error->message = "compute conv failed";
+        ggml_backend_sched_reset(state->sched);
+        return false;
     }
     
-    std::vector<float> pe(seq_len_per_item * feat_dim);
-    compute_sinusoidal_pe(pe.data(), seq_len_per_item, feat_dim);
-    
-    for (int b = 0; b < batch_size; ++b) {
-        int frame_offset = b * seq_len_per_item;
-        int valid_len = out_frames[b];
-        for (int f = 0; f < valid_len; ++f) {
-            for (int h = 0; h < feat_dim; ++h) {
-                conv_out[(frame_offset + f) * feat_dim + h] += pe[f * feat_dim + h];
-            }
-        }
-    }
-    
-std::vector<float> attn_mask(total_seq * total_seq, -INFINITY);
-    for (int b = 0; b < batch_size; ++b) {
-        int frame_start = b * seq_len_per_item;
-        int valid_len = out_frames[b];
-        
-        for (int r = frame_start; r < frame_start + valid_len; ++r) {
-            for (int c = frame_start; c < frame_start + valid_len; ++c) {
-                attn_mask[r * total_seq + c] = 0.0f;
-            }
-        }
-        
-        for (int r = frame_start + valid_len; r < frame_start + seq_len_per_item; ++r) {
-            for (int c = frame_start; c < frame_start + valid_len; ++c) {
-                attn_mask[r * total_seq + c] = 0.0f;
-            }
-        }
-    }
+    ggml_tensor* conv_out_t = ggml_graph_get_tensor(gf_conv, "conv_out");
+    std::vector<float> conv_all(n_state * max_out_w * total_chunks);
+    ggml_backend_tensor_get(conv_out_t, conv_all.data(), 0, conv_all.size() * sizeof(float));
     
     ggml_backend_sched_reset(state->sched);
     
-    ggml_cgraph* gf_enc = build_graph_encoder_batch(state, total_seq, batch_size, seq_len_per_item);
-    if (!ggml_backend_sched_alloc_graph(state->sched, gf_enc)) { if (error) error->message = "alloc enc batch failed"; return false; }
+    std::vector<float> pos_emb_data(max_out_w * n_state);
+    compute_sinusoidal_pe(pos_emb_data.data(), max_out_w, n_state);
     
-    ggml_tensor* enc_in = ggml_graph_get_tensor(gf_enc, "enc_input_batch");
-    ggml_backend_tensor_set(enc_in, conv_out.data(), 0, conv_out.size() * sizeof(float));
+    std::vector<std::vector<float>> clip_hidden(batch_size);
+    std::vector<int> clip_n_ctx(batch_size);
     
-    ggml_tensor* mask_t = ggml_graph_get_tensor(gf_enc, "attn_mask");
-    ggml_backend_tensor_set(mask_t, attn_mask.data(), 0, attn_mask.size() * sizeof(float));
-    
-    if (ggml_backend_sched_graph_compute(state->sched, gf_enc) != GGML_STATUS_SUCCESS) { if (error) error->message = "compute enc batch failed"; ggml_backend_sched_reset(state->sched); return false; }
-    
-    ggml_tensor* embd_enc = ggml_graph_get_tensor(gf_enc, "embd_enc_batch");
-    std::vector<float> all_out(n_state * total_seq);
-    ggml_backend_tensor_get(embd_enc, all_out.data(), 0, all_out.size() * sizeof(float));
+    chunk_idx = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        int total_out = clip_total_out_frames[b];
+        clip_hidden[b].resize(total_out * n_state);
+        clip_n_ctx[b] = total_out;
+        
+        int32_t dst_offset = 0;
+        for (int32_t c = 0; c < clip_n_chunks[b]; ++c) {
+            int32_t valid = clip_chunk_out_lens[b][c];
+            for (int32_t t = 0; t < valid; ++t) {
+                for (int32_t d = 0; d < n_state; ++d) {
+                    float val = conv_all[d + t * n_state + chunk_idx * n_state * max_out_w];
+                    float pe = pos_emb_data[t * n_state + d];
+                    clip_hidden[b][(dst_offset + t) * n_state + d] = val + pe;
+                }
+            }
+            dst_offset += valid;
+            chunk_idx++;
+        }
+    }
     
     output.features.resize(batch_size);
+    
     for (int b = 0; b < batch_size; ++b) {
-        int actual_out = out_frames[b];
-        int offset = b * seq_len_per_item;
-        output.features[b].hidden_size = n_state;
-        output.features[b].n_frames = actual_out;
-        output.features[b].data.resize(actual_out * n_state);
-        for (int f = 0; f < actual_out; ++f) {
-            for (int h = 0; h < n_state; ++h) {
-                output.features[b].data[f * n_state + h] = all_out[(offset + f) * n_state + h];
+        int n_ctx = clip_n_ctx[b];
+        
+        std::vector<int32_t> cu_seqlens;
+        cu_seqlens.push_back(0);
+        {
+            int32_t remaining = n_ctx;
+            while (remaining > 0) {
+                if (remaining >= window_aftercnn) {
+                    cu_seqlens.push_back(cu_seqlens.back() + window_aftercnn);
+                    remaining -= window_aftercnn;
+                } else {
+                    cu_seqlens.push_back(cu_seqlens.back() + remaining);
+                    remaining = 0;
+                }
             }
         }
+        
+        std::vector<float> attn_mask(n_ctx * n_ctx, -INFINITY);
+        for (size_t seg = 1; seg < cu_seqlens.size(); ++seg) {
+            int32_t seg_start = cu_seqlens[seg - 1];
+            int32_t seg_end = cu_seqlens[seg];
+            for (int32_t r = seg_start; r < seg_end; ++r) {
+                for (int32_t c = seg_start; c < seg_end; ++c) {
+                    attn_mask[r * n_ctx + c] = 0.0f;
+                }
+            }
+        }
+        
+        ggml_cgraph* gf_enc = build_transformer_graph(state, n_ctx);
+        if (!ggml_backend_sched_alloc_graph(state->sched, gf_enc)) {
+            if (error) error->message = "alloc transformer graph failed";
+            return false;
+        }
+        
+        ggml_tensor* hidden_t = ggml_graph_get_tensor(gf_enc, "inp_hidden");
+        ggml_backend_tensor_set(hidden_t, clip_hidden[b].data(), 0, clip_hidden[b].size() * sizeof(float));
+        
+        ggml_tensor* mask_t = ggml_graph_get_tensor(gf_enc, "attn_mask");
+        ggml_backend_tensor_set(mask_t, attn_mask.data(), 0, attn_mask.size() * sizeof(float));
+        
+        if (ggml_backend_sched_graph_compute(state->sched, gf_enc) != GGML_STATUS_SUCCESS) {
+            if (error) error->message = "compute transformer failed";
+            ggml_backend_sched_reset(state->sched);
+            return false;
+        }
+        
+        ggml_tensor* enc_out = ggml_graph_get_tensor(gf_enc, "audio_enc_out");
+        std::vector<float> enc_all(n_state * n_ctx);
+        ggml_backend_tensor_get(enc_out, enc_all.data(), 0, enc_all.size() * sizeof(float));
+        
+        output.features[b].hidden_size = n_state;
+        output.features[b].n_frames = n_ctx;
+        output.features[b].data = enc_all;
+        
+        ggml_backend_sched_reset(state->sched);
     }
     
-    ggml_backend_sched_reset(state->sched);
     return true;
 }
 

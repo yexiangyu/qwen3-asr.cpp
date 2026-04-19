@@ -47,11 +47,7 @@ int main(int argc, char** argv) {
     printf("Device: %s\n", get_device_name(state));
     printf("PASSED: get_device_name\n");
     
-    printf("\n=== Test 4: get_kv_cache_capacity ===\n");
-    printf("KV cache capacity: %d\n", get_kv_cache_capacity(state));
-    printf("PASSED: get_kv_cache_capacity\n");
-    
-    printf("\n=== Test 5: decode with synthetic input ===\n");
+    printf("\n=== Test 4: decode with synthetic input ===\n");
     const int n_tokens = 10;
     const int n_audio_frames = 5;
     const int hidden_size = hp.hidden_size;
@@ -121,7 +117,7 @@ int main(int argc, char** argv) {
     
     printf("PASSED: decode with synthetic input\n");
     
-    printf("\n=== Test 6: convert_to_timestamps ===\n");
+    printf("\n=== Test 5: convert_to_timestamps ===\n");
     TimestampResult ts_result = convert_to_timestamps(output, hp.timestamp_segment_time_ms);
     printf("Converted timestamps: ");
     for (int i = 0; i < std::min(5, (int)ts_result.timestamps.size()); ++i) {
@@ -131,17 +127,7 @@ int main(int argc, char** argv) {
     printf("n_words: %d\n", ts_result.n_words);
     printf("PASSED: convert_to_timestamps\n");
     
-    printf("\n=== Test 7: clear_kv_cache ===\n");
-    clear_kv_cache(state);
-    printf("KV cache used after clear: %d\n", get_kv_cache_used(state));
-    if (get_kv_cache_used(state) != 0) {
-        fprintf(stderr, "FAILED: KV cache not cleared\n");
-        free(state);
-        return 1;
-    }
-    printf("PASSED: clear_kv_cache\n");
-    
-    printf("\n=== Test 8: free ===\n");
+    printf("\n=== Test 6: free ===\n");
     free(state);
     printf("PASSED: free\n");
     

@@ -4,6 +4,8 @@
 #include "ggml-backend.h"
 #include <vector>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
 
 namespace asr::aligner::decoder {
@@ -67,6 +69,9 @@ struct Model {
     
     std::vector<std::string> vocab;
     std::map<std::string, int32_t> token_to_id;
+    std::unordered_map<std::string, int32_t> decoded_to_id;
+    std::unordered_map<std::string, int> bpe_ranks;
+    std::unordered_set<std::string> ko_dict;
 };
 
 struct Cache {

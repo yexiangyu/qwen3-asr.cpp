@@ -159,6 +159,20 @@ if(GGML_CUDA_FOUND)
     target_link_libraries(asr-cli PRIVATE ggml-cuda CUDA::cudart)
 endif()
 
+add_executable(ggml-quantize src/tools/quantize.cpp)
+target_include_directories(ggml-quantize PRIVATE ${GGML_DIR}/include)
+target_link_directories(ggml-quantize PRIVATE ${GGML_BUILD_DIR}/src)
+target_link_libraries(ggml-quantize PRIVATE
+    ggml
+    ggml-base
+    ggml-cpu
+    Threads::Threads
+)
+if(GGML_CUDA_FOUND)
+    target_link_directories(ggml-quantize PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+    target_link_libraries(ggml-quantize PRIVATE ggml-cuda CUDA::cudart)
+endif()
+
 option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
 
 if(QWEN3_ASR_BUILD_TESTS)
@@ -212,6 +226,9 @@ if(QWEN3_ASR_BUILD_TESTS)
 
     add_asr_test(test_aligner_decoder_simple tests/test_aligner_decoder_simple.cpp)
     target_link_libraries(test_aligner_decoder_simple PRIVATE asr_aligner_decoder)
+
+    add_asr_test(test_batch_align tests/test_batch_align.cpp)
+    target_link_libraries(test_batch_align PRIVATE asr_aligner_encoder asr_aligner_decoder asr_mel asr_codec)
 
     add_asr_test(integration_test tests/integration_test.cpp)
     target_link_libraries(integration_test PRIVATE

@@ -1,5 +1,6 @@
 #include "asr/aligner/decoder.hpp"
 #include "asr/aligner/decoder_model.hpp"
+#include "asr/common/hf_tokenizer.hpp"
 #include "gguf.h"
 
 #ifdef GGML_USE_CUDA
@@ -9,19 +10,20 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <climits>
 #include <vector>
 #include <fstream>
+#include <algorithm>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <algorithm>
 
 namespace asr::aligner::decoder {
 
 using asr::ErrorInfo;
 
-constexpr int MAX_NODES = 16384;
+constexpr int FA_MAX_NODES = 16384;
 
 static ggml_backend_buffer_type_t get_preferred_buft() {
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -52,44 +54,42 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
     
     auto get_f32 = [&](const char* key, float def) {
         int64_t idx = gguf_find_key(ctx_gguf, key);
-        return idx < 0 ? def : gguf_get_val_f32(ctx_gguf, idx);
+        if (idx < 0) return def;
+        enum gguf_type vtype = gguf_get_kv_type(ctx_gguf, idx);
+        if (vtype == GGUF_TYPE_FLOAT32) return gguf_get_val_f32(ctx_gguf, idx);
+        if (vtype == GGUF_TYPE_FLOAT64) return (float)gguf_get_val_f64(ctx_gguf, idx);
+        return def;
     };
     
-    model.hparams.vocab_size = get_u32("qwen3-asr.vocab_size", 152064);
-    model.hparams.hidden_size = get_u32("qwen3-asr.embedding_length", 1024);
-    model.hparams.n_layers = get_u32("qwen3-asr.block_count", 28);
-    model.hparams.n_heads = get_u32("qwen3-asr.attention.head_count", 16);
-    model.hparams.n_kv_heads = get_u32("qwen3-asr.attention.head_count_kv", 8);
-    model.hparams.intermediate_size = get_u32("qwen3-asr.feed_forward_length", 3072);
-    model.hparams.head_dim = get_u32("qwen3-asr.attention.key_length", 128);
-    model.hparams.rms_norm_eps = get_f32("qwen3-asr.attention.layer_norm_rms_epsilon", 1e-6f);
-    model.hparams.rope_theta = get_f32("qwen3-asr.rope.freq_base", 1000000.0f);
-    model.hparams.classify_head_size = get_u32("qwen3-asr.classify_num", 5000);
+    model.hparams.vocab_size = get_u32("qwen3asr.llm.vocab_size", get_u32("qwen3-asr.vocab_size", 152064));
+    model.hparams.hidden_size = get_u32("qwen3asr.llm.d_model", get_u32("qwen3-asr.embedding_length", 1024));
+    model.hparams.n_layers = get_u32("qwen3asr.llm.n_layers", get_u32("qwen3-asr.block_count", 28));
+    model.hparams.n_heads = get_u32("qwen3asr.llm.n_heads", get_u32("qwen3-asr.attention.head_count", 16));
+    model.hparams.n_kv_heads = get_u32("qwen3asr.llm.n_kv_heads", get_u32("qwen3-asr.attention.head_count_kv", 8));
+    model.hparams.intermediate_size = get_u32("qwen3asr.llm.ff_dim", get_u32("qwen3-asr.feed_forward_length", 3072));
+    model.hparams.head_dim = get_u32("qwen3asr.llm.head_dim", get_u32("qwen3-asr.attention.key_length", 128));
+    model.hparams.rms_norm_eps = get_f32("qwen3asr.llm.rms_norm_eps", get_f32("qwen3-asr.attention.layer_norm_rms_epsilon", 1e-6f));
+    model.hparams.rope_theta = get_f32("qwen3asr.llm.rope_theta", get_f32("qwen3-asr.rope.freq_base", 1000000.0f));
+    model.hparams.classify_head_size = get_u32("qwen3asr.llm.classify_num", get_u32("qwen3-asr.classify_num", 5000));
     
-    model.hparams.timestamp_token_id = get_u32("qwen3-asr.timestamp_token_id", 151705);
-    model.hparams.audio_start_token_id = get_u32("qwen3-asr.audio.start_token_id", 151669);
-    model.hparams.audio_end_token_id = get_u32("qwen3-asr.audio.end_token_id", 151670);
-    model.hparams.audio_pad_token_id = get_u32("qwen3-asr.audio.pad_token_id", 151676);
-    model.hparams.pad_token_id = 151643;
-    model.hparams.eos_token_id = 151645;
+    model.hparams.timestamp_token_id = get_u32("qwen3asr.timestamp_token_id", get_u32("qwen3-asr.timestamp_token_id", 151705));
+    model.hparams.audio_start_token_id = get_u32("qwen3asr.audio_start_token_id", get_u32("qwen3_asr.audio_start_token_id", get_u32("qwen3-asr.audio.start_token_id", 151669)));
+    model.hparams.audio_end_token_id = get_u32("qwen3asr.audio_end_token_id", get_u32("qwen3_asr.audio_end_token_id", get_u32("qwen3-asr.audio.end_token_id", 151670)));
+    model.hparams.audio_pad_token_id = get_u32("qwen3asr.audio_pad_token_id", get_u32("qwen3_asr.audio_token_id", get_u32("qwen3-asr.audio.pad_token_id", 151676)));
+    model.hparams.pad_token_id = get_u32("qwen3asr.pad_token_id", 151643);
+    model.hparams.eos_token_id = get_u32("qwen3asr.eos_token_id", 151645);
     
     model.layers.resize(model.hparams.n_layers);
     
     for (ggml_tensor* t = ggml_get_first_tensor(model.ctx); t; t = ggml_get_next_tensor(model.ctx, t)) {
         const char* name = ggml_get_name(t);
-        
-        if (strstr(name, "audio.")) {
-            continue;
-        }
-        
+        if (strstr(name, "audio.")) continue;
         model.tensors[name] = t;
         
         if (strstr(name, "blk.")) {
             int layer_idx = -1;
-            if (sscanf(name, "blk.%d.", &layer_idx) == 1 &&
-                layer_idx >= 0 && layer_idx < model.hparams.n_layers) {
+            if (sscanf(name, "blk.%d.", &layer_idx) == 1 && layer_idx >= 0 && layer_idx < model.hparams.n_layers) {
                 auto& layer = model.layers[layer_idx];
-                
                 if (strstr(name, "attn_output.weight")) layer.attn_output = t;
                 else if (strstr(name, "attn_norm.weight")) layer.attn_norm = t;
                 else if (strstr(name, "attn_q_norm.weight")) layer.attn_q_norm = t;
@@ -102,74 +102,62 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
                 else if (strstr(name, "ffn_up.weight")) layer.ffn_up = t;
                 else if (strstr(name, "ffn_down.weight")) layer.ffn_down = t;
             }
-        }
-        else if (strstr(name, "token_embd.weight")) {
-            model.token_embd = t;
-        }
-        else if (strstr(name, "output_norm.weight")) {
-            model.output_norm = t;
-        }
-        else if (strstr(name, "output.weight")) {
-            model.classify_head_w = t;
-        }
-        else if (strstr(name, "output.bias")) {
-            model.classify_head_b = t;
-        }
+        } else if (strstr(name, "token_embd.weight")) model.token_embd = t;
+        else if (strstr(name, "output_norm.weight")) model.output_norm = t;
+        else if (strstr(name, "output.weight")) model.classify_head_w = t;
+        else if (strstr(name, "output.bias")) model.classify_head_b = t;
     }
     
     int64_t tokens_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
     if (tokens_idx >= 0) {
         int64_t n_vocab = gguf_get_arr_n(ctx_gguf, tokens_idx);
         model.vocab.resize(n_vocab);
+        for (int64_t i = 0; i < n_vocab; ++i) model.vocab[i] = gguf_get_arr_str(ctx_gguf, tokens_idx, i);
         for (int64_t i = 0; i < n_vocab; ++i) {
-            model.vocab[i] = gguf_get_arr_str(ctx_gguf, tokens_idx, i);
+            if (!model.vocab[i].empty()) model.token_to_id[model.vocab[i]] = static_cast<int32_t>(i);
         }
-        for (int64_t i = 0; i < n_vocab; ++i) {
-            if (!model.vocab[i].empty()) {
-                model.token_to_id[model.vocab[i]] = static_cast<int32_t>(i);
-            }
-        }
-        fprintf(stderr, "Loaded vocabulary: %lld tokens, token_to_id size: %zu\n", 
-                (long long)n_vocab, model.token_to_id.size());
-        if (n_vocab > 0) {
-            fprintf(stderr, "  First 10 tokens: [%s, %s, %s, %s, %s, %s, %s, %s, %s, %s]\n",
-                    model.vocab[0].c_str(), model.vocab[1].c_str(),
-                    model.vocab[2].c_str(), model.vocab[3].c_str(),
-                    model.vocab[4].c_str(), model.vocab[5].c_str(),
-                    model.vocab[6].c_str(), model.vocab[7].c_str(),
-                    model.vocab[8].c_str(), model.vocab[9].c_str());
-        }
-        // Try to find Chinese characters
-        std::string test_chars[] = {"知", "道", "规", "则", "吗"};
-        for (const auto& ch : test_chars) {
-            auto it = model.token_to_id.find(ch);
-            if (it != model.token_to_id.end()) {
-                fprintf(stderr, "  Found '%s' at id=%d\n", ch.c_str(), it->second);
-            } else {
-                fprintf(stderr, "  '%s' NOT FOUND in vocab\n", ch.c_str());
-            }
-        }
+        fprintf(stderr, "Loaded vocabulary: %lld tokens, token_to_id size: %zu\n", (long long)n_vocab, model.token_to_id.size());
     } else {
         fprintf(stderr, "Warning: tokenizer.ggml.tokens not found in model\n");
     }
     
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        if (error) error->message = "Cannot mmap file";
-        gguf_free(ctx_gguf);
-        return false;
+    int64_t merges_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.merges");
+    if (merges_idx >= 0) {
+        int64_t n_merges = gguf_get_arr_n(ctx_gguf, merges_idx);
+        for (int64_t i = 0; i < n_merges; ++i) {
+            std::string merge = gguf_get_arr_str(ctx_gguf, merges_idx, i);
+            model.bpe_ranks[merge] = static_cast<int>(i);
+        }
+        fprintf(stderr, "Loaded BPE merges: %lld\n", (long long)n_merges);
+    } else {
+        fprintf(stderr, "Warning: tokenizer.ggml.merges not found in model\n");
     }
+
+    // Fallback: parse tokenizer from tokenizer.huggingface.json
+    if (model.vocab.empty() || model.bpe_ranks.empty()) {
+        int64_t hf_idx = gguf_find_key(ctx_gguf, "tokenizer.huggingface.json");
+        if (hf_idx >= 0) {
+            const char* hf_json = gguf_get_val_str(ctx_gguf, hf_idx);
+            if (hf_json) {
+                asr::HfTokenizerData hf_data;
+                if (asr::load_tokenizer_from_hf_json(hf_json, model.hparams.vocab_size, hf_data)) {
+                    model.vocab = std::move(hf_data.vocab);
+                    model.token_to_id.insert(hf_data.token_to_id.begin(), hf_data.token_to_id.end());
+                    model.bpe_ranks.insert(hf_data.bpe_ranks.begin(), hf_data.bpe_ranks.end());
+                }
+            }
+        }
+    }
+    
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { if (error) error->message = "Cannot mmap file"; gguf_free(ctx_gguf); return false; }
     
     struct stat st;
     fstat(fd, &st);
     void* mmap_addr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     
-    if (mmap_addr == MAP_FAILED) {
-        if (error) error->message = "mmap failed";
-        gguf_free(ctx_gguf);
-        return false;
-    }
+    if (mmap_addr == MAP_FAILED) { if (error) error->message = "mmap failed"; gguf_free(ctx_gguf); return false; }
     
     model.mmap_addr = mmap_addr;
     model.mmap_size = st.st_size;
@@ -178,24 +166,13 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
     uint8_t* data_base = (uint8_t*)mmap_addr + data_offset;
     
     model.buffer = ggml_backend_alloc_ctx_tensors_from_buft(model.ctx, get_preferred_buft());
-    if (!model.buffer) {
-        if (error) error->message = "Failed to allocate tensor buffer";
-        munmap(mmap_addr, st.st_size);
-        gguf_free(ctx_gguf);
-        return false;
-    }
+    if (!model.buffer) { if (error) error->message = "Failed to allocate tensor buffer"; munmap(mmap_addr, st.st_size); gguf_free(ctx_gguf); return false; }
     
     for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf); ++i) {
         const char* name = gguf_get_tensor_name(ctx_gguf, i);
-        
-        if (strstr(name, "audio.")) {
-            continue;
-        }
-        
+        if (strstr(name, "audio.")) continue;
         ggml_tensor* t = ggml_get_tensor(model.ctx, name);
-        if (t) {
-            ggml_backend_tensor_set(t, data_base + gguf_get_tensor_offset(ctx_gguf, i), 0, ggml_nbytes(t));
-        }
+        if (t) ggml_backend_tensor_set(t, data_base + gguf_get_tensor_offset(ctx_gguf, i), 0, ggml_nbytes(t));
     }
     
     ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -206,91 +183,25 @@ static bool load_model_internal(const char* path, Model& model, ErrorInfo* error
     }
     
     gguf_free(ctx_gguf);
-    fprintf(stderr, "Aligner decoder model loaded: %zu bytes, classify_head_size=%d\n", 
-            ggml_backend_buffer_get_size(model.buffer), model.hparams.classify_head_size);
+    fprintf(stderr, "Aligner decoder hparams: vocab=%d, hidden=%d, n_layers=%d, n_heads=%d, n_kv_heads=%d, head_dim=%d, ff=%d, rope_theta=%f, rms_eps=%f, classify=%d\n",
+            model.hparams.vocab_size, model.hparams.hidden_size, model.hparams.n_layers,
+            model.hparams.n_heads, model.hparams.n_kv_heads, model.hparams.head_dim,
+            model.hparams.intermediate_size, model.hparams.rope_theta, model.hparams.rms_norm_eps,
+            model.hparams.classify_head_size);
+    fprintf(stderr, "Aligner decoder model loaded: %zu bytes, classify_head_size=%d\n", ggml_backend_buffer_get_size(model.buffer), model.hparams.classify_head_size);
     return true;
 }
 
 static void free_decoder_model(Model& model) {
-    if (model.buffer) {
-        ggml_backend_buffer_free(model.buffer);
-        model.buffer = nullptr;
-    }
-    if (model.ctx) {
-        ggml_free(model.ctx);
-        model.ctx = nullptr;
-    }
-    if (model.mmap_addr) {
-        munmap(model.mmap_addr, model.mmap_size);
-        model.mmap_addr = nullptr;
-        model.mmap_size = 0;
-    }
+    if (model.buffer) { ggml_backend_buffer_free(model.buffer); model.buffer = nullptr; }
+    if (model.ctx) { ggml_free(model.ctx); model.ctx = nullptr; }
+    if (model.mmap_addr) { munmap(model.mmap_addr, model.mmap_size); model.mmap_addr = nullptr; model.mmap_size = 0; }
     model.layers.clear();
     model.tensors.clear();
     model.vocab.clear();
     model.token_to_id.clear();
-}
-
-static bool init_kv_cache(State* state, int n_ctx) {
-    const auto& hp = state->model->hparams;
-    
-    state->kv_cache.n_ctx = n_ctx;
-    state->kv_cache.n_used = 0;
-    state->kv_cache.head_dim = hp.head_dim;
-    state->kv_cache.n_kv_heads = hp.n_kv_heads;
-    state->kv_cache.n_layers = hp.n_layers;
-    
-    const size_t n_tensors = hp.n_layers * 2;
-    const size_t ctx_size = n_tensors * ggml_tensor_overhead();
-    
-    struct ggml_init_params params = {
-        ctx_size,
-        nullptr,
-        true
-    };
-    
-    state->kv_cache.ctx = ggml_init(params);
-    if (!state->kv_cache.ctx) {
-        return false;
-    }
-    
-    state->kv_cache.k_cache.resize(hp.n_layers);
-    state->kv_cache.v_cache.resize(hp.n_layers);
-    
-    for (int il = 0; il < hp.n_layers; ++il) {
-        state->kv_cache.k_cache[il] = ggml_new_tensor_3d(
-            state->kv_cache.ctx, GGML_TYPE_F16,
-            hp.head_dim, hp.n_kv_heads, n_ctx);
-        ggml_format_name(state->kv_cache.k_cache[il], "k_cache_%d", il);
-        
-        state->kv_cache.v_cache[il] = ggml_new_tensor_3d(
-            state->kv_cache.ctx, GGML_TYPE_F16,
-            hp.head_dim, hp.n_kv_heads, n_ctx);
-        ggml_format_name(state->kv_cache.v_cache[il], "v_cache_%d", il);
-    }
-    
-    ggml_backend_t kv_backend = state->backend_gpu ? state->backend_gpu : state->backend_cpu;
-    state->kv_cache.buffer = ggml_backend_alloc_ctx_tensors(state->kv_cache.ctx, kv_backend);
-    if (!state->kv_cache.buffer) {
-        return false;
-    }
-    
-    return true;
-}
-
-static void free_kv_cache(Cache& cache) {
-    if (cache.buffer) {
-        ggml_backend_buffer_free(cache.buffer);
-        cache.buffer = nullptr;
-    }
-    if (cache.ctx) {
-        ggml_free(cache.ctx);
-        cache.ctx = nullptr;
-    }
-    cache.k_cache.clear();
-    cache.v_cache.clear();
-    cache.n_ctx = 0;
-    cache.n_used = 0;
+    model.bpe_ranks.clear();
+    model.ko_dict.clear();
 }
 
 State* init(const Config& config) {
@@ -306,35 +217,22 @@ State* init(const Config& config) {
     }
     
     state->backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!state->backend_cpu) {
-        free_decoder_model(*state->model);
-        delete state->model;
-        delete state;
-        return nullptr;
-    }
+    if (!state->backend_cpu) { free_decoder_model(*state->model); delete state->model; delete state; return nullptr; }
     
     if (!config.device_name.empty()) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_name(config.device_name.c_str());
-        if (dev) {
-            state->backend_gpu = ggml_backend_dev_init(dev, nullptr);
-        }
+        if (dev) state->backend_gpu = ggml_backend_dev_init(dev, nullptr);
     }
-    if (!state->backend_gpu) {
-        state->backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-    }
+    if (!state->backend_gpu) state->backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     
     std::vector<ggml_backend_t> backends;
-    if (state->backend_gpu) {
-        backends.push_back(state->backend_gpu);
-    }
+    if (state->backend_gpu) backends.push_back(state->backend_gpu);
     backends.push_back(state->backend_cpu);
     
     std::vector<ggml_backend_buffer_type_t> bufts;
-    for (auto be : backends) {
-        bufts.push_back(ggml_backend_get_default_buffer_type(be));
-    }
+    for (auto be : backends) bufts.push_back(ggml_backend_get_default_buffer_type(be));
     
-    state->sched = ggml_backend_sched_new(backends.data(), bufts.data(), backends.size(), MAX_NODES, false, true);
+    state->sched = ggml_backend_sched_new(backends.data(), bufts.data(), backends.size(), FA_MAX_NODES, false, true);
     if (!state->sched) {
         free_decoder_model(*state->model);
         if (state->backend_gpu) ggml_backend_free(state->backend_gpu);
@@ -344,85 +242,37 @@ State* init(const Config& config) {
         return nullptr;
     }
     
-    state->compute_meta.resize(ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead());
-    
-    if (!init_kv_cache(state, config.max_ctx_length)) {
-        ggml_backend_sched_free(state->sched);
-        if (state->backend_gpu) ggml_backend_free(state->backend_gpu);
-        ggml_backend_free(state->backend_cpu);
-        free_decoder_model(*state->model);
-        delete state->model;
-        delete state;
-        return nullptr;
-    }
-    
+    state->compute_meta.resize(ggml_tensor_overhead() * FA_MAX_NODES + ggml_graph_overhead());
     return state;
 }
 
 void free(State* state) {
     if (!state) return;
-    
-    free_kv_cache(state->kv_cache);
-    
-    if (state->sched) {
-        ggml_backend_sched_free(state->sched);
-        state->sched = nullptr;
-    }
-    if (state->backend_gpu) {
-        ggml_backend_free(state->backend_gpu);
-        state->backend_gpu = nullptr;
-    }
-    if (state->backend_cpu) {
-        ggml_backend_free(state->backend_cpu);
-        state->backend_cpu = nullptr;
-    }
-    if (state->model) {
-        free_decoder_model(*state->model);
-        delete state->model;
-        state->model = nullptr;
-    }
-    
+    if (state->sched) { ggml_backend_sched_free(state->sched); state->sched = nullptr; }
+    if (state->backend_gpu) { ggml_backend_free(state->backend_gpu); state->backend_gpu = nullptr; }
+    if (state->backend_cpu) { ggml_backend_free(state->backend_cpu); state->backend_cpu = nullptr; }
+    if (state->model) { free_decoder_model(*state->model); delete state->model; state->model = nullptr; }
     delete state;
 }
 
-void clear_kv_cache(State* state) {
-    if (!state) return;
-    state->kv_cache.n_used = 0;
-    
-    if (state->kv_cache.buffer) {
-        for (int il = 0; il < state->kv_cache.n_layers; ++il) {
-            if (state->kv_cache.k_cache[il]) {
-                ggml_backend_buffer_clear(state->kv_cache.buffer, 0);
-                break;
-            }
-        }
-    }
-}
-
-int get_kv_cache_used(State* state) {
-    if (!state) return 0;
-    return state->kv_cache.n_used;
-}
-
-int get_kv_cache_capacity(State* state) {
-    if (!state) return 0;
-    return state->kv_cache.n_ctx;
-}
-
 const char* get_device_name(State* state) {
-    if (!state) return "CPU";
-    return state->backend_gpu ? ggml_backend_name(state->backend_gpu) : "CPU";
+    return state && state->backend_gpu ? ggml_backend_name(state->backend_gpu) : "CPU";
 }
 
 HyperParams get_hparams(State* state) {
-    if (!state || !state->model) return HyperParams();
-    return state->model->hparams;
+    return state && state->model ? state->model->hparams : HyperParams();
 }
+
+// ==================== Decoder Graph ====================
+// Ported directly from legacy ForcedAligner::build_decoder_graph
 
 static ggml_cgraph* build_decoder_graph(
     State* state,
     const int32_t* tokens, int n_tokens,
-    const float* audio_features, int n_audio_frames, int audio_start_pos) {
+    const float* audio_embd, int n_audio,
+    int audio_start_pos) {
+    
+    (void)tokens;
     
     const auto& hp = state->model->hparams;
     const int n_head = hp.n_heads;
@@ -440,7 +290,7 @@ static ggml_cgraph* build_decoder_graph(
     };
     
     struct ggml_context* ctx0 = ggml_init(params);
-    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx0, MAX_NODES, false);
+    struct ggml_cgraph* gf = ggml_new_graph_custom(ctx0, FA_MAX_NODES, false);
     
     struct ggml_tensor* inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp_tokens, "inp_tokens");
@@ -451,28 +301,26 @@ static ggml_cgraph* build_decoder_graph(
     ggml_set_input(inp_pos);
     
     struct ggml_tensor* inp_audio = nullptr;
-    if (audio_features && n_audio_frames > 0) {
-        inp_audio = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, n_audio_frames);
+    if (audio_embd && n_audio > 0) {
+        inp_audio = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, n_audio);
         ggml_set_name(inp_audio, "inp_audio");
         ggml_set_input(inp_audio);
     }
     
     struct ggml_tensor* cur = ggml_get_rows(ctx0, state->model->token_embd, inp_tokens);
     
-    if (inp_audio && n_audio_frames > 0 && audio_start_pos >= 0 && audio_start_pos + n_audio_frames <= n_tokens) {
+    if (inp_audio && n_audio > 0 && audio_start_pos >= 0 && audio_start_pos + n_audio <= n_tokens) {
         struct ggml_tensor* embd_before = nullptr;
         struct ggml_tensor* embd_after = nullptr;
         
         if (audio_start_pos > 0) {
-            embd_before = ggml_view_2d(ctx0, cur, hidden_size, audio_start_pos,
-                                       cur->nb[1], 0);
+            embd_before = ggml_view_2d(ctx0, cur, hidden_size, audio_start_pos, cur->nb[1], 0);
         }
         
-        if (audio_start_pos + n_audio_frames < n_tokens) {
-            int after_start = audio_start_pos + n_audio_frames;
+        if (audio_start_pos + n_audio < n_tokens) {
+            int after_start = audio_start_pos + n_audio;
             int after_len = n_tokens - after_start;
-            embd_after = ggml_view_2d(ctx0, cur, hidden_size, after_len,
-                                      cur->nb[1], after_start * cur->nb[1]);
+            embd_after = ggml_view_2d(ctx0, cur, hidden_size, after_len, cur->nb[1], after_start * cur->nb[1]);
         }
         
         if (embd_before && embd_after) {
@@ -497,13 +345,6 @@ static ggml_cgraph* build_decoder_graph(
     
     for (int il = 0; il < n_layer; ++il) {
         const auto& layer = state->model->layers[il];
-        
-        if (!layer.attn_norm || !layer.attn_q || !layer.attn_k || !layer.attn_v ||
-            !layer.attn_output || !layer.ffn_norm || !layer.ffn_gate ||
-            !layer.ffn_up || !layer.ffn_down) {
-            ggml_free(ctx0);
-            return nullptr;
-        }
         
         cur = ggml_rms_norm(ctx0, inpL, eps);
         cur = ggml_mul(ctx0, cur, layer.attn_norm);
@@ -553,9 +394,7 @@ static ggml_cgraph* build_decoder_graph(
         struct ggml_tensor* up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
         
         gate = ggml_silu(ctx0, gate);
-        
         cur = ggml_mul(ctx0, gate, up);
-        
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
         
         inpL = ggml_add(ctx0, cur, inpFF);
@@ -567,9 +406,7 @@ static ggml_cgraph* build_decoder_graph(
     cur = ggml_mul(ctx0, cur, state->model->output_norm);
     
     cur = ggml_mul_mat(ctx0, state->model->classify_head_w, cur);
-    if (state->model->classify_head_b) {
-        cur = ggml_add(ctx0, cur, state->model->classify_head_b);
-    }
+    if (state->model->classify_head_b) cur = ggml_add(ctx0, cur, state->model->classify_head_b);
     
     ggml_set_name(cur, "logits");
     ggml_set_output(cur);
@@ -581,24 +418,11 @@ static ggml_cgraph* build_decoder_graph(
     return gf;
 }
 
+// Ported directly from legacy ForcedAligner::forward_decoder
+
 bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) {
     if (!state || !state->model) {
         if (error) error->message = "State or model not initialized";
-        return false;
-    }
-    
-    if (!input.tokens || input.n_tokens <= 0) {
-        if (error) error->message = "Invalid input tokens";
-        return false;
-    }
-    
-    if (state->kv_cache.n_ctx == 0) {
-        if (error) error->message = "KV cache not initialized";
-        return false;
-    }
-    
-    if (input.n_tokens > state->kv_cache.n_ctx) {
-        if (error) error->message = "Context length exceeded";
         return false;
     }
     
@@ -627,9 +451,7 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
     struct ggml_tensor* inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
     if (inp_pos) {
         std::vector<int32_t> positions(input.n_tokens);
-        for (int i = 0; i < input.n_tokens; ++i) {
-            positions[i] = i;
-        }
+        for (int i = 0; i < input.n_tokens; ++i) positions[i] = i;
         ggml_backend_tensor_set(inp_pos, positions.data(), 0, input.n_tokens * sizeof(int32_t));
     }
     
@@ -678,15 +500,10 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
         int32_t best_class = 0;
         float best_val = row_logits[0];
         for (int c = 1; c < n_classes; ++c) {
-            if (row_logits[c] > best_val) {
-                best_val = row_logits[c];
-                best_class = c;
-            }
+            if (row_logits[c] > best_val) { best_val = row_logits[c]; best_class = c; }
         }
         output.timestamp_indices[t] = best_class;
     }
-    
-    state->kv_cache.n_used = input.n_tokens;
     
     ggml_backend_sched_reset(state->sched);
     
@@ -697,13 +514,471 @@ TimestampResult convert_to_timestamps(const Output& output, int timestamp_segmen
     TimestampResult result;
     result.n_words = output.timestamp_indices.size();
     result.timestamps.resize(output.timestamp_indices.size());
-    
     for (size_t i = 0; i < output.timestamp_indices.size(); ++i) {
         result.timestamps[i] = output.timestamp_indices[i] * (timestamp_segment_time_ms / 1000.0f);
+    }
+    return result;
+}
+
+// ==================== BPE Tokenizer ====================
+// Ported directly from legacy code
+
+static const std::vector<std::string>& get_byte_to_unicode_table() {
+    static std::vector<std::string> table;
+    if (!table.empty()) return table;
+    table.resize(256);
+    
+    std::vector<int> byte_to_cp(256, 0);
+    std::vector<bool> assigned(256, false);
+    
+    auto mark = [&](int lo, int hi) {
+        for (int b = lo; b <= hi; ++b) { byte_to_cp[b] = b; assigned[b] = true; }
+    };
+    mark(0x21, 0x7E);
+    mark(0xA1, 0xAC);
+    mark(0xAE, 0xFF);
+    
+    int n = 0;
+    for (int b = 0; b < 256; ++b) { if (!assigned[b]) { byte_to_cp[b] = 256 + n; ++n; } }
+    
+    auto cp_to_utf8 = [](int cp) -> std::string {
+        std::string s;
+        if (cp < 0x80) { s += static_cast<char>(cp); }
+        else if (cp < 0x800) { s += static_cast<char>(0xC0 | (cp >> 6)); s += static_cast<char>(0x80 | (cp & 0x3F)); }
+        else { s += static_cast<char>(0xE0 | (cp >> 12)); s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); s += static_cast<char>(0x80 | (cp & 0x3F)); }
+        return s;
+    };
+    
+    for (int b = 0; b < 256; ++b) table[b] = cp_to_utf8(byte_to_cp[b]);
+    return table;
+}
+
+static std::string bytes_to_bpe_string(const std::string& text) {
+    const auto& table = get_byte_to_unicode_table();
+    std::string result;
+    result.reserve(text.size() * 2);
+    for (unsigned char c : text) result += table[c];
+    return result;
+}
+
+static std::vector<std::string> split_utf8_chars(const std::string& s) {
+    std::vector<std::string> chars;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t len = 1;
+        if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        if (i + len > s.size()) len = 1;
+        chars.push_back(s.substr(i, len));
+        i += len;
+    }
+    return chars;
+}
+
+static std::vector<std::string> bpe_encode_word(const std::string& word_bpe, const std::unordered_map<std::string, int>& bpe_ranks) {
+    std::vector<std::string> symbols = split_utf8_chars(word_bpe);
+    if (symbols.size() <= 1) return symbols;
+    
+    while (true) {
+        int best_rank = INT_MAX;
+        size_t best_pos = 0;
+        for (size_t i = 0; i + 1 < symbols.size(); ++i) {
+            std::string key = symbols[i] + " " + symbols[i + 1];
+            auto it = bpe_ranks.find(key);
+            if (it != bpe_ranks.end() && it->second < best_rank) { best_rank = it->second; best_pos = i; }
+        }
+        if (best_rank == INT_MAX) break;
+        
+        std::string merged = symbols[best_pos] + symbols[best_pos + 1];
+        std::vector<std::string> new_symbols;
+        new_symbols.reserve(symbols.size() - 1);
+        for (size_t i = 0; i < symbols.size(); ++i) {
+            if (i == best_pos) { new_symbols.push_back(merged); ++i; }
+            else new_symbols.push_back(symbols[i]);
+        }
+        symbols = std::move(new_symbols);
+        if (symbols.size() == 1) break;
+    }
+    return symbols;
+}
+
+// ==================== Text Processing ====================
+// Ported directly from legacy code
+
+static uint32_t utf8_to_codepoint(const std::string& s, size_t& i) {
+    if (i >= s.size()) return 0;
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    uint32_t cp = 0;
+    if ((c & 0x80) == 0) { cp = c; i += 1; }
+    else if ((c & 0xE0) == 0xC0) {
+        if (i + 1 < s.size()) { cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3F); i += 2; }
+        else { i += 1; }
+    } else if ((c & 0xF0) == 0xE0) {
+        if (i + 2 < s.size()) { cp = ((c & 0x0F) << 12) | ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 6) | (static_cast<unsigned char>(s[i + 2]) & 0x3F); i += 3; }
+        else { i += 1; }
+    } else if ((c & 0xF8) == 0xF0) {
+        if (i + 3 < s.size()) { cp = ((c & 0x07) << 18) | ((static_cast<unsigned char>(s[i + 1]) & 0x3F) << 12) | ((static_cast<unsigned char>(s[i + 2]) & 0x3F) << 6) | (static_cast<unsigned char>(s[i + 3]) & 0x3F); i += 4; }
+        else { i += 1; }
+    } else { i += 1; }
+    return cp;
+}
+
+static bool is_cjk_char(uint32_t code) {
+    return (0x4E00 <= code && code <= 0x9FFF) || (0x3400 <= code && code <= 0x4DBF) ||
+           (0x20000 <= code && code <= 0x2A6DF) || (0x2A700 <= code && code <= 0x2B73F) ||
+           (0x2B740 <= code && code <= 0x2B81F) || (0x2B820 <= code && code <= 0x2CEAF) ||
+           (0xF900 <= code && code <= 0xFAFF);
+}
+
+static bool is_kept_char(uint32_t code) {
+    if (code == '\'') return true;
+    if (code < 0x80) {
+        if (('A' <= code && code <= 'Z') || ('a' <= code && code <= 'z') || ('0' <= code && code <= '9')) return true;
+        if (code == '.' || code == '!' || code == '?') return true;
+        return false;
+    }
+    if (code == 0x3002) return true;
+    if (code == 0xFF01) return true;
+    if (code == 0xFF1F) return true;
+    if (0x4E00 <= code && code <= 0x9FFF) return true;
+    if (0x3400 <= code && code <= 0x4DBF) return true;
+    if (0xAC00 <= code && code <= 0xD7AF) return true;
+    if (0x3040 <= code && code <= 0x30FF) return true;
+    return false;
+}
+
+static std::string clean_token(const std::string& token) {
+    std::string result;
+    size_t i = 0;
+    while (i < token.size()) {
+        size_t start = i;
+        uint32_t cp = utf8_to_codepoint(token, i);
+        if (is_kept_char(cp)) result += token.substr(start, i - start);
+    }
+    return result;
+}
+
+static bool is_end_punctuation(uint32_t cp) {
+    return cp == '.' || cp == '!' || cp == '?' || cp == 0x3002 || cp == 0xFF01 || cp == 0xFF1F;
+}
+
+static std::vector<std::string> split_segment_with_cjk(const std::string& seg) {
+    std::vector<std::string> tokens;
+    std::string buf;
+    size_t i = 0;
+    while (i < seg.size()) {
+        size_t start = i;
+        uint32_t cp = utf8_to_codepoint(seg, i);
+        if (is_cjk_char(cp)) {
+            if (!buf.empty()) { std::string cleaned = clean_token(buf); if (!cleaned.empty()) tokens.push_back(cleaned); buf.clear(); }
+            std::string cjk_char = seg.substr(start, i - start);
+            std::string cleaned = clean_token(cjk_char);
+            if (!cleaned.empty()) tokens.push_back(cleaned);
+        } else if (is_end_punctuation(cp)) {
+            if (!buf.empty()) { std::string cleaned = clean_token(buf); if (!cleaned.empty()) tokens.push_back(cleaned); buf.clear(); }
+            tokens.push_back(seg.substr(start, i - start));
+        } else {
+            buf += seg.substr(start, i - start);
+        }
+    }
+    if (!buf.empty()) { std::string cleaned = clean_token(buf); if (!cleaned.empty()) tokens.push_back(cleaned); }
+    return tokens;
+}
+
+static std::vector<std::string> tokenize_space_lang(const std::string& text) {
+    std::vector<std::string> tokens;
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r')) ++i;
+        if (i >= text.size()) break;
+        size_t start = i;
+        while (i < text.size() && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' && text[i] != '\r') ++i;
+        std::string seg = text.substr(start, i - start);
+        std::string cleaned_seg = clean_token(seg);
+        if (!cleaned_seg.empty()) {
+            auto sub_tokens = split_segment_with_cjk(cleaned_seg);
+            for (const auto& t : sub_tokens) tokens.push_back(t);
+        }
+    }
+    return tokens;
+}
+
+static size_t utf8_char_len(unsigned char c) {
+    if ((c & 0x80) == 0) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static size_t utf8_strlen(const std::string& s) {
+    size_t count = 0;
+    size_t i = 0;
+    while (i < s.size()) { i += utf8_char_len(static_cast<unsigned char>(s[i])); ++count; }
+    return count;
+}
+
+static std::string utf8_substr(const std::string& s, size_t char_start, size_t char_count) {
+    size_t byte_start = 0;
+    for (size_t c = 0; c < char_start && byte_start < s.size(); ++c) byte_start += utf8_char_len(static_cast<unsigned char>(s[byte_start]));
+    size_t byte_end = byte_start;
+    for (size_t c = 0; c < char_count && byte_end < s.size(); ++c) byte_end += utf8_char_len(static_cast<unsigned char>(s[byte_end]));
+    return s.substr(byte_start, byte_end - byte_start);
+}
+
+static std::vector<std::string> tokenize_korean(const std::string& text, const std::unordered_set<std::string>& ko_dict) {
+    std::vector<std::string> whitespace_words;
+    {
+        size_t i = 0;
+        while (i < text.size()) {
+            while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r')) ++i;
+            if (i >= text.size()) break;
+            size_t start = i;
+            while (i < text.size() && text[i] != ' ' && text[i] != '\t' && text[i] != '\n' && text[i] != '\r') ++i;
+            whitespace_words.push_back(text.substr(start, i - start));
+        }
+    }
+    
+    std::vector<std::string> result;
+    for (const auto& word : whitespace_words) {
+        size_t length = utf8_strlen(word);
+        if (length <= 2) { result.push_back(word); continue; }
+        
+        float best_score = -1e9f;
+        size_t best_left_len = 0;
+        std::string best_left;
+        std::string best_right;
+        
+        for (size_t e = 2; e <= length; ++e) {
+            std::string left = utf8_substr(word, 0, e);
+            std::string right = utf8_substr(word, e, length - e);
+            float score = ko_dict.count(left) ? 1.0f : 0.0f;
+            if (score > best_score || (score == best_score && e > best_left_len)) { best_score = score; best_left_len = e; best_left = left; best_right = right; }
+        }
+        result.push_back(best_left);
+        if (!best_right.empty()) result.push_back(best_right);
+    }
+    return result;
+}
+
+std::vector<int32_t> tokenize_with_timestamps(State* state, const std::string& text, std::vector<std::string>& words, const std::string& language) {
+    if (!state || !state->model) return {};
+    
+    words.clear();
+    std::vector<int32_t> tokens;
+    const int32_t ts_token = state->model->hparams.timestamp_token_id;
+    
+    std::vector<std::string> raw_words;
+    if (language == "korean" && !state->model->ko_dict.empty()) {
+        raw_words = tokenize_korean(text, state->model->ko_dict);
+    } else {
+        raw_words = tokenize_space_lang(text);
+    }
+    
+    for (size_t w = 0; w < raw_words.size(); ++w) {
+        words.push_back(raw_words[w]);
+        
+        std::string bpe_str = bytes_to_bpe_string(raw_words[w]);
+        std::vector<std::string> subwords = bpe_encode_word(bpe_str, state->model->bpe_ranks);
+        
+        for (const auto& sw : subwords) {
+            auto it = state->model->token_to_id.find(sw);
+            if (it != state->model->token_to_id.end()) tokens.push_back(it->second);
+        }
+        
+        tokens.push_back(ts_token);
+        tokens.push_back(ts_token);
+    }
+    
+    return tokens;
+}
+
+bool load_korean_dict(State* state, const std::string& dict_path) {
+    if (!state || !state->model) return false;
+    std::ifstream f(dict_path);
+    if (!f.is_open()) return false;
+    state->model->ko_dict.clear();
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        size_t pos = line.find(' ');
+        std::string word = (pos != std::string::npos) ? line.substr(0, pos) : line;
+        if (!word.empty()) state->model->ko_dict.insert(word);
+    }
+    return true;
+}
+
+// ==================== Timestamp Processing ====================
+// Ported directly from legacy code
+
+static int32_t get_feat_extract_output_lengths(int32_t input_lengths) {
+    int32_t input_lengths_leave = input_lengths % 100;
+    int32_t feat_lengths = (input_lengths_leave - 1) / 2 + 1;
+    int32_t output_lengths = ((feat_lengths - 1) / 2 + 1 - 1) / 2 + 1 + (input_lengths / 100) * 13;
+    return output_lengths;
+}
+
+std::vector<int32_t> build_token_sequence(State* state, int n_audio_pads, const std::vector<int32_t>& text_tokens) {
+    if (!state || !state->model) return {};
+    const auto& hp = state->model->hparams;
+    std::vector<int32_t> tokens;
+    tokens.push_back(hp.audio_start_token_id);
+    for (int i = 0; i < n_audio_pads; ++i) tokens.push_back(hp.audio_pad_token_id);
+    tokens.push_back(hp.audio_end_token_id);
+    for (auto tok : text_tokens) tokens.push_back(tok);
+    return tokens;
+}
+
+std::vector<int32_t> extract_timestamp_classes(const Output& output, const std::vector<int32_t>& tokens, int timestamp_token_id) {
+    std::vector<int32_t> classes;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == timestamp_token_id) {
+            const float* logits = output.logits.data() + i * output.n_classes;
+            int32_t best_class = 0;
+            float best_score = logits[0];
+            for (int c = 1; c < output.n_classes; ++c) { if (logits[c] > best_score) { best_score = logits[c]; best_class = c; } }
+            classes.push_back(best_class);
+        }
+    }
+    return classes;
+}
+
+std::vector<int32_t> fix_timestamp_classes(const std::vector<int32_t>& data) {
+    const int n = static_cast<int>(data.size());
+    if (n == 0) return {};
+    
+    std::vector<int> dp(n, 1);
+    std::vector<int> parent(n, -1);
+    
+    for (int i = 1; i < n; ++i) {
+        for (int j = 0; j < i; ++j) {
+            if (data[j] <= data[i] && dp[j] + 1 > dp[i]) { dp[i] = dp[j] + 1; parent[i] = j; }
+        }
+    }
+    
+    int max_len = 0, max_idx = 0;
+    for (int i = 0; i < n; ++i) { if (dp[i] > max_len) { max_len = dp[i]; max_idx = i; } }
+    
+    std::vector<bool> is_normal(n, false);
+    { int idx = max_idx; while (idx != -1) { is_normal[idx] = true; idx = parent[idx]; } }
+    
+    std::vector<int32_t> result(data.begin(), data.end());
+    int i = 0;
+    
+    while (i < n) {
+        if (!is_normal[i]) {
+            int j = i;
+            while (j < n && !is_normal[j]) ++j;
+            int anomaly_count = j - i;
+            
+            int32_t left_val = -1;
+            for (int k = i - 1; k >= 0; --k) { if (is_normal[k]) { left_val = result[k]; break; } }
+            
+            int32_t right_val = -1;
+            for (int k = j; k < n; ++k) { if (is_normal[k]) { right_val = result[k]; break; } }
+            
+            if (anomaly_count <= 2) {
+                for (int k = i; k < j; ++k) {
+                    if (left_val < 0) result[k] = right_val;
+                    else if (right_val < 0) result[k] = left_val;
+                    else result[k] = ((k - (i - 1)) <= (j - k)) ? left_val : right_val;
+                }
+            } else {
+                if (left_val >= 0 && right_val >= 0) {
+                    float step = static_cast<float>(right_val - left_val) / (anomaly_count + 1);
+                    for (int k = i; k < j; ++k) result[k] = static_cast<int32_t>(left_val + step * (k - i + 1));
+                } else if (left_val >= 0) {
+                    for (int k = i; k < j; ++k) result[k] = left_val;
+                } else if (right_val >= 0) {
+                    for (int k = i; k < j; ++k) result[k] = right_val;
+                }
+            }
+            
+            i = j;
+        } else { ++i; }
     }
     
     return result;
 }
+
+std::vector<float> classes_to_timestamps(const std::vector<int32_t>& classes, float segment_time_sec) {
+    std::vector<float> timestamps;
+    timestamps.reserve(classes.size());
+    for (int32_t cls : classes) timestamps.push_back(cls * segment_time_sec);
+    return timestamps;
+}
+
+// ==================== High-level align ====================
+// Ported directly from legacy ForcedAligner::align
+
+bool align(State* state, const AlignInput& input, AlignOutput& output, ErrorInfo* error) {
+    if (!state || !state->model) { if (error) error->message = "State or model not initialized"; return false; }
+    if (!input.audio_features || input.n_audio_frames <= 0) { if (error) error->message = "Invalid audio features"; return false; }
+    if (input.text.empty()) { if (error) error->message = "Text is empty"; return false; }
+    
+    std::vector<std::string> words;
+    std::vector<int32_t> text_tokens = tokenize_with_timestamps(state, input.text, words, input.language);
+    if (text_tokens.empty() || words.empty()) { if (error) error->message = "Failed to tokenize text"; return false; }
+    
+    const auto& hp = state->model->hparams;
+    
+    int32_t n_audio_pads = input.n_mel_frames > 0 ? get_feat_extract_output_lengths(input.n_mel_frames) : input.n_audio_frames;
+    std::vector<int32_t> tokens = build_token_sequence(state, n_audio_pads, text_tokens);
+    
+    int audio_start_pos = 0;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == hp.audio_start_token_id) { audio_start_pos = i + 1; break; }
+    }
+    
+    Input dec_input;
+    dec_input.tokens = tokens.data();
+    dec_input.n_tokens = tokens.size();
+    dec_input.audio_features = input.audio_features;
+    dec_input.n_audio_frames = input.n_audio_frames;
+    dec_input.audio_start_pos = audio_start_pos;
+    
+    Output dec_output;
+    if (!decode(state, dec_input, dec_output, error)) return false;
+    
+    float segment_time = hp.timestamp_segment_time_ms / 1000.0f;
+    float audio_duration = (input.n_samples > 0 && input.sample_rate > 0)
+        ? static_cast<float>(input.n_samples) / input.sample_rate
+        : input.n_audio_frames * segment_time;
+    
+    std::vector<int32_t> timestamp_classes = extract_timestamp_classes(dec_output, tokens, hp.timestamp_token_id);
+    std::vector<int32_t> fixed_classes = fix_timestamp_classes(timestamp_classes);
+    std::vector<float> timestamps = classes_to_timestamps(fixed_classes, segment_time);
+    
+    for (size_t i = 0; i < timestamps.size(); ++i) {
+        if (timestamps[i] > audio_duration) timestamps[i] = audio_duration;
+    }
+    
+    output.words.clear();
+    output.audio_duration = audio_duration;
+    
+    for (size_t w = 0; w < words.size(); ++w) {
+        size_t start_idx = w * 2;
+        size_t end_idx = w * 2 + 1;
+        
+        AlignedWord aw;
+        aw.word = words[w];
+        aw.start = (start_idx < timestamps.size()) ? timestamps[start_idx] : 0.0f;
+        aw.end = (end_idx < timestamps.size()) ? timestamps[end_idx] : audio_duration;
+        aw.conf_start = 0.0f;
+        aw.conf_end = 0.0f;
+        
+        if (aw.end < aw.start) aw.end = aw.start;
+        
+        output.words.push_back(aw);
+    }
+    
+    output.success = true;
+    return true;
+}
+
+// ==================== Utility ====================
 
 bool load_ref_data(const char* path, std::vector<float>& data) {
     std::ifstream file(path, std::ios::binary);
@@ -724,242 +999,10 @@ bool save_ref_data(const char* path, const std::vector<float>& data) {
 }
 
 bool compare_float_arrays(const std::vector<float>& a, const std::vector<float>& b, float tolerance, bool verbose) {
-    if (a.size() != b.size()) {
-        if (verbose) fprintf(stderr, "Size mismatch: %zu vs %zu\n", a.size(), b.size());
-        return false;
-    }
+    if (a.size() != b.size()) { if (verbose) fprintf(stderr, "Size mismatch: %zu vs %zu\n", a.size(), b.size()); return false; }
     float max_diff = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        max_diff = std::max(max_diff, fabsf(a[i] - b[i]));
-    }
-    if (max_diff > tolerance) {
-        if (verbose) fprintf(stderr, "Max diff: %.6f > %.6f\n", max_diff, tolerance);
-        return false;
-    }
-    return true;
-}
-
-static bool is_cjk(uint32_t cp) {
-    return (cp >= 0x4E00 && cp <= 0x9FFF) ||
-           (cp >= 0x3400 && cp <= 0x4DBF) ||
-           (cp >= 0x20000 && cp <= 0x2A6DF) ||
-           (cp >= 0x2A700 && cp <= 0x2B73F);
-}
-
-static std::vector<uint32_t> utf8_to_codepoints(const std::string& s) {
-    std::vector<uint32_t> cps;
-    size_t i = 0;
-    while (i < s.size()) {
-        uint32_t cp = 0;
-        uint8_t c = s[i];
-        if ((c & 0x80) == 0) {
-            cp = c; i += 1;
-        } else if ((c & 0xE0) == 0xC0) {
-            if (i + 1 < s.size()) {
-                cp = ((c & 0x1F) << 6) | (s[i+1] & 0x3F);
-                i += 2;
-            } else i += 1;
-        } else if ((c & 0xF0) == 0xE0) {
-            if (i + 2 < s.size()) {
-                cp = ((c & 0x0F) << 12) | ((s[i+1] & 0x3F) << 6) | (s[i+2] & 0x3F);
-                i += 3;
-            } else i += 1;
-        } else if ((c & 0xF8) == 0xF0) {
-            if (i + 3 < s.size()) {
-                cp = ((c & 0x07) << 18) | ((s[i+1] & 0x3F) << 12) | ((s[i+2] & 0x3F) << 6) | (s[i+3] & 0x3F);
-                i += 4;
-            } else i += 1;
-        } else {
-            i += 1;
-        }
-        cps.push_back(cp);
-    }
-    return cps;
-}
-
-static std::string codepoint_to_utf8(uint32_t cp) {
-    std::string s;
-    if (cp < 0x80) {
-        s = char(cp);
-    } else if (cp < 0x800) {
-        s = char(0xC0 | (cp >> 6));
-        s += char(0x80 | (cp & 0x3F));
-    } else if (cp < 0x10000) {
-        s = char(0xE0 | (cp >> 12));
-        s += char(0x80 | ((cp >> 6) & 0x3F));
-        s += char(0x80 | (cp & 0x3F));
-    } else {
-        s = char(0xF0 | (cp >> 18));
-        s += char(0x80 | ((cp >> 12) & 0x3F));
-        s += char(0x80 | ((cp >> 6) & 0x3F));
-        s += char(0x80 | (cp & 0x3F));
-    }
-    return s;
-}
-
-std::vector<std::string> tokenize_text(const std::string& text) {
-    std::vector<std::string> words;
-    auto cps = utf8_to_codepoints(text);
-    
-    std::string latin_seq;
-    for (auto cp : cps) {
-        if (is_cjk(cp)) {
-            if (!latin_seq.empty()) {
-                words.push_back(latin_seq);
-                latin_seq.clear();
-            }
-            words.push_back(codepoint_to_utf8(cp));
-        } else if (cp < 0x80 && (isalpha(cp) || cp == '\'')) {
-            latin_seq += char(cp);
-        } else {
-            if (!latin_seq.empty()) {
-                words.push_back(latin_seq);
-                latin_seq.clear();
-            }
-            if (cp < 0x80 && !isspace(cp)) {
-                words.push_back(codepoint_to_utf8(cp));
-            }
-        }
-    }
-    if (!latin_seq.empty()) {
-        words.push_back(latin_seq);
-    }
-    
-    return words;
-}
-
-std::string decode_token(State* state, int32_t token_id) {
-    if (!state || !state->model) return "";
-    if (token_id < 0 || token_id >= (int32_t)state->model->vocab.size()) return "";
-    return state->model->vocab[token_id];
-}
-
-std::vector<int32_t> tokenize(State* state, const std::string& text, std::vector<std::string>& words) {
-    if (!state || !state->model) return {};
-    
-    words = tokenize_text(text);
-    std::vector<int32_t> tokens;
-    
-    for (const auto& w : words) {
-        auto it = state->model->token_to_id.find(w);
-        if (it != state->model->token_to_id.end()) {
-            tokens.push_back(it->second);
-        } else {
-            auto cps = utf8_to_codepoints(w);
-            for (auto cp : cps) {
-                std::string ch = codepoint_to_utf8(cp);
-                auto it2 = state->model->token_to_id.find(ch);
-                if (it2 != state->model->token_to_id.end()) {
-                    tokens.push_back(it2->second);
-                }
-            }
-        }
-    }
-    
-    return tokens;
-}
-
-std::vector<int32_t> build_token_sequence(State* state, int n_audio_frames, const std::vector<int32_t>& text_tokens) {
-    if (!state || !state->model) return {};
-    
-    const auto& hp = state->model->hparams;
-    std::vector<int32_t> tokens;
-    
-    tokens.push_back(hp.audio_start_token_id);
-    for (int i = 0; i < n_audio_frames; ++i) {
-        tokens.push_back(hp.audio_pad_token_id);
-    }
-    tokens.push_back(hp.audio_end_token_id);
-    
-    for (auto tok : text_tokens) {
-        tokens.push_back(tok);
-        tokens.push_back(hp.timestamp_token_id);
-    }
-    
-    return tokens;
-}
-
-bool align(State* state, const AlignInput& input, AlignOutput& output, ErrorInfo* error) {
-    if (!state || !state->model) {
-        if (error) error->message = "State or model not initialized";
-        return false;
-    }
-    
-    if (!input.audio_features || input.n_audio_frames <= 0) {
-        if (error) error->message = "Invalid audio features";
-        return false;
-    }
-    
-    if (input.text.empty()) {
-        if (error) error->message = "Text is empty";
-        return false;
-    }
-    
-    if (state->model->vocab.empty()) {
-        if (error) error->message = "Model vocabulary is empty - cannot tokenize";
-        return false;
-    }
-    
-    std::vector<std::string> words;
-    std::vector<int32_t> text_tokens = tokenize(state, input.text, words);
-    
-    if (text_tokens.empty()) {
-        if (error) error->message = "Failed to tokenize text (no matching tokens found)";
-        return false;
-    }
-    
-    const auto& hp = state->model->hparams;
-    
-    if (input.audio_feature_dim != hp.hidden_size) {
-        if (error) error->message = "Audio feature dimension mismatch: got " + 
-            std::to_string(input.audio_feature_dim) + ", expected " + std::to_string(hp.hidden_size);
-        return false;
-    }
-    
-    std::vector<int32_t> tokens = build_token_sequence(state, input.n_audio_frames, text_tokens);
-    
-    int audio_start_pos = 0;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i] == hp.audio_start_token_id) {
-            audio_start_pos = i + 1;
-            break;
-        }
-    }
-    
-    Input dec_input;
-    dec_input.tokens = tokens.data();
-    dec_input.n_tokens = tokens.size();
-    dec_input.audio_features = input.audio_features;
-    dec_input.n_audio_frames = input.n_audio_frames;
-    dec_input.audio_start_pos = audio_start_pos;
-    
-    Output dec_output;
-    if (!decode(state, dec_input, dec_output, error)) {
-        return false;
-    }
-    
-    float segment_time = hp.timestamp_segment_time_ms / 1000.0f;
-    output.audio_duration = input.n_audio_frames * segment_time;
-    
-    output.words.clear();
-    int token_idx = input.n_audio_frames + 2;
-    
-    for (size_t w = 0; w < words.size() && w < text_tokens.size(); ++w) {
-        if (token_idx + 1 >= (int)dec_output.timestamp_indices.size()) break;
-        
-        int ts_idx = token_idx + 1;
-        int ts_class = dec_output.timestamp_indices[ts_idx];
-        
-        AlignedWord aw;
-        aw.word = words[w];
-        aw.start = ts_class * segment_time;
-        aw.end = aw.start + segment_time;
-        
-        output.words.push_back(aw);
-        token_idx += 2;
-    }
-    
-    output.success = true;
+    for (size_t i = 0; i < a.size(); ++i) max_diff = std::max(max_diff, fabsf(a[i] - b[i]));
+    if (max_diff > tolerance) { if (verbose) fprintf(stderr, "Max diff: %.6f > %.6f\n", max_diff, tolerance); return false; }
     return true;
 }
 

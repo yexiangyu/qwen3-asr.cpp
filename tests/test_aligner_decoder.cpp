@@ -96,6 +96,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    printf("\n--- Logits samples (first 3 tokens, first 10 classes) ---\n");
+    for (int t = 0; t < 3; ++t) {
+        printf("  token[%d]: ", t);
+        for (int c = 0; c < 10; ++c) {
+            printf("%.3f ", output.logits[t * output.n_classes + c]);
+        }
+        printf("\n");
+    }
+    
     printf("\n--- Timestamp indices (first 20) ---\n");
     for (int i = 0; i < 20; ++i) {
         printf("  token[%d]: class=%d -> %.2fs\n", 

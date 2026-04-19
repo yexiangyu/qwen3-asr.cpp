@@ -39,14 +39,19 @@ struct AlignedWord {
     std::string word;
     float start;
     float end;
+    float conf_start;
+    float conf_end;
 };
 
 struct AlignInput {
     const float* audio_features;
     int n_audio_frames;
     int audio_feature_dim;
+    int n_mel_frames;
     std::string text;
     std::string language;
+    int n_samples = 0;
+    int sample_rate = 16000;
 };
 
 struct AlignOutput {
@@ -63,13 +68,16 @@ TimestampResult convert_to_timestamps(const Output& output, int timestamp_segmen
 
 bool align(State* state, const AlignInput& input, AlignOutput& output, ErrorInfo* error = nullptr);
 
-std::vector<int32_t> tokenize(State* state, const std::string& text, std::vector<std::string>& words);
-std::string decode_token(State* state, int32_t token_id);
-std::vector<int32_t> build_token_sequence(State* state, int n_audio_frames, const std::vector<int32_t>& text_tokens);
+std::vector<int32_t> tokenize_with_timestamps(State* state, const std::string& text, std::vector<std::string>& words, const std::string& language = "");
+std::vector<int32_t> build_token_sequence(State* state, int n_audio_pads, const std::vector<int32_t>& text_tokens);
 
-void clear_kv_cache(State* state);
-int get_kv_cache_used(State* state);
-int get_kv_cache_capacity(State* state);
+bool load_korean_dict(State* state, const std::string& dict_path);
+
+std::vector<int32_t> extract_timestamp_classes(const Output& output, const std::vector<int32_t>& tokens, int timestamp_token_id);
+std::vector<int32_t> fix_timestamp_classes(const std::vector<int32_t>& classes);
+std::vector<float> classes_to_timestamps(const std::vector<int32_t>& classes, float segment_time_sec);
+
+
 
 const char* get_device_name(State* state);
 HyperParams get_hparams(State* state);

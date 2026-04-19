@@ -15,64 +15,24 @@
 #include <iomanip>
 #include <cctype>
 #include <cmath>
+#include <chrono>
 
 using namespace asr;
 
-static bool is_cjk(uint32_t cp) {
-    return (cp >= 0x4E00 && cp <= 0x9FFF) ||
-           (cp >= 0x3400 && cp <= 0x4DBF) ||
-           (cp >= 0x20000 && cp <= 0x2A6DF);
-}
-
-static std::vector<uint32_t> utf8_to_codepoints(const std::string& s) {
-    std::vector<uint32_t> cps;
-    size_t i = 0;
-    while (i < s.size()) {
-        uint32_t cp = 0;
-        uint8_t c = s[i];
-        if ((c & 0x80) == 0) {
-            cp = c; i += 1;
-        } else if ((c & 0xE0) == 0xC0) {
-            if (i + 1 < s.size()) {
-                cp = ((c & 0x1F) << 6) | (s[i+1] & 0x3F);
-                i += 2;
-            } else i += 1;
-        } else if ((c & 0xF0) == 0xE0) {
-            if (i + 2 < s.size()) {
-                cp = ((c & 0x0F) << 12) | ((s[i+1] & 0x3F) << 6) | (s[i+2] & 0x3F);
-                i += 3;
-            } else i += 1;
-        } else if ((c & 0xF8) == 0xF0) {
-            if (i + 3 < s.size()) {
-                cp = ((c & 0x07) << 18) | ((s[i+1] & 0x3F) << 12) | ((s[i+2] & 0x3F) << 6) | (s[i+3] & 0x3F);
-                i += 4;
-            } else i += 1;
-        } else {
-            i += 1;
-        }
-        cps.push_back(cp);
+static std::string strip_asr_language_prefix(const std::string& text) {
+    if (text.empty()) return text;
+    size_t start = 0;
+    while (start < text.size() && (text[start] == ' ' || text[start] == '\t')) ++start;
+    if (start < text.size() && text.compare(start, 8, "language") == 0) {
+        size_t after_lang = start + 8;
+        while (after_lang < text.size() && text[after_lang] == ' ') ++after_lang;
+        size_t name_end = after_lang;
+        while (name_end < text.size() && text[name_end] != ' ' && text[name_end] != '\n') ++name_end;
+        size_t text_start = name_end;
+        while (text_start < text.size() && (text[text_start] == ' ' || text[text_start] == '\t' || text[text_start] == '\n')) ++text_start;
+        return text.substr(text_start);
     }
-    return cps;
-}
-
-static std::string codepoint_to_utf8(uint32_t cp) {
-    std::string s;
-    if (cp < 0x80) {
-        s = char(cp);
-    } else if (cp < 0x800) {
-        s = char(0xC0 | (cp >> 6));
-        s += char(0x80 | (cp & 0x3F));
-    } else if (cp < 0x10000) {
-        s = char(0xE0 | (cp >> 12));
-        s += char(0x80 | ((cp >> 6) & 0x3F));
-        s += char(0x80 | (cp & 0x3F));
-    } else {
-        s = char(0xF0 | (cp >> 18));
-        s += char(0x80 | ((cp >> 12) & 0x3F));
-        s += char(0x80 | ((cp >> 6) & 0x3F));
-        s += char(0x80 | (cp & 0x3F));
-    }
-    return s;
+    return text;
 }
 
 struct CliConfig {
@@ -179,7 +139,7 @@ void output_text(const std::string& language, const std::string& text, const std
     }
 }
 
-void output_json(const std::string& language, const std::string& text, int n_tokens, const std::vector<aligner::decoder::AlignedWord>& words) {
+void output_json(const std::string& language, const std::string& text, int n_tokens, const std::vector<aligner::decoder::AlignedWord>& words, float audio_duration) {
     printf("{\n");
     printf("  \"language\": \"%s\",\n", escape_json(language).c_str());
     printf("  \"text\": \"%s\",\n", escape_json(text).c_str());
@@ -196,7 +156,7 @@ void output_json(const std::string& language, const std::string& text, int n_tok
         printf("  ],\n");
     }
     
-    printf("  \"audio_duration\": %.3f\n", words.empty() ? 0.0f : words.back().end);
+    printf("  \"audio_duration\": %.3f\n", audio_duration);
     printf("}\n");
 }
 
@@ -223,8 +183,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    float audio_duration = (float)audio_samples.size() / sample_rate;
-    printf("Audio: %zu samples, %d Hz, %.2f seconds\n", audio_samples.size(), sample_rate, audio_duration);
+    float audio_len_sec = (float)audio_samples.size() / sample_rate;
+    printf("Audio: %zu samples, %d Hz, %.2f seconds\n", audio_samples.size(), sample_rate, audio_len_sec);
     
     printf("\n--- Step 2: Compute mel spectrogram ---\n");
     mel::Config mel_config;
@@ -241,11 +201,14 @@ int main(int argc, char** argv) {
     std::string transcribe_lang;
     int transcribe_n_tokens = 0;
     std::vector<aligner::decoder::AlignedWord> aligned_words;
+    float audio_duration = 0.0f;
     
     transcribe::decoder::State* dec_state = nullptr;
     
     if (!config.align_only) {
         printf("\n--- Step 3: Initialize ASR modules ---\n");
+        
+        auto t3_start = std::chrono::high_resolution_clock::now();
         
         transcribe::encoder::Config enc_config;
         enc_config.model_path = config.model_path;
@@ -275,7 +238,13 @@ int main(int argc, char** argv) {
         auto dec_hparams = transcribe::decoder::get_hparams(dec_state);
         printf("Transcribe decoder initialized (vocab=%d, hidden=%d)\n", dec_hparams.vocab_size, dec_hparams.hidden_size);
         
+        auto t3_end = std::chrono::high_resolution_clock::now();
+        double init_ms = std::chrono::duration<double, std::milli>(t3_end - t3_start).count();
+        printf("[Timing] Init (encoder+decoder load): %.1f ms\n", init_ms);
+        
         printf("\n--- Step 4: Transcribe ---\n");
+        
+        auto t4_enc_start = std::chrono::high_resolution_clock::now();
         
         transcribe::encoder::BatchInput enc_input;
         enc_input.mel_data.push_back(mel_spec.data.data());
@@ -293,6 +262,12 @@ int main(int argc, char** argv) {
         
         auto& audio_features = enc_output.features[0];
         printf("Audio features: hidden=%d, frames=%d\n", audio_features.hidden_size, audio_features.n_frames);
+        
+        auto t4_enc_end = std::chrono::high_resolution_clock::now();
+        double enc_ms = std::chrono::duration<double, std::milli>(t4_enc_end - t4_enc_start).count();
+        printf("[Timing] Audio encode: %.1f ms\n", enc_ms);
+        
+        auto t4_dec_start = std::chrono::high_resolution_clock::now();
         
         transcribe::decoder::TranscribeInput transcribe_in;
         transcribe_in.audio_features = audio_features.data.data();
@@ -317,6 +292,10 @@ int main(int argc, char** argv) {
         
         printf("Generated %d tokens\n", transcribe_n_tokens);
         
+        auto t4_dec_end = std::chrono::high_resolution_clock::now();
+        double dec_ms = std::chrono::duration<double, std::milli>(t4_dec_end - t4_dec_start).count();
+        printf("[Timing] Text decode: %.1f ms (%.2f ms/token)\n", dec_ms, dec_ms / transcribe_n_tokens);
+        
         // Free encoder immediately, but keep decoder for alignment tokenization
         transcribe::encoder::free(enc_state);
         
@@ -331,6 +310,7 @@ int main(int argc, char** argv) {
     
     if (!config.transcribe_only) {
         printf("\n--- Step 5: Initialize Aligner modules ---\n");
+        auto t5_start = std::chrono::high_resolution_clock::now();
         
         aligner::encoder::Config align_enc_config;
         align_enc_config.model_path = config.aligner_model_path;
@@ -359,8 +339,11 @@ int main(int argc, char** argv) {
         auto align_hparams = aligner::decoder::get_hparams(align_dec_state);
         printf("Aligner decoder initialized (classify_head_size=%d, segment_time=%dms)\n",
                align_hparams.classify_head_size, align_hparams.timestamp_segment_time_ms);
+        auto t5_end = std::chrono::high_resolution_clock::now();
+        printf("[Timing] Aligner init: %.1f ms\n", std::chrono::duration<double, std::milli>(t5_end - t5_start).count());
         
         printf("\n--- Step 6: Encode for alignment ---\n");
+        auto t6_start = std::chrono::high_resolution_clock::now();
         
         aligner::encoder::BatchInput align_enc_input;
         align_enc_input.mel_data.push_back(mel_spec.data.data());
@@ -378,120 +361,44 @@ int main(int argc, char** argv) {
         
         auto& align_features = align_enc_output.features[0];
         printf("Aligner features: hidden=%d, frames=%d\n", align_features.hidden_size, align_features.n_frames);
+        auto t6_end = std::chrono::high_resolution_clock::now();
+        printf("[Timing] Aligner encode: %.1f ms\n", std::chrono::duration<double, std::milli>(t6_end - t6_start).count());
         
         printf("\n--- Step 7: Align ---\n");
-        printf("Text to align: %s\n", transcribe_text.c_str());
+        auto t7_start = std::chrono::high_resolution_clock::now();
+        std::string align_text = strip_asr_language_prefix(transcribe_text);
+        printf("Text to align: %s (lang: %s)\n", align_text.c_str(), transcribe_lang.c_str());
         
-        // Use transcribe decoder's tokenizer (same tokenizer as aligner)
-        std::vector<std::string> words;
-        std::vector<int32_t> text_tokens;
-        if (!config.align_only && dec_state) {
-            // We have transcribe decoder, use its tokenizer
-            // Get tokens from transcribe output and decode them
-            text_tokens = transcribe::decoder::tokenize(dec_state, transcribe_text);
-            
-            // Build words from text (simple char-level for CJK)
-            auto cps = utf8_to_codepoints(transcribe_text);
-            std::string latin_seq;
-            for (auto cp : cps) {
-                if (is_cjk(cp)) {
-                    if (!latin_seq.empty()) {
-                        words.push_back(latin_seq);
-                        latin_seq.clear();
-                    }
-                    words.push_back(codepoint_to_utf8(cp));
-                } else if (cp < 0x80 && (isalpha(cp) || cp == '\'')) {
-                    latin_seq += char(cp);
-                } else {
-                    if (!latin_seq.empty()) {
-                        words.push_back(latin_seq);
-                        latin_seq.clear();
-                    }
-                    if (cp < 0x80 && !isspace(cp)) {
-                        words.push_back(codepoint_to_utf8(cp));
-                    }
-                }
-            }
-            if (!latin_seq.empty()) {
-                words.push_back(latin_seq);
-            }
-        } else {
-            // Align-only mode: need separate tokenizer
-            // For now, use simple char-level tokenization
-            auto cps = utf8_to_codepoints(transcribe_text);
-            for (auto cp : cps) {
-                std::string ch = codepoint_to_utf8(cp);
-                if (!isspace(cp)) {
-                    words.push_back(ch);
-                }
-            }
-            // This will likely fail for align-only mode without proper BPE tokenizer
-            fprintf(stderr, "Warning: Align-only mode may not work correctly without proper BPE tokenizer\n");
-        }
+        aligner::decoder::AlignInput align_in;
+        align_in.audio_features = align_features.data.data();
+        align_in.n_audio_frames = align_features.n_frames;
+        align_in.audio_feature_dim = align_features.hidden_size;
+        align_in.n_mel_frames = mel_spec.n_frames;
+        align_in.text = align_text;
+        align_in.language = transcribe_lang;
+        align_in.n_samples = (int)audio_samples.size();
+        align_in.sample_rate = sample_rate;
         
-        if (text_tokens.empty()) {
-            fprintf(stderr, "Error: Failed to tokenize text for alignment\n");
+        aligner::decoder::AlignOutput align_out;
+        if (!aligner::decoder::align(align_dec_state, align_in, align_out, &error)) {
+            fprintf(stderr, "Error: Alignment failed: %s\n", error.message.c_str());
             aligner::decoder::free(align_dec_state);
             aligner::encoder::free(align_enc_state);
             return 1;
         }
         
-        printf("Tokenized: %zu tokens, %zu words\n", text_tokens.size(), words.size());
-        
-        // Build alignment input manually
-        std::vector<int32_t> align_tokens = aligner::decoder::build_token_sequence(
-            align_dec_state, align_features.n_frames, text_tokens);
-        
-        int audio_start_pos = 0;
-        for (size_t i = 0; i < align_tokens.size(); ++i) {
-            if (align_tokens[i] == align_hparams.audio_start_token_id) {
-                audio_start_pos = i + 1;
-                break;
-            }
-        }
-        
-        aligner::decoder::Input dec_input;
-        dec_input.tokens = align_tokens.data();
-        dec_input.n_tokens = align_tokens.size();
-        dec_input.audio_features = align_features.data.data();
-        dec_input.n_audio_frames = align_features.n_frames;
-        dec_input.audio_start_pos = audio_start_pos;
-        
-        aligner::decoder::Output dec_output;
-        if (!aligner::decoder::decode(align_dec_state, dec_input, dec_output, &error)) {
-            fprintf(stderr, "Error: Alignment decode failed: %s\n", error.message.c_str());
-            aligner::decoder::free(align_dec_state);
-            aligner::encoder::free(align_enc_state);
-            return 1;
-        }
-        
-        // Convert timestamps to words
-        float segment_time = align_hparams.timestamp_segment_time_ms / 1000.0f;
-        int token_idx = align_features.n_frames + 2;
-        
-        for (size_t w = 0; w < words.size() && w < text_tokens.size(); ++w) {
-            if (token_idx + 1 >= (int)dec_output.timestamp_indices.size()) break;
-            
-            int ts_idx = token_idx + 1;
-            int ts_class = dec_output.timestamp_indices[ts_idx];
-            
-            aligner::decoder::AlignedWord aw;
-            aw.word = words[w];
-            aw.start = ts_class * segment_time;
-            aw.end = aw.start + segment_time;
-            
-            aligned_words.push_back(aw);
-            token_idx += 2;
-        }
-        
-        printf("Aligned %zu words\n", aligned_words.size());
+        aligned_words = align_out.words;
+        audio_duration = align_out.audio_duration;
+        printf("Aligned %zu words, audio duration: %.2f sec\n", aligned_words.size(), audio_duration);
+        auto t7_end = std::chrono::high_resolution_clock::now();
+        printf("[Timing] Align decode: %.1f ms\n", std::chrono::duration<double, std::milli>(t7_end - t7_start).count());
         
         aligner::decoder::free(align_dec_state);
         aligner::encoder::free(align_enc_state);
     }
     
     if (config.json_output) {
-        output_json(transcribe_lang, transcribe_text, transcribe_n_tokens, aligned_words);
+        output_json(transcribe_lang, transcribe_text, transcribe_n_tokens, aligned_words, audio_duration);
     } else {
         output_text(transcribe_lang, transcribe_text, aligned_words);
     }
@@ -516,7 +423,7 @@ int main(int argc, char** argv) {
                     }
                     out_file << "  ],\n";
                 }
-                out_file << "  \"audio_duration\": " << (aligned_words.empty() ? audio_duration : aligned_words.back().end) << "\n";
+                out_file << "  \"audio_duration\": " << std::fixed << std::setprecision(3) << audio_duration << "\n";
                 out_file << "}\n";
             } else {
                 out_file << "Language: " << transcribe_lang << "\n";

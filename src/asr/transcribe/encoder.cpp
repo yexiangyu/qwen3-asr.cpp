@@ -71,15 +71,15 @@ bool load_model(const char* path, EncoderModel& model, ErrorInfo* error) {
         return idx < 0 ? def : (int32_t)gguf_get_val_u32(ctx_gguf, idx);
     };
     
-    model.hparams.n_encoder_layers = get_u32("audio.encoder_layers", 18);
-    model.hparams.d_model = get_u32("audio.d_model", 896);
-    model.hparams.n_attention_heads = get_u32("audio.attention_heads", 14);
-    model.hparams.n_mel_bins = get_u32("audio.num_mel_bins", 128);
-    model.hparams.hidden_size = get_u32("text.hidden_size", 1024);
-    model.hparams.head_dim = get_u32("audio.head_dim", 64);
-    model.hparams.ff_dim = get_u32("audio.ffn_dim", 3584);
-    model.hparams.conv_channels = get_u32("audio.conv_channels", 480);
-    model.hparams.conv_out_dim = get_u32("audio.conv_out_dim", 896);
+    model.hparams.n_encoder_layers = get_u32("qwen3_asr.audio.encoder_layers", get_u32("audio.encoder_layers", 18));
+    model.hparams.d_model = get_u32("qwen3_asr.audio.d_model", get_u32("audio.d_model", 896));
+    model.hparams.n_attention_heads = get_u32("qwen3_asr.audio.encoder_attention_heads", get_u32("audio.attention_heads", 14));
+    model.hparams.n_mel_bins = get_u32("qwen3_asr.audio.num_mel_bins", get_u32("audio.num_mel_bins", 128));
+    model.hparams.hidden_size = get_u32("qwen3_asr.audio.output_dim", get_u32("audio.output_dim", get_u32("text.hidden_size", 1024)));
+    model.hparams.head_dim = model.hparams.d_model / model.hparams.n_attention_heads;
+    model.hparams.ff_dim = get_u32("qwen3_asr.audio.encoder_ffn_dim", get_u32("audio.ffn_dim", 3584));
+    model.hparams.conv_channels = get_u32("qwen3_asr.audio.conv_channels", get_u32("audio.conv_channels", 480));
+    model.hparams.conv_out_dim = get_u32("qwen3_asr.audio.conv_out_dim", get_u32("audio.conv_out_dim", model.hparams.d_model));
     
     model.layers.resize(model.hparams.n_encoder_layers);
     
@@ -87,43 +87,44 @@ bool load_model(const char* path, EncoderModel& model, ErrorInfo* error) {
         const char* name = ggml_get_name(t);
         model.tensors[name] = t;
         
-        if (strstr(name, "encoder.conv1.weight") || strstr(name, "audio.encoder.conv1.weight")) model.conv1_w = t;
-        else if (strstr(name, "encoder.conv1.bias") || strstr(name, "audio.encoder.conv1.bias")) model.conv1_b = t;
-        else if (strstr(name, "encoder.conv2.weight") || strstr(name, "audio.encoder.conv2.weight")) model.conv2_w = t;
-        else if (strstr(name, "encoder.conv2.bias") || strstr(name, "audio.encoder.conv2.bias")) model.conv2_b = t;
-        else if (strstr(name, "encoder.conv3.weight") || strstr(name, "audio.encoder.conv3.weight")) model.conv3_w = t;
-        else if (strstr(name, "encoder.conv3.bias") || strstr(name, "audio.encoder.conv3.bias")) model.conv3_b = t;
-        else if (strstr(name, "encoder.conv_out.weight") || strstr(name, "audio.encoder.conv_out.weight")) model.conv_out_w = t;
-        else if (strstr(name, "encoder.ln_post.weight") || strstr(name, "audio.encoder.ln_post.weight")) model.ln_post_w = t;
-        else if (strstr(name, "encoder.ln_post.bias") || strstr(name, "audio.encoder.ln_post.bias")) model.ln_post_b = t;
-        else if (strstr(name, "encoder.proj1.weight") || strstr(name, "audio.encoder.proj1.weight")) model.proj1_w = t;
-        else if (strstr(name, "encoder.proj1.bias") || strstr(name, "audio.encoder.proj1.bias")) model.proj1_b = t;
-        else if (strstr(name, "encoder.proj2.weight") || strstr(name, "audio.encoder.proj2.weight")) model.proj2_w = t;
-        else if (strstr(name, "encoder.proj2.bias") || strstr(name, "audio.encoder.proj2.bias")) model.proj2_b = t;
+        if (strstr(name, "conv2d1.weight") || strstr(name, "conv1.weight")) model.conv1_w = t;
+        else if (strstr(name, "conv2d1.bias") || strstr(name, "conv1.bias")) model.conv1_b = t;
+        else if (strstr(name, "conv2d2.weight") || strstr(name, "conv2.weight")) model.conv2_w = t;
+        else if (strstr(name, "conv2d2.bias") || strstr(name, "conv2.bias")) model.conv2_b = t;
+        else if (strstr(name, "conv2d3.weight") || strstr(name, "conv3.weight")) model.conv3_w = t;
+        else if (strstr(name, "conv2d3.bias") || strstr(name, "conv3.bias")) model.conv3_b = t;
+        else if (strstr(name, "conv_out.weight")) model.conv_out_w = t;
+        else if (strstr(name, "ln_post.weight")) model.ln_post_w = t;
+        else if (strstr(name, "ln_post.bias")) model.ln_post_b = t;
+        else if (strstr(name, "proj1.weight")) model.proj1_w = t;
+        else if (strstr(name, "proj1.bias")) model.proj1_b = t;
+        else if (strstr(name, "proj2.weight")) model.proj2_w = t;
+        else if (strstr(name, "proj2.bias")) model.proj2_b = t;
         
-        if (strstr(name, "encoder.blk.") || strstr(name, "audio.encoder.blk.")) {
-            for (int l = 0; l < model.hparams.n_encoder_layers; l++) {
-                char pattern[64];
-                snprintf(pattern, sizeof(pattern), ".blk.%d.", l);
-                if (strstr(name, pattern)) {
-                    auto& layer = model.layers[l];
-                    if (strstr(name, "attn_q.weight")) layer.attn_q_w = t;
-                    else if (strstr(name, "attn_q.bias")) layer.attn_q_b = t;
-                    else if (strstr(name, "attn_k.weight")) layer.attn_k_w = t;
-                    else if (strstr(name, "attn_k.bias")) layer.attn_k_b = t;
-                    else if (strstr(name, "attn_v.weight")) layer.attn_v_w = t;
-                    else if (strstr(name, "attn_v.bias")) layer.attn_v_b = t;
-                    else if (strstr(name, "attn_out.weight")) layer.attn_out_w = t;
-                    else if (strstr(name, "attn_out.bias")) layer.attn_out_b = t;
-                    else if (strstr(name, "attn_norm.weight")) layer.attn_norm_w = t;
-                    else if (strstr(name, "attn_norm.bias")) layer.attn_norm_b = t;
-                    else if (strstr(name, "ffn_up.weight")) layer.ffn_up_w = t;
-                    else if (strstr(name, "ffn_up.bias")) layer.ffn_up_b = t;
-                    else if (strstr(name, "ffn_down.weight")) layer.ffn_down_w = t;
-                    else if (strstr(name, "ffn_down.bias")) layer.ffn_down_b = t;
-                    else if (strstr(name, "ffn_norm.weight")) layer.ffn_norm_w = t;
-                    else if (strstr(name, "ffn_norm.bias")) layer.ffn_norm_b = t;
-                    break;
+        if (strstr(name, "layers.") || strstr(name, "encoder.blk.")) {
+            int layer_idx = -1;
+            if (sscanf(name, "thinker.audio_tower.layers.%d.", &layer_idx) == 1 ||
+                sscanf(name, "audio_tower.layers.%d.", &layer_idx) == 1 ||
+                sscanf(name, "audio.encoder.blk.%d.", &layer_idx) == 1 ||
+                sscanf(name, "encoder.blk.%d.", &layer_idx) == 1) {
+                if (layer_idx >= 0 && layer_idx < model.hparams.n_encoder_layers) {
+                    auto& layer = model.layers[layer_idx];
+                    if (strstr(name, "q_proj.weight") || strstr(name, "attn_q.weight")) layer.attn_q_w = t;
+                    else if (strstr(name, "q_proj.bias") || strstr(name, "attn_q.bias")) layer.attn_q_b = t;
+                    else if (strstr(name, "k_proj.weight") || strstr(name, "attn_k.weight")) layer.attn_k_w = t;
+                    else if (strstr(name, "k_proj.bias") || strstr(name, "attn_k.bias")) layer.attn_k_b = t;
+                    else if (strstr(name, "v_proj.weight") || strstr(name, "attn_v.weight")) layer.attn_v_w = t;
+                    else if (strstr(name, "v_proj.bias") || strstr(name, "attn_v.bias")) layer.attn_v_b = t;
+                    else if (strstr(name, "out_proj.weight") || strstr(name, "attn_out.weight")) layer.attn_out_w = t;
+                    else if (strstr(name, "out_proj.bias") || strstr(name, "attn_out.bias")) layer.attn_out_b = t;
+                    else if (strstr(name, "self_attn_layer_norm.weight") || strstr(name, "attn_norm.weight")) layer.attn_norm_w = t;
+                    else if (strstr(name, "self_attn_layer_norm.bias") || strstr(name, "attn_norm.bias")) layer.attn_norm_b = t;
+                    else if (strstr(name, "fc1.weight") || strstr(name, "ffn_up.weight")) layer.ffn_up_w = t;
+                    else if (strstr(name, "fc1.bias") || strstr(name, "ffn_up.bias")) layer.ffn_up_b = t;
+                    else if (strstr(name, "fc2.weight") || strstr(name, "ffn_down.weight")) layer.ffn_down_w = t;
+                    else if (strstr(name, "fc2.bias") || strstr(name, "ffn_down.bias")) layer.ffn_down_b = t;
+                    else if (strstr(name, "final_layer_norm.weight") || strstr(name, "ffn_norm.weight")) layer.ffn_norm_w = t;
+                    else if (strstr(name, "final_layer_norm.bias") || strstr(name, "ffn_norm.bias")) layer.ffn_norm_b = t;
                 }
             }
         }
@@ -142,7 +143,7 @@ bool load_model(const char* path, EncoderModel& model, ErrorInfo* error) {
     model.mmap_addr = mmap_addr;
     model.mmap_size = st.st_size;
     
-    size_t data_offset = gguf_get_data_offset(ctx_gguf);
+size_t data_offset = gguf_get_data_offset(ctx_gguf);
     uint8_t* data_base = (uint8_t*)mmap_addr + data_offset;
     
     model.buffer = ggml_backend_alloc_ctx_tensors_from_buft(model.ctx, get_preferred_buft());
@@ -222,6 +223,16 @@ HyperParams get_hparams(EncoderState* state) {
     return state && state->model ? state->model->hparams : HyperParams();
 }
 
+static ggml_tensor* conv_2d_via_im2col(ggml_context* ctx, ggml_tensor* kernel, ggml_tensor* input, int s0, int s1, int p0, int p1, int d0, int d1) {
+    ggml_tensor* im2col_out = ggml_im2col(ctx, kernel, input, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F16);
+    ggml_tensor* result = ggml_mul_mat(ctx,
+        ggml_reshape_2d(ctx, im2col_out, im2col_out->ne[0], im2col_out->ne[3] * im2col_out->ne[2] * im2col_out->ne[1]),
+        ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]));
+    result = ggml_reshape_4d(ctx, result, im2col_out->ne[1], im2col_out->ne[2], im2col_out->ne[3], kernel->ne[3]);
+    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2));
+    return result;
+}
+
 static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, int batch_size) {
     EncoderModel& m = *state->model;
     int n_mel = m.hparams.n_mel_bins;
@@ -234,15 +245,15 @@ static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, in
     ggml_tensor* mel_batch = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_frames, n_mel, 1, batch_size);
     ggml_set_name(mel_batch, "mel_batch"); ggml_set_input(mel_batch);
     
-    ggml_tensor* cur = ggml_conv_2d(ctx, m.conv1_w, mel_batch, 2, 2, 1, 1, 1, 1);
+    ggml_tensor* cur = conv_2d_via_im2col(ctx, m.conv1_w, mel_batch, 2, 2, 1, 1, 1, 1);
     if (m.conv1_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv1_b, 1, 1, conv_ch, 1));
     cur = ggml_gelu(ctx, cur);
     
-    cur = ggml_conv_2d(ctx, m.conv2_w, cur, 2, 2, 1, 1, 1, 1);
+    cur = conv_2d_via_im2col(ctx, m.conv2_w, cur, 2, 2, 1, 1, 1, 1);
     if (m.conv2_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2_b, 1, 1, conv_ch, 1));
     cur = ggml_gelu(ctx, cur);
     
-    cur = ggml_conv_2d(ctx, m.conv3_w, cur, 2, 2, 1, 1, 1, 1);
+    cur = conv_2d_via_im2col(ctx, m.conv3_w, cur, 2, 2, 1, 1, 1, 1);
     if (m.conv3_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv3_b, 1, 1, conv_ch, 1));
     cur = ggml_gelu(ctx, cur);
     
