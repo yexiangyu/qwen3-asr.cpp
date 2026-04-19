@@ -571,6 +571,25 @@ if(QWEN3_ASR_BUILD_TESTS)
         target_link_libraries(test_e2e_batch_transcribe PRIVATE ggml-cuda CUDA::cudart)
     endif()
     
+    # Test batch performance comparison
+    add_executable(test_batch_performance tests/test_batch_performance.cpp)
+    target_include_directories(test_batch_performance PRIVATE ${GGML_DIR}/include)
+    target_link_directories(test_batch_performance PRIVATE ${GGML_BUILD_DIR}/src)
+    target_link_libraries(test_batch_performance PRIVATE
+        asr_transcribe_encoder
+        asr_transcribe_decoder
+        asr_mel
+        asr_codec
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_batch_performance PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_batch_performance PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+    
     # Test aligner encoder module
     add_executable(test_aligner_encoder tests/test_aligner_encoder.cpp)
     target_include_directories(test_aligner_encoder PRIVATE ${GGML_DIR}/include)
