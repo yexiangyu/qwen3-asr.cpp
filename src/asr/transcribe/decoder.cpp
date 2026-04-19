@@ -2095,7 +2095,53 @@ static ggml_cgraph* build_batch_decode_graph(
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur_slice, v_cache_view));
         }
         
-        cur = inpL;
+        struct ggml_tensor* attn_layer_out = nullptr;
+        
+        for (int bs = 0; bs < batch_size; ++bs) {
+            auto& slot = state->unified_cache.slots[active_slots[bs]];
+            int kv_len = slot.n_used + 1;
+            
+            struct ggml_tensor* Q_slot = ggml_view_3d(ctx0, Qcur,
+                head_dim, n_head, 1,
+                Qcur->nb[1], Qcur->nb[2],
+                bs * Qcur->nb[2]);
+            
+            struct ggml_tensor* K_slot = ggml_view_3d(ctx0, k_cache,
+                head_dim, n_kv_head, kv_len,
+                k_cache->nb[1], k_cache->nb[2],
+                slot.start_pos * k_cache->nb[2]);
+            
+            struct ggml_tensor* V_slot = ggml_view_3d(ctx0, v_cache,
+                head_dim, n_kv_head, kv_len,
+                v_cache->nb[1], v_cache->nb[2],
+                slot.start_pos * v_cache->nb[2]);
+            
+            Q_slot = ggml_permute(ctx0, Q_slot, 0, 2, 1, 3);
+            K_slot = ggml_permute(ctx0, K_slot, 0, 2, 1, 3);
+            V_slot = ggml_permute(ctx0, V_slot, 0, 2, 1, 3);
+            
+            struct ggml_tensor* attn_result = ggml_flash_attn_ext(ctx0, Q_slot, K_slot, V_slot, nullptr, KQscale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn_result, GGML_PREC_F32);
+            attn_result = ggml_reshape_2d(ctx0, attn_result, n_head * head_dim, 1);
+            
+            attn_result = ggml_mul_mat(ctx0, layer.attn_out, attn_result);
+            
+            struct ggml_tensor* inpL_view = ggml_view_2d(ctx0, inpL,
+                hidden_size, 1,
+                inpL->nb[1],
+                bs * inpL->nb[1]);
+            
+            attn_result = ggml_add(ctx0, attn_result, inpL_view);
+            
+            if (bs == 0) {
+                attn_layer_out = ggml_cont(ctx0, attn_result);
+            } else {
+                attn_layer_out = ggml_concat(ctx0, attn_layer_out, attn_result, 1);
+            }
+        }
+        
+        cur = attn_layer_out;
+        struct ggml_tensor* inpFF = cur;
         cur = ggml_rms_norm(ctx0, cur, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
         
@@ -2108,7 +2154,7 @@ static ggml_cgraph* build_batch_decode_graph(
         
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
         
-        inpL = ggml_add(ctx0, cur, inpL);
+        inpL = ggml_add(ctx0, cur, inpFF);
     }
     
     cur = inpL;

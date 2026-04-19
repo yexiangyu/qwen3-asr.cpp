@@ -472,23 +472,6 @@ if(GGML_CUDA_FOUND)
     target_link_libraries(asr-cli PRIVATE ggml-cuda CUDA::cudart)
 endif()
 
-# Debug comparison tool
-add_executable(debug-compare src/tools/debug_compare.cpp)
-target_link_libraries(debug-compare PRIVATE
-    asr_codec
-    asr_mel
-    asr_transcribe_encoder
-    asr_transcribe_decoder
-    ggml
-    ggml-base
-    ggml-cpu
-    Threads::Threads
-)
-if(GGML_CUDA_FOUND)
-    target_link_directories(debug-compare PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
-    target_link_libraries(debug-compare PRIVATE ggml-cuda CUDA::cudart)
-endif()
-
 # Test executables (controlled by QWEN3_ASR_BUILD_TESTS option)
 option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
 
@@ -567,6 +550,25 @@ if(QWEN3_ASR_BUILD_TESTS)
     if(GGML_CUDA_FOUND)
         target_link_directories(test_batch_decode PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
         target_link_libraries(test_batch_decode PRIVATE ggml-cuda CUDA::cudart)
+    endif()
+    
+    # Test end-to-end batch transcribe
+    add_executable(test_e2e_batch_transcribe tests/test_e2e_batch_transcribe.cpp)
+    target_include_directories(test_e2e_batch_transcribe PRIVATE ${GGML_DIR}/include)
+    target_link_directories(test_e2e_batch_transcribe PRIVATE ${GGML_BUILD_DIR}/src)
+    target_link_libraries(test_e2e_batch_transcribe PRIVATE
+        asr_transcribe_encoder
+        asr_transcribe_decoder
+        asr_mel
+        asr_codec
+        ggml
+        ggml-base
+        ggml-cpu
+        Threads::Threads
+    )
+    if(GGML_CUDA_FOUND)
+        target_link_directories(test_e2e_batch_transcribe PRIVATE ${GGML_BUILD_DIR}/src/ggml-cuda)
+        target_link_libraries(test_e2e_batch_transcribe PRIVATE ggml-cuda CUDA::cudart)
     endif()
     
     # Test aligner encoder module
