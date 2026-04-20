@@ -11,6 +11,15 @@
 #include <mutex>
 #include <cassert>
 
+#ifdef QWEN3_ASR_USE_CUFFT
+#include <cuda_runtime.h>
+#include <cufft.h>
+#endif
+
+#ifdef QWEN3_ASR_USE_FFTW
+#include <fftw3.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -102,23 +111,7 @@ static void dft(const float* in, int N, float* out) {
     }
 }
 
-static void bit_reverse_permute(float* data, int N) {
-    int j = 0;
-    for (int i = 0; i < N - 1; i++) {
-        if (i < j) {
-            std::swap(data[2 * i + 0], data[2 * j + 0]);
-            std::swap(data[2 * i + 1], data[2 * j + 1]);
-        }
-        int m = N >> 1;
-        while (m >= 1 && j >= m) {
-            j -= m;
-            m >>= 1;
-        }
-        j += m;
-    }
-}
-
-static void fft_iterative(const float* in, int N, float* out, float* /*workspace*/) {
+static void fft_iterative(const float* in, int N, float* out) {
     if (N == 1) {
         out[0] = in[0];
         out[1] = 0;
@@ -142,7 +135,16 @@ static void fft_iterative(const float* in, int N, float* out, float* /*workspace
         out[2 * i + 1] = 0.0f;
     }
 
-    bit_reverse_permute(out, N);
+    int j = 0;
+    for (int i = 0; i < N - 1; i++) {
+        if (i < j) {
+            std::swap(out[2 * i + 0], out[2 * j + 0]);
+            std::swap(out[2 * i + 1], out[2 * j + 1]);
+        }
+        int m = N >> 1;
+        while (m >= 1 && j >= m) { j -= m; m >>= 1; }
+        j += m;
+    }
 
     for (int s = 1; s <= log2_N; s++) {
         int m = 1 << s;
@@ -153,11 +155,11 @@ static void fft_iterative(const float* in, int N, float* out, float* /*workspace
         for (int k = 0; k < N; k += m) {
             float w_re = 1.0f;
             float w_im = 0.0f;
-            for (int j = 0; j < half_m; j++) {
-                int t0 = 2 * (k + j) + 0;
-                int t1 = 2 * (k + j) + 1;
-                int u0 = 2 * (k + j + half_m) + 0;
-                int u1 = 2 * (k + j + half_m) + 1;
+            for (int jj = 0; jj < half_m; jj++) {
+                int t0 = 2 * (k + jj) + 0;
+                int t1 = 2 * (k + jj) + 1;
+                int u0 = 2 * (k + jj + half_m) + 0;
+                int u1 = 2 * (k + jj + half_m) + 1;
 
                 float tr = w_re * out[u0] - w_im * out[u1];
                 float ti = w_re * out[u1] + w_im * out[u0];
@@ -174,6 +176,160 @@ static void fft_iterative(const float* in, int N, float* out, float* /*workspace
             }
         }
     }
+}
+
+#ifdef QWEN3_ASR_USE_CUFFT
+static bool compute_mel_cufft(const std::vector<float>& samples_padded, int n_frames,
+                               int frame_size, int frame_step, int n_fft_bins,
+                               const Window& hann, float* power_all,
+                               const Config& /*config*/) {
+    int n = n_frames;
+    int fft_size = frame_size;
+    
+    std::vector<float> windowed_frames(n * fft_size);
+    for (int f = 0; f < n; f++) {
+        int offset = f * frame_step;
+        int valid_len = std::min(fft_size, static_cast<int>(samples_padded.size()) - offset);
+        for (int j = 0; j < valid_len; j++) {
+            windowed_frames[f * fft_size + j] = hann.data[j] * samples_padded[offset + j];
+        }
+        for (int j = valid_len; j < fft_size; j++) {
+            windowed_frames[f * fft_size + j] = 0.0f;
+        }
+    }
+    
+    cufftHandle plan;
+    cufftResult cufft_err = cufftPlan1d(&plan, fft_size, CUFFT_R2C, n);
+    if (cufft_err != CUFFT_SUCCESS) return false;
+    
+    float* d_in = nullptr;
+    cufftComplex* d_out = nullptr;
+    
+    cudaError_t cuda_err = cudaMalloc(&d_in, n * fft_size * sizeof(float));
+    if (cuda_err != cudaSuccess) { cufftDestroy(plan); return false; }
+    cuda_err = cudaMalloc(&d_out, n * (fft_size / 2 + 1) * sizeof(cufftComplex));
+    if (cuda_err != cudaSuccess) { cudaFree(d_in); cufftDestroy(plan); return false; }
+    
+    cuda_err = cudaMemcpy(d_in, windowed_frames.data(), n * fft_size * sizeof(float), cudaMemcpyHostToDevice);
+    if (cuda_err != cudaSuccess) { cudaFree(d_in); cudaFree(d_out); cufftDestroy(plan); return false; }
+    
+    cufft_err = cufftExecR2C(plan, d_in, d_out);
+    if (cufft_err != CUFFT_SUCCESS) {
+        cudaFree(d_in); cudaFree(d_out); cufftDestroy(plan); return false;
+    }
+    
+    cuda_err = cudaDeviceSynchronize();
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_in); cudaFree(d_out); cufftDestroy(plan); return false;
+    }
+    
+    std::vector<cufftComplex> gpu_out(n * (fft_size / 2 + 1));
+    cuda_err = cudaMemcpy(gpu_out.data(), d_out, gpu_out.size() * sizeof(cufftComplex), cudaMemcpyDeviceToHost);
+    
+    cufftDestroy(plan);
+    cudaFree(d_in);
+    cudaFree(d_out);
+    
+    if (cuda_err != cudaSuccess) return false;
+    
+    for (int f = 0; f < n; f++) {
+        for (int j = 0; j < n_fft_bins; j++) {
+            cufftComplex c = gpu_out[f * (fft_size / 2 + 1) + j];
+            float re = c.x;
+            float im = c.y;
+            power_all[j * n_frames + f] = re * re + im * im;
+        }
+    }
+    
+    return true;
+}
+#endif
+
+#ifdef QWEN3_ASR_USE_FFTW
+static bool compute_mel_fftw(const std::vector<float>& samples_padded, int n_frames,
+                              int frame_size, int frame_step, int n_fft_bins,
+                              const Window& hann, float* power_all,
+                              const Config& config) {
+    int n = n_frames;
+    int fft_size = frame_size;
+    int out_size = fft_size / 2 + 1;
+    
+    int n_array[] = {fft_size};
+    float* single_in = fftwf_alloc_real(fft_size);
+    fftwf_complex* single_out = fftwf_alloc_complex(out_size);
+    fftwf_plan plan = fftwf_plan_dft_r2c(1, n_array, single_in, single_out, FFTW_ESTIMATE);
+    
+    for (int f = 0; f < n; f++) {
+        int offset = f * frame_step;
+        int valid_len = std::min(fft_size, static_cast<int>(samples_padded.size()) - offset);
+        for (int j = 0; j < valid_len; j++) {
+            single_in[j] = hann.data[j] * samples_padded[offset + j];
+        }
+        for (int j = valid_len; j < fft_size; j++) {
+            single_in[j] = 0.0f;
+        }
+        
+        fftwf_execute_dft_r2c(plan, single_in, single_out);
+        
+        for (int j = 0; j < n_fft_bins; j++) {
+            float re = single_out[j][0];
+            float im = single_out[j][1];
+            power_all[j * n_frames + f] = re * re + im * im;
+        }
+    }
+    
+    fftwf_destroy_plan(plan);
+    fftwf_free(single_in);
+    fftwf_free(single_out);
+    
+    return true;
+}
+#endif
+
+static bool compute_mel_fallback(const std::vector<float>& samples_padded, int n_frames,
+                                  int frame_size, int frame_step, int n_fft_bins,
+                                  const Window& hann, float* power_all,
+                                  const Config& config) {
+    auto process_range = [&](int start, int end) {
+        std::vector<float> fft_in(frame_size);
+        std::vector<float> fft_out(frame_size * 2);
+        
+        for (int frame_idx = start; frame_idx < end; frame_idx++) {
+            int offset = frame_idx * frame_step;
+            
+            std::fill(fft_in.begin(), fft_in.end(), 0.0f);
+            
+            int valid_len = std::min(frame_size, static_cast<int>(samples_padded.size()) - offset);
+            for (int j = 0; j < valid_len; j++) {
+                fft_in[j] = hann.data[j] * samples_padded[offset + j];
+            }
+            
+            fft_iterative(fft_in.data(), frame_size, fft_out.data());
+            
+            for (int j = 0; j < n_fft_bins; j++) {
+                power_all[j * n_frames + frame_idx] = 
+                    fft_out[2 * j + 0] * fft_out[2 * j + 0] + 
+                    fft_out[2 * j + 1] * fft_out[2 * j + 1];
+            }
+        }
+    };
+    
+    std::vector<std::thread> threads;
+    int frames_per_thread = (n_frames + config.n_threads - 1) / config.n_threads;
+    
+    for (int t = 0; t < config.n_threads; t++) {
+        int start = t * frames_per_thread;
+        int end = std::min(start + frames_per_thread, n_frames);
+        if (start < n_frames) {
+            threads.emplace_back(process_range, start, end);
+        }
+    }
+    
+    for (auto& th : threads) {
+        th.join();
+    }
+    
+    return true;
 }
 
 static bool compute_impl(const Input& input, MelSpectrum& output, const Config& config, const Window& hann, const FilterBank& filters, ErrorInfo* error);
@@ -226,45 +382,24 @@ static bool compute_impl(const Input& input, MelSpectrum& output, const Config& 
     
     std::vector<float> power_all(n_fft_bins * n_frames, 0.0f);
     
-    std::vector<float> fft_workspace(frame_size * 2);
+    bool fft_ok = false;
+    
+#ifdef QWEN3_ASR_USE_CUFFT
+    fft_ok = compute_mel_cufft(samples_padded, n_frames, frame_size, frame_step, n_fft_bins, hann, power_all.data(), config);
+    if (fft_ok) goto fft_done;
+#endif
 
-    auto process_range = [&](int start, int end) {
-        std::vector<float> fft_in(frame_size);
-        std::vector<float> fft_out(frame_size * 2);
-        
-        for (int frame_idx = start; frame_idx < end; frame_idx++) {
-            int offset = frame_idx * frame_step;
-            
-            std::fill(fft_in.begin(), fft_in.end(), 0.0f);
-            
-            int valid_len = std::min(frame_size, static_cast<int>(samples_padded.size()) - offset);
-            for (int j = 0; j < valid_len; j++) {
-                fft_in[j] = hann.data[j] * samples_padded[offset + j];
-            }
-            
-            fft_iterative(fft_in.data(), frame_size, fft_out.data(), fft_workspace.data());
-            
-            for (int j = 0; j < n_fft_bins; j++) {
-                power_all[j * n_frames + frame_idx] = 
-                    fft_out[2 * j + 0] * fft_out[2 * j + 0] + 
-                    fft_out[2 * j + 1] * fft_out[2 * j + 1];
-            }
-        }
-    };
-    
-    std::vector<std::thread> threads;
-    int frames_per_thread = (n_frames + config.n_threads - 1) / config.n_threads;
-    
-    for (int t = 0; t < config.n_threads; t++) {
-        int start = t * frames_per_thread;
-        int end = std::min(start + frames_per_thread, n_frames);
-        if (start < n_frames) {
-            threads.emplace_back(process_range, start, end);
-        }
-    }
-    
-    for (auto& th : threads) {
-        th.join();
+#ifdef QWEN3_ASR_USE_FFTW
+    fft_ok = compute_mel_fftw(samples_padded, n_frames, frame_size, frame_step, n_fft_bins, hann, power_all.data(), config);
+    if (fft_ok) goto fft_done;
+#endif
+
+    fft_ok = compute_mel_fallback(samples_padded, n_frames, frame_size, frame_step, n_fft_bins, hann, power_all.data(), config);
+
+fft_done:
+    if (!fft_ok) {
+        if (error) error->message = "FFT computation failed";
+        return false;
     }
     
     auto apply_filterbank = [&](int mel_start, int mel_end) {
@@ -279,7 +414,7 @@ static bool compute_impl(const Input& input, MelSpectrum& output, const Config& 
         }
     };
     
-    threads.clear();
+    std::vector<std::thread> threads;
     int mels_per_thread = (config.n_mels + config.n_threads - 1) / config.n_threads;
     for (int t = 0; t < config.n_threads; t++) {
         int mel_s = t * mels_per_thread;
@@ -290,7 +425,6 @@ static bool compute_impl(const Input& input, MelSpectrum& output, const Config& 
     }
     for (auto& th : threads) th.join();
     
-    // Clamping and normalization (matching original implementation)
     float mmax = -1e20f;
     for (int m = 0; m < config.n_mels; m++) {
         for (int f = 0; f < n_frames; f++) {
