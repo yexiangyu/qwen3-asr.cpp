@@ -199,6 +199,14 @@ EncoderState* init(const Config& config) {
     if (!state->sched) { free_align_encoder_model(*state->model); delete state->model; delete state; return nullptr; }
     
     state->compute_meta.resize(ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead());
+    
+    constexpr int32_t chunk_mel_size = 100;
+    int32_t pe_out_w = chunk_output_len(chunk_mel_size);
+    int n_state = state->model->hparams.d_model;
+    state->pe_cached.resize(pe_out_w * n_state);
+    compute_sinusoidal_pe(state->pe_cached.data(), pe_out_w, n_state);
+    state->pe_cached_out_w = pe_out_w;
+    
     return state;
 }
 
@@ -434,11 +442,9 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
     ggml_backend_tensor_set(mel_t, mel_batch_data.data(), 0, mel_batch_data.size() * sizeof(float));
     
     // Upload PE tensor to GPU (repeated for all chunks)
-    std::vector<float> pe_chunk(max_out_w * n_state);
-    compute_sinusoidal_pe(pe_chunk.data(), max_out_w, n_state);
     std::vector<float> pe_full(max_out_w * n_state * total_chunks);
     for (int c = 0; c < total_chunks; ++c) {
-        memcpy(pe_full.data() + c * max_out_w * n_state, pe_chunk.data(), max_out_w * n_state * sizeof(float));
+        memcpy(pe_full.data() + c * max_out_w * n_state, state->pe_cached.data(), max_out_w * n_state * sizeof(float));
     }
     ggml_tensor* pe_t = ggml_graph_get_tensor(gf_conv, "inp_pe");
     ggml_backend_tensor_set(pe_t, pe_full.data(), 0, pe_full.size() * sizeof(float));
@@ -468,9 +474,9 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
         for (int32_t c = 0; c < clip_n_chunks[b]; ++c) {
             int32_t valid = clip_chunk_out_lens[b][c];
             for (int32_t t = 0; t < valid; ++t) {
-                for (int32_t d = 0; d < n_state; ++d) {
-                    clip_hidden[b][(dst_offset + t) * n_state + d] = conv_all[d + t * n_state + chunk_idx * n_state * max_out_w];
-                }
+                memcpy(clip_hidden[b].data() + (dst_offset + t) * n_state,
+                       conv_all.data() + t * n_state + chunk_idx * n_state * max_out_w,
+                       n_state * sizeof(float));
             }
             dst_offset += valid;
             chunk_idx++;

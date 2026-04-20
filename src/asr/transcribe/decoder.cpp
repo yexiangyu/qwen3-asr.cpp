@@ -790,11 +790,8 @@ bool prefill(State* state, const PrefillInput& input, DecoderOutput& output, Err
     }
     
     int64_t vocab_size = logits->ne[0];
-    int64_t n_logit_rows = logits->ne[1];
-    output.logits.resize(n_logit_rows * vocab_size);
     output.vocab_size = vocab_size;
-    ggml_backend_tensor_get(logits, output.logits.data(), 0, output.logits.size() * sizeof(float));
-    
+
     int32_t argmax_val = -1;
     ggml_backend_tensor_get(argmax_t, &argmax_val, 0, sizeof(int32_t));
     output.next_token = argmax_val;
@@ -2212,7 +2209,11 @@ static ggml_cgraph* build_batch_decode_graph(
     ggml_set_name(cur, "logits");
     ggml_set_output(cur);
     
-    ggml_build_forward_expand(gf, cur);
+    struct ggml_tensor* argmax_result = ggml_argmax(ctx0, cur);
+    ggml_set_name(argmax_result, "argmax_result");
+    ggml_set_output(argmax_result);
+    
+    ggml_build_forward_expand(gf, argmax_result);
     
     ggml_free(ctx0);
     
@@ -2271,27 +2272,22 @@ bool batch_decode_step(BatchDecodeState* state, ErrorInfo* error) {
     }
     
     struct ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits");
-    if (!logits) {
-        if (error) error->message = "Failed to find logits tensor";
+    struct ggml_tensor* argmax_t = ggml_graph_get_tensor(gf, "argmax_result");
+    if (!logits || !argmax_t) {
+        if (error) error->message = "Failed to find logits/argmax tensor";
         ggml_backend_sched_reset(state->sched);
         return false;
     }
     
-    int vocab_size = logits->ne[0];
-    std::vector<float> all_logits(vocab_size * active_slots.size());
-    ggml_backend_tensor_get(logits, all_logits.data(), 0, all_logits.size() * sizeof(float));
+    int batch_sz = active_slots.size();
+    std::vector<int32_t> argmax_vals(batch_sz);
+    ggml_backend_tensor_get(argmax_t, argmax_vals.data(), 0, batch_sz * sizeof(int32_t));
     
     const int eos_token = state->model->hparams.eos_token;
     
     for (size_t i = 0; i < active_slots.size(); ++i) {
         auto& slot = state->unified_cache.slots[active_slots[i]];
-        
-        std::vector<float> slot_logits(vocab_size);
-        for (int v = 0; v < vocab_size; ++v) {
-            slot_logits[v] = all_logits[i * vocab_size + v];
-        }
-        
-        int next_token = argmax(slot_logits);
+        int next_token = argmax_vals[i];
         
         slot.n_used++;
         

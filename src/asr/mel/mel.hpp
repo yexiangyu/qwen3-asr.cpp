@@ -36,7 +36,14 @@ struct Window {
     int length;
 };
 
+struct MelState {
+    Window hann;
+    FilterBank filters;
+    bool initialized = false;
+};
+
 bool compute(const Input& input, MelSpectrum& output, const Config& config = {}, ErrorInfo* error = nullptr);
+bool compute_cached(MelState& state, const Input& input, MelSpectrum& output, const Config& config = {}, ErrorInfo* error = nullptr);
 
 bool compute_from_file(const char* wav_path, MelSpectrum& output, const Config& config = {}, ErrorInfo* error = nullptr);
 

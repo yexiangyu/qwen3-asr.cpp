@@ -192,7 +192,11 @@ int main(int argc, char** argv) {
     
     auto mel_start = std::chrono::high_resolution_clock::now();
     mel::MelSpectrum mel_spec;
-    if (!mel::compute_from_file(config.input_path.c_str(), mel_spec, mel_config, &error)) {
+    mel::MelState mel_state;
+    mel::Input mel_input;
+    mel_input.samples = audio_samples.data();
+    mel_input.n_samples = static_cast<int>(audio_samples.size());
+    if (!mel::compute_cached(mel_state, mel_input, mel_spec, mel_config, &error)) {
         fprintf(stderr, "Error: Failed to compute mel: %s\n", error.message.c_str());
         return 1;
     }

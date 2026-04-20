@@ -5,7 +5,7 @@
 #include "ggml-backend.h"
 #include <string>
 #include <vector>
-#include <map>
+#include <unordered_map>
 
 namespace asr::aligner::encoder {
 
@@ -71,7 +71,7 @@ struct EncoderModel {
     void* mmap_addr = nullptr;
     size_t mmap_size = 0;
     
-    std::map<std::string, ggml_tensor*> tensors;
+    std::unordered_map<std::string, ggml_tensor*> tensors;
 };
 
 struct EncoderState {
@@ -85,6 +85,9 @@ struct EncoderState {
     ggml_tensor* embd_enc = nullptr;
     
     EncoderModel* model = nullptr;
+    
+    std::vector<float> pe_cached;
+    int pe_cached_out_w = 0;
 };
 
 bool load_model(const char* path, EncoderModel& model, ErrorInfo* error);

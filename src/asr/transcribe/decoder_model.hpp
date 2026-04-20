@@ -48,7 +48,7 @@ std::unordered_map<std::string, int> token_to_id;
     void* mmap_addr = nullptr;
     size_t mmap_size = 0;
     
-    std::map<std::string, ggml_tensor*> tensors;
+    std::unordered_map<std::string, ggml_tensor*> tensors;
 };
 
 struct Cache {

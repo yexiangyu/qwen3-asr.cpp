@@ -23,7 +23,7 @@ bool ffmpeg_decode(const char* path, std::vector<float>& samples, int& sample_ra
     samples.clear();
     sample_rate = 16000;
     
-    const int chunk_size = 4096;
+    const int chunk_size = 65536;
     int16_t buffer[chunk_size];
     
     while (true) {

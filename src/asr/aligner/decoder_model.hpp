@@ -65,10 +65,10 @@ struct Model {
     void* mmap_addr = nullptr;
     size_t mmap_size = 0;
     
-    std::map<std::string, ggml_tensor*> tensors;
+    std::unordered_map<std::string, ggml_tensor*> tensors;
     
     std::vector<std::string> vocab;
-    std::map<std::string, int32_t> token_to_id;
+    std::unordered_map<std::string, int32_t> token_to_id;
     std::unordered_map<std::string, int32_t> decoded_to_id;
     std::unordered_map<std::string, int> bpe_ranks;
     std::unordered_set<std::string> ko_dict;

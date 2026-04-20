@@ -411,7 +411,11 @@ static ggml_cgraph* build_decoder_graph(
     ggml_set_name(cur, "logits");
     ggml_set_output(cur);
     
-    ggml_build_forward_expand(gf, cur);
+    struct ggml_tensor* argmax_result = ggml_argmax(ctx0, cur);
+    ggml_set_name(argmax_result, "argmax_result");
+    ggml_set_output(argmax_result);
+    
+    ggml_build_forward_expand(gf, argmax_result);
     
     ggml_free(ctx0);
     
@@ -483,27 +487,17 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
     }
     
     struct ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits");
-    if (!logits) {
-        if (error) error->message = "Failed to find logits tensor";
+    struct ggml_tensor* argmax_t = ggml_graph_get_tensor(gf, "argmax_result");
+    if (!logits || !argmax_t) {
+        if (error) error->message = "Failed to find logits/argmax tensor";
         ggml_backend_sched_reset(state->sched);
         return false;
     }
     
     int64_t n_classes = logits->ne[0];
     output.n_classes = n_classes;
-    output.logits.resize(input.n_tokens * n_classes);
     output.timestamp_indices.resize(input.n_tokens);
-    ggml_backend_tensor_get(logits, output.logits.data(), 0, output.logits.size() * sizeof(float));
-    
-    for (int t = 0; t < input.n_tokens; ++t) {
-        const float* row_logits = output.logits.data() + t * n_classes;
-        int32_t best_class = 0;
-        float best_val = row_logits[0];
-        for (int c = 1; c < n_classes; ++c) {
-            if (row_logits[c] > best_val) { best_val = row_logits[c]; best_class = c; }
-        }
-        output.timestamp_indices[t] = best_class;
-    }
+    ggml_backend_tensor_get(argmax_t, output.timestamp_indices.data(), 0, input.n_tokens * sizeof(int32_t));
     
     ggml_backend_sched_reset(state->sched);
     
@@ -835,11 +829,7 @@ std::vector<int32_t> extract_timestamp_classes(const Output& output, const std::
     std::vector<int32_t> classes;
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (tokens[i] == timestamp_token_id) {
-            const float* logits = output.logits.data() + i * output.n_classes;
-            int32_t best_class = 0;
-            float best_score = logits[0];
-            for (int c = 1; c < output.n_classes; ++c) { if (logits[c] > best_score) { best_score = logits[c]; best_class = c; } }
-            classes.push_back(best_class);
+            classes.push_back(output.timestamp_indices[i]);
         }
     }
     return classes;

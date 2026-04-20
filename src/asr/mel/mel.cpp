@@ -102,50 +102,85 @@ static void dft(const float* in, int N, float* out) {
     }
 }
 
-static void fft_recursive(const float* in, int N, float* out) {
+static void bit_reverse_permute(float* data, int N) {
+    int j = 0;
+    for (int i = 0; i < N - 1; i++) {
+        if (i < j) {
+            std::swap(data[2 * i + 0], data[2 * j + 0]);
+            std::swap(data[2 * i + 1], data[2 * j + 1]);
+        }
+        int m = N >> 1;
+        while (m >= 1 && j >= m) {
+            j -= m;
+            m >>= 1;
+        }
+        j += m;
+    }
+}
+
+static void fft_iterative(const float* in, int N, float* out, float* /*workspace*/) {
     if (N == 1) {
         out[0] = in[0];
         out[1] = 0;
         return;
     }
-    
+
     if (N % 2 != 0) {
         dft(in, N, out);
         return;
     }
-    
-    int half_N = N / 2;
-    std::vector<float> even(half_N);
-    std::vector<float> odd(half_N);
-    
-    for (int i = 0; i < half_N; i++) {
-        even[i] = in[2 * i];
-        odd[i] = in[2 * i + 1];
+
+    for (int i = 0; i < N; i++) {
+        out[2 * i + 0] = in[i];
+        out[2 * i + 1] = 0.0f;
     }
-    
-    std::vector<float> even_fft(N * 2);
-    std::vector<float> odd_fft(N * 2);
-    
-    fft_recursive(even.data(), half_N, even_fft.data());
-    fft_recursive(odd.data(), half_N, odd_fft.data());
-    
-    for (int k = 0; k < half_N; k++) {
-        float angle = 2.0f * M_PI * k / N;
-        float re = cosf(angle);
-        float im = -sinf(angle);
-        
-        float re_odd = odd_fft[2 * k + 0];
-        float im_odd = odd_fft[2 * k + 1];
-        
-        out[2 * k + 0] = even_fft[2 * k + 0] + re * re_odd - im * im_odd;
-        out[2 * k + 1] = even_fft[2 * k + 1] + re * im_odd + im * re_odd;
-        
-        out[2 * (k + half_N) + 0] = even_fft[2 * k + 0] - re * re_odd + im * im_odd;
-        out[2 * (k + half_N) + 1] = even_fft[2 * k + 1] - re * im_odd - im * re_odd;
+
+    bit_reverse_permute(out, N);
+
+    for (int s = 1; s <= static_cast<int>(log2f(N)); s++) {
+        int m = 1 << s;
+        int half_m = m >> 1;
+        float wm_re = cosf(2.0f * M_PI / m);
+        float wm_im = -sinf(2.0f * M_PI / m);
+
+        for (int k = 0; k < N; k += m) {
+            float w_re = 1.0f;
+            float w_im = 0.0f;
+            for (int j = 0; j < half_m; j++) {
+                int t0 = 2 * (k + j) + 0;
+                int t1 = 2 * (k + j) + 1;
+                int u0 = 2 * (k + j + half_m) + 0;
+                int u1 = 2 * (k + j + half_m) + 1;
+
+                float tr = w_re * out[u0] - w_im * out[u1];
+                float ti = w_re * out[u1] + w_im * out[u0];
+
+                out[u0] = out[t0] - tr;
+                out[u1] = out[t1] - ti;
+                out[t0] += tr;
+                out[t1] += ti;
+
+                float new_w_re = w_re * wm_re - w_im * wm_im;
+                float new_w_im = w_re * wm_im + w_im * wm_re;
+                w_re = new_w_re;
+                w_im = new_w_im;
+            }
+        }
     }
 }
 
-bool compute(const Input& input, MelSpectrum& output, const Config& config, ErrorInfo* error) {
+static bool compute_impl(const Input& input, MelSpectrum& output, const Config& config, const Window& hann, const FilterBank& filters, ErrorInfo* error);
+
+bool compute_with_state(MelState& state, const Input& input, MelSpectrum& output, const Config& config, ErrorInfo* error) {
+    if (!state.initialized) {
+        create_hann_window(state.hann, config.n_fft, true);
+        create_filter_bank(state.filters, config);
+        state.initialized = true;
+    }
+    return compute_impl(input, output, config, state.hann, state.filters, error);
+}
+
+static bool compute_impl(const Input& input, MelSpectrum& output, const Config& config, const Window& hann, const FilterBank& filters, ErrorInfo* error) {
     int frame_size = config.n_fft;
     int frame_step = config.hop_length;
     int n_fft_bins = 1 + config.n_fft / 2;
@@ -178,18 +213,14 @@ bool compute(const Input& input, MelSpectrum& output, const Config& config, Erro
     int total_frames = (static_cast<int>(samples_padded.size()) - frame_size) / frame_step + 1;
     int n_frames = total_frames - 1;
     
-    Window hann;
-    create_hann_window(hann, frame_size, true);
-    
-    FilterBank filters;
-    create_filter_bank(filters, config);
-    
     output.n_mels = config.n_mels;
     output.n_frames = n_frames;
     output.data.resize(config.n_mels * n_frames, 0.0f);
     
     std::vector<float> power_all(n_fft_bins * n_frames, 0.0f);
     
+    std::vector<float> fft_workspace(frame_size * 2);
+
     auto process_range = [&](int start, int end) {
         std::vector<float> fft_in(frame_size);
         std::vector<float> fft_out(frame_size * 2);
@@ -204,7 +235,7 @@ bool compute(const Input& input, MelSpectrum& output, const Config& config, Erro
                 fft_in[j] = hann.data[j] * samples_padded[offset + j];
             }
             
-            fft_recursive(fft_in.data(), frame_size, fft_out.data());
+            fft_iterative(fft_in.data(), frame_size, fft_out.data(), fft_workspace.data());
             
             for (int j = 0; j < n_fft_bins; j++) {
                 power_all[j * n_frames + frame_idx] = 
@@ -229,15 +260,28 @@ bool compute(const Input& input, MelSpectrum& output, const Config& config, Erro
         th.join();
     }
     
-    for (int m = 0; m < config.n_mels; m++) {
-        for (int f = 0; f < n_frames; f++) {
-            float sum = 0.0f;
-            for (int k = 0; k < n_fft_bins; k++) {
-                sum += filters.data[m * n_fft_bins + k] * power_all[k * n_frames + f];
+    auto apply_filterbank = [&](int mel_start, int mel_end) {
+        for (int m = mel_start; m < mel_end; m++) {
+            for (int f = 0; f < n_frames; f++) {
+                float sum = 0.0f;
+                for (int k = 0; k < n_fft_bins; k++) {
+                    sum += filters.data[m * n_fft_bins + k] * power_all[k * n_frames + f];
+                }
+                output.data[m * n_frames + f] = log10f(std::max(sum, 1e-10f));
             }
-            output.data[m * n_frames + f] = log10f(std::max(sum, 1e-10f));
+        }
+    };
+    
+    threads.clear();
+    int mels_per_thread = (config.n_mels + config.n_threads - 1) / config.n_threads;
+    for (int t = 0; t < config.n_threads; t++) {
+        int mel_s = t * mels_per_thread;
+        int mel_e = std::min(mel_s + mels_per_thread, config.n_mels);
+        if (mel_s < config.n_mels) {
+            threads.emplace_back(apply_filterbank, mel_s, mel_e);
         }
     }
+    for (auto& th : threads) th.join();
     
     // Clamping and normalization (matching original implementation)
     float mmax = -1e20f;
@@ -259,6 +303,18 @@ bool compute(const Input& input, MelSpectrum& output, const Config& config, Erro
     }
     
     return true;
+}
+
+bool compute_cached(MelState& state, const Input& input, MelSpectrum& output, const Config& config, ErrorInfo* error) {
+    return compute_with_state(state, input, output, config, error);
+}
+
+bool compute(const Input& input, MelSpectrum& output, const Config& config, ErrorInfo* error) {
+    Window hann;
+    create_hann_window(hann, config.n_fft, true);
+    FilterBank filters;
+    create_filter_bank(filters, config);
+    return compute_impl(input, output, config, hann, filters, error);
 }
 
 bool compute_from_file(const char* wav_path, MelSpectrum& output, const Config& config, ErrorInfo* error) {

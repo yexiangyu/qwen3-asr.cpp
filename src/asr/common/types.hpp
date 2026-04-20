@@ -45,7 +45,7 @@ struct AudioFeatures {
 
 struct ErrorInfo {
     std::string message;
-    int code;
+    int code = 0;
 };
 
 } // namespace asr
