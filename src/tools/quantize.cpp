@@ -26,7 +26,8 @@ static bool should_quantize_tensor(const char * name, ggml_type type, int64_t nr
     if (strstr(name, ".bias")) return false;
     if (strstr(name, "embed_tokens") || strstr(name, "token_embd")) return false;
     if (strstr(name, "lm_head") && strstr(name, ".weight")) return false;
-    if (strstr(name, "output.weight")) return false;
+    if (strcmp(name, "output.weight") == 0) return false;
+    if (strstr(name, "attn_output.weight")) return false;
     if (strstr(name, "classify_head")) return false;
     if (strstr(name, "ln_post.weight") || strstr(name, "ln_post.bias")) return false;
     if (strstr(name, "proj1.bias") || strstr(name, "proj2.bias")) return false;
@@ -172,7 +173,7 @@ int main(int argc, char ** argv) {
             new_data.resize(quant_size);
 
             fprintf(stderr, "  [%3d/%3d] %50s  %6s -> %6s  quantizing (%lld rows x %lld cols)...\n",
-                    (int)0, (int)n_tensors, name,
+                    (int)tensor_idx + 1, (int)n_tensors, name,
                     ggml_type_name_ext(orig_type), ggml_type_name_ext(new_type),
                     (long long)nrows, (long long)n_per_row);
 

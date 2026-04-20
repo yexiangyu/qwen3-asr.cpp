@@ -219,6 +219,16 @@ HyperParams get_hparams(EncoderState* state) {
     return state && state->model ? state->model->hparams : HyperParams();
 }
 
+static ggml_tensor* conv_2d_via_im2col(ggml_context* ctx, ggml_tensor* kernel, ggml_tensor* input, int s0, int s1, int p0, int p1, int d0, int d1) {
+    ggml_tensor* im2col_out = ggml_im2col(ctx, kernel, input, s0, s1, p0, p1, d0, d1, true, GGML_TYPE_F16);
+    ggml_tensor* result = ggml_mul_mat(ctx,
+        ggml_reshape_2d(ctx, im2col_out, im2col_out->ne[0], im2col_out->ne[3] * im2col_out->ne[2] * im2col_out->ne[1]),
+        ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1] * kernel->ne[2], kernel->ne[3]));
+    result = ggml_reshape_4d(ctx, result, im2col_out->ne[1], im2col_out->ne[2], im2col_out->ne[3], kernel->ne[3]);
+    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2));
+    return result;
+}
+
 static ggml_cgraph* build_conv_graph(EncoderState* state, int max_chunk_len, int n_mel, int n_chunks) {
     EncoderModel& m = *state->model;
     int conv_ch = m.hparams.conv_channels;
@@ -231,15 +241,15 @@ static ggml_cgraph* build_conv_graph(EncoderState* state, int max_chunk_len, int
     ggml_set_name(mel_batch, "mel_batch");
     ggml_set_input(mel_batch);
     
-    ggml_tensor* cur = ggml_conv_2d(ctx, m.conv2d1_w, mel_batch, 2, 2, 1, 1, 1, 1);
+    ggml_tensor* cur = conv_2d_via_im2col(ctx, m.conv2d1_w, mel_batch, 2, 2, 1, 1, 1, 1);
     if (m.conv2d1_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d1_b, 1, 1, conv_ch, 1));
     cur = ggml_gelu(ctx, cur);
     
-    cur = ggml_conv_2d(ctx, m.conv2d2_w, cur, 2, 2, 1, 1, 1, 1);
+    cur = conv_2d_via_im2col(ctx, m.conv2d2_w, cur, 2, 2, 1, 1, 1, 1);
     if (m.conv2d2_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d2_b, 1, 1, conv_ch, 1));
     cur = ggml_gelu(ctx, cur);
     
-    cur = ggml_conv_2d(ctx, m.conv2d3_w, cur, 2, 2, 1, 1, 1, 1);
+    cur = conv_2d_via_im2col(ctx, m.conv2d3_w, cur, 2, 2, 1, 1, 1, 1);
     if (m.conv2d3_b) cur = ggml_add(ctx, cur, ggml_reshape_4d(ctx, m.conv2d3_b, 1, 1, conv_ch, 1));
     cur = ggml_gelu(ctx, cur);
     
