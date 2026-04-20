@@ -270,7 +270,8 @@ static ggml_cgraph* build_decoder_graph(
     State* state,
     const int32_t* tokens, int n_tokens,
     const float* audio_embd, int n_audio,
-    int audio_start_pos) {
+    int audio_start_pos,
+    int n_ts_tokens) {
     
     (void)tokens;
     
@@ -299,6 +300,10 @@ static ggml_cgraph* build_decoder_graph(
     struct ggml_tensor* inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
+    
+    struct ggml_tensor* inp_ts_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ts_tokens);
+    ggml_set_name(inp_ts_rows, "inp_ts_rows");
+    ggml_set_input(inp_ts_rows);
     
     struct ggml_tensor* inp_audio = nullptr;
     if (audio_embd && n_audio > 0) {
@@ -408,9 +413,6 @@ static ggml_cgraph* build_decoder_graph(
     cur = ggml_mul_mat(ctx0, state->model->classify_head_w, cur);
     if (state->model->classify_head_b) cur = ggml_add(ctx0, cur, state->model->classify_head_b);
     
-    ggml_set_name(cur, "logits");
-    ggml_set_output(cur);
-    
     struct ggml_tensor* argmax_result = ggml_argmax(ctx0, cur);
     ggml_set_name(argmax_result, "argmax_result");
     ggml_set_output(argmax_result);
@@ -432,7 +434,8 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
     
     struct ggml_cgraph* gf = build_decoder_graph(
         state, input.tokens, input.n_tokens,
-        input.audio_features, input.n_audio_frames, input.audio_start_pos);
+        input.audio_features, input.n_audio_frames, input.audio_start_pos,
+        input.n_ts_tokens);
     
     if (!gf) {
         if (error) error->message = "Failed to build decoder graph";
@@ -457,6 +460,11 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
         std::vector<int32_t> positions(input.n_tokens);
         for (int i = 0; i < input.n_tokens; ++i) positions[i] = i;
         ggml_backend_tensor_set(inp_pos, positions.data(), 0, input.n_tokens * sizeof(int32_t));
+    }
+    
+    struct ggml_tensor* inp_ts_rows_t = ggml_graph_get_tensor(gf, "inp_ts_rows");
+    if (inp_ts_rows_t && input.ts_rows && input.n_ts_tokens > 0) {
+        ggml_backend_tensor_set(inp_ts_rows_t, input.ts_rows, 0, input.n_ts_tokens * sizeof(int32_t));
     }
     
     struct ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "causal_mask");
@@ -486,15 +494,14 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
         return false;
     }
     
-    struct ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits");
-    struct ggml_tensor* argmax_t = ggml_graph_get_tensor(gf, "argmax_result");
-    if (!logits || !argmax_t) {
-        if (error) error->message = "Failed to find logits/argmax tensor";
+struct ggml_tensor* argmax_t = ggml_graph_get_tensor(gf, "argmax_result");
+    if (!argmax_t) {
+        if (error) error->message = "Failed to find argmax tensor";
         ggml_backend_sched_reset(state->sched);
         return false;
     }
     
-    int64_t n_classes = logits->ne[0];
+    int64_t n_classes = argmax_t->ne[0];
     output.n_classes = n_classes;
     output.timestamp_indices.resize(input.n_tokens);
     ggml_backend_tensor_get(argmax_t, output.timestamp_indices.data(), 0, input.n_tokens * sizeof(int32_t));
@@ -930,12 +937,21 @@ bool align(State* state, const AlignInput& input, AlignOutput& output, ErrorInfo
         if (tokens[i] == hp.audio_start_token_id) { audio_start_pos = i + 1; break; }
     }
     
+    std::vector<int32_t> ts_rows;
+    for (int i = 0; i < (int)tokens.size(); ++i) {
+        if (tokens[i] == hp.timestamp_token_id) {
+            ts_rows.push_back(i);
+        }
+    }
+    
     Input dec_input;
     dec_input.tokens = tokens.data();
     dec_input.n_tokens = tokens.size();
     dec_input.audio_features = input.audio_features;
     dec_input.n_audio_frames = input.n_audio_frames;
     dec_input.audio_start_pos = audio_start_pos;
+    dec_input.ts_rows = ts_rows.data();
+    dec_input.n_ts_tokens = ts_rows.size();
     
     Output dec_output;
     if (!decode(state, dec_input, dec_output, error)) return false;

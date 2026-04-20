@@ -22,6 +22,8 @@ struct Input {
     const float* audio_features;
     int n_audio_frames;
     int audio_start_pos;
+    const int32_t* ts_rows;
+    int n_ts_tokens;
 };
 
 struct Output {
