@@ -1,468 +1,192 @@
 # Qwen3-ASR.cpp
 
-A high-performance C++ implementation of Qwen3-ASR and Qwen3-ForcedAligner using the GGML tensor library. Optimized for Apple Silicon with Metal GPU acceleration, providing fast speech recognition and word-level timestamp alignment.
+A C++ GGML implementation of Qwen3-ASR and Qwen3-ForcedAligner with GPU acceleration (CUDA/Metal). Supports F16, Q8_0, and NVFP4 quantized models for speech recognition and word-level timestamp alignment.
 
 ## Features
 
-- **Automatic Speech Recognition (ASR)**: Transcribe audio files to text in 30+ languages
-- **Forced Alignment**: Align reference text to audio with utterance-level timestamps
-- **Combined Pipeline** (`--transcribe-align`): Automatically runs ASR then alignment with auto language detection
-- **HTTP Server Services**: Production-ready HTTP servers for transcription and alignment
-- **C API Library**: C-compatible API for multi-language integration (Python, Go, Rust, etc.)
-- **Flash Attention**: Uses `ggml_flash_attn_ext()` for fast decoding (3.7x speedup)
-- **Metal GPU Acceleration**: Optimized for Apple Silicon with dual CPU+Metal backend
-- **Accelerate/vDSP**: Highly optimized mel spectrogram computation (45x speedup)
-- **mmap Weight Loading**: Zero-copy GPU transfer for fast model initialization
-- **F16 KV Cache**: Reduced memory bandwidth with half-precision key-value cache
-- **Korean Word Splitting**: Soynlp LTokenizer algorithm with 18K-word dictionary
-- **Quantization Support**: Q8_0 quantization for reduced memory usage (~40% smaller)
-- **Pure C++17**: No Python runtime required for inference
+- **Automatic Speech Recognition (ASR)**: Transcribe audio to text in 30+ languages
+- **Forced Alignment**: Align text to audio with word-level timestamps
+- **Combined Pipeline** (`--transcribe-align`): ASR → alignment with auto language detection
+- **Quantized Model Support**: F16, Q8_0, NVFP4 (Blackwell), Q4_0 — up to 53% memory reduction
+- **im2col+mul_mat Conv**: Quantized conv kernels compute directly via mul_mat (no dequant overhead)
+- **Flash Attention**: `ggml_flash_attn_ext()` with F32 precision for fast decoding
+- **F16 KV Cache**: Half-precision key-value cache
+- **GPU Acceleration**: CUDA (Linux) / Metal (macOS) with multi-backend scheduling
+- **mmap Weight Loading**: Zero-copy GPU transfer, fast initialization
+- **Korean/CJK Word Splitting**: Soynlp LTokenizer + CJK character-level splitting
+- **HF Tokenizer JSON Fallback**: Parses `tokenizer.huggingface.json` when GGUF tokens absent
+- **GGUF Quantization Tool**: Built-in `ggml-quantize` for F16 → NVFP4/Q8_0/Q4_0 conversion
+- **Pure C++17**: No Python runtime required
 
 ## Supported Models
 
-| Model | Size | Description |
-|-------|------|-------------|
-| `qwen3-asr-0.6b-f16.gguf` | ~1.8 GB | ASR model, F16 precision |
-| `qwen3-asr-0.6b-q8_0.gguf` | ~1.3 GB | ASR model, Q8_0 quantized |
-| `qwen3-forced-aligner-0.6b-f16.gguf` | ~1.8 GB | Forced alignment model |
+| Model | F16 Size | NVFP4 Size | Q8_0 Size | Description |
+|-------|----------|------------|-----------|-------------|
+| `qwen3-asr-1.7b-f16.gguf` | ~4.48 GB | ~2.30 GB | ~2.4 GB | ASR model |
+| `qwen3-forced-aligner-0.6b-f16.gguf` | ~1.75 GB | ~0.81 GB | — | Forced aligner |
 
 ## Requirements
 
-- CMake 3.14+
-- C++17 compatible compiler (Clang 7+, GCC 8+, MSVC 2019+)
-- Apple Silicon recommended (Metal GPU support)
+- CMake 3.14+, C++17 compiler
+- NVIDIA GPU with CUDA (Linux) or Apple Silicon with Metal (macOS)
 - GGML library (included as submodule)
 
 ## Building
 
 ```bash
-# Clone the repository with submodules
 git clone --recursive https://github.com/yexiangyu/qwen3-asr.cpp.git
 cd qwen3-asr.cpp
 
-# Build
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j$(sysctl -n hw.ncpu)
-```
+# Standard build (with CUDA)
+cmake -B build && cmake --build build -j$(nproc)
 
-On Linux, replace `$(sysctl -n hw.ncpu)` with `$(nproc)`.
+# Disable CUDA
+cmake -B build -DGGML_CUDA=OFF && cmake --build build -j$(nproc)
+
+# macOS
+cmake -B build && cmake --build build -j$(sysctl -n hw.ncpu)
+```
 
 ## Quick Start
 
-### CLI Tools
+### Transcription (ASR only)
 
-**Transcription (ASR):**
 ```bash
-./build/qwen3-asr-cli -m models/qwen3-asr-0.6b-f16.gguf -f audio.wav
+./build/asr-cli --input audio.wav --model models/qwen3-asr-1.7b-f16.gguf --transcribe-only
 ```
 
-**Forced Alignment:**
-```bash
-./build/qwen3-asr-cli \
-  -m models/qwen3-forced-aligner-0.6b-f16.gguf \
-  -f audio.wav \
-  --align \
-  --text "Hello world" \
-  --lang english
-```
+### Forced Alignment
 
-**Combined Pipeline (Transcribe + Align):**
 ```bash
-./build/qwen3-asr-cli \
-  -m models/qwen3-asr-0.6b-f16.gguf \
-  --aligner-model models/qwen3-forced-aligner-0.6b-f16.gguf \
-  -f audio.wav \
-  --transcribe-align
-```
-
-### HTTP Servers
-
-**Transcription Server:**
-```bash
-./build/qwen3-transcribe-server \
-  --model models/qwen3-asr-0.6b-f16.gguf \
-  --port 8081
-```
-
-**Alignment Server:**
-```bash
-./build/qwen3-align-server \
+./build/asr-cli --input audio.wav \
   --model models/qwen3-forced-aligner-0.6b-f16.gguf \
-  --port 8080
+  --align-only --text "Hello world" --language english
 ```
 
-## HTTP Server Services
+### Combined (Transcribe + Align)
 
-Two independent HTTP servers for production deployment.
-
-### qwen3-transcribe-server (Transcription Service)
-
-Transcription HTTP server with REST API.
-
-**Startup:**
 ```bash
-./build/qwen3-transcribe-server \
-  --model models/qwen3-asr-0.6b-f16.gguf \
-  --port 8081 \
-  --threads 4 \
-  --max-tokens 1024
+./build/asr-cli --input audio.wav \
+  --model models/qwen3-asr-1.7b-f16.gguf \
+  --aligner models/qwen3-forced-aligner-0.6b-f16.gguf
 ```
 
-**Command-line Options:**
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--model <path>` | - | ASR model path (required) |
-| `--port <num>` | 8081 | HTTP port |
-| `--threads <num>` | 4 | Processing threads |
-| `--max-tokens <num>` | 1024 | Maximum output tokens |
-| `--default-language <lang>` | - | Default language |
+### NVFP4 Quantized Models
 
-**API Endpoints:**
+Same commands, just use the quantized model paths:
 
-**GET /health** - Health check
-```json
-{"status": "ok", "model_loaded": true}
-```
-
-**POST /transcribe** - Transcription request (multipart/form-data)
-
-Request fields:
-| Field | Required | Description |
-|-------|----------|-------------|
-| `audio` | Yes | PCM int16 data (16kHz mono) |
-| `language` | No | Language code (e.g., `english`) |
-| `context` | No | Context/prompt text |
-| `max_tokens` | No | Maximum tokens override |
-
-Example:
 ```bash
-# Extract PCM from WAV (skip 44-byte header)
-dd if=audio.wav bs=1 skip=44 of=audio.pcm
-
-# Send request
-curl -X POST http://localhost:8081/transcribe \
-  -F "audio=@audio.pcm;type=application/octet-stream" \
-  -F "language=english"
+./build/asr-cli --input audio.wav \
+  --model models/qwen3-asr-1.7b-nvfp4.gguf \
+  --aligner models/qwen3-forced-aligner-0.6b-nvfp4.gguf
 ```
 
-Response:
-```json
-{
-  "success": true,
-  "text": "language English Hello world, this is a test.",
-  "text_content": "Hello world, this is a test.",
-  "processing_time_ms": 8045,
-  "n_tokens": 297,
-  "tokens": [
-    {"id": 151704, "confidence": 0.9947},
-    {"id": 32313, "confidence": 0.9973}
-  ]
-}
+### CLI Options
+
+```
+--input <path>           Input audio file (WAV/ffmpeg-supported)
+--model <path>           ASR model path
+--aligner <path>         Aligner model path
+--device <name>          Compute device: CUDA0, CUDA1, Metal, CPU (default: CUDA0)
+--threads <n>            Thread count (default: 4)
+--language <lang>        Language hint (e.g., chinese, korean, english)
+--transcribe-only        Only transcription, skip alignment
+--align-only             Only alignment (requires --text)
+--text <text>            Text for alignment
+--max-tokens <n>         Max tokens to generate (default: 512)
+--output <path>          Output file path
+--format <fmt>           Output format: text, json (default: text)
 ```
 
-Error response:
-```json
-{
-  "success": false,
-  "error": "Error description"
-}
-```
+## Quantization
 
-**Python Client:**
-```python
-import requests
-
-# Read PCM data
-pcm_data = open('audio.pcm', 'rb').read()
-
-# Send request
-response = requests.post(
-    'http://localhost:8081/transcribe',
-    files={'audio': ('audio.pcm', pcm_data, 'application/octet-stream')},
-    data={
-        'language': 'english',
-        'context': 'Optional context prompt'
-    }
-)
-
-result = response.json()
-if result['success']:
-    print(result['text_content'])
-else:
-    print(f"Error: {result['error']}")
-```
-
-**Concurrency & Performance:**
-- Crow framework supports multithreaded request reception
-- Single model instance with mutex protection for thread safety
-- Requests processed serially to avoid memory contention
-- PCM direct transmission avoids WAV parsing overhead
-- Model pre-loaded at startup reduces first-request latency
-
-### qwen3-align-server (Alignment Service)
-
-Alignment HTTP server with utterance-level output.
-
-**Startup:**
 ```bash
-./build/qwen3-align-server \
-  --model models/qwen3-forced-aligner-0.6b-f16.gguf \
-  --port 8080 \
-  --threads 4
+# F16 → NVFP4 (Blackwell RTX 5080+)
+./build/ggml-quantize models/qwen3-asr-1.7b-f16.gguf models/qwen3-asr-1.7b-nvfp4.gguf nvfp4
+
+# F16 → Q8_0 (universal, all GPUs)
+./build/ggml-quantize models/qwen3-asr-1.7b-f16.gguf models/qwen3-asr-1.7b-q8_0.gguf q8_0
+
+# F16 → Q4_0
+./build/ggml-quantize models/qwen3-asr-1.7b-f16.gguf models/qwen3-asr-1.7b-q4_0.gguf q4_0
 ```
 
-**Command-line Options:**
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--model <path>` | - | Aligner model path (required) |
-| `--port <num>` | 8080 | HTTP port |
-| `--threads <num>` | 4 | Processing threads |
-| `--korean-dict <path>` | - | Korean dictionary path |
-| `--default-language <lang>` | - | Default language |
+### Quantization Rules
 
-**API Endpoints:**
+- **Quantized**: all weight matrices with ne[0] divisible by block_size
+- **Kept as F16**: norm/bias, token embeddings, lm_head/output.weight, classify_head, ln_post, conv weights (small dims), **attn_output.weight** (critical — NVFP4/Q4_0 causes repetitive generation)
+- **NVFP4**: additionally requires ne[0] % 64 == 0
 
-**GET /health** - Health check
-```json
-{"status": "ok", "model_loaded": true}
-```
-
-**POST /align** - Alignment request (multipart/form-data)
-
-Request fields:
-| Field | Required | Description |
-|-------|----------|-------------|
-| `audio` | Yes | PCM int16 data (16kHz mono) |
-| `text` | Yes | Reference text to align |
-| `language` | No | Language code (e.g., `english`) |
-
-Example:
-```bash
-curl -X POST http://localhost:8080/align \
-  -F "text=Hello world. This is a test." \
-  -F "audio=@audio.pcm;type=application/octet-stream" \
-  -F "language=english"
-```
-
-Response (utterance-level, sentences split by `.!?。！？`):
-```json
-{
-  "success": true,
-  "processing_time_ms": 6216,
-  "n_utterances": 2,
-  "utterances": [
-    {
-      "start": 0.000,
-      "end": 1.360,
-      "text": "Hello world.",
-      "n_words": 4,
-      "words": [
-        {"word": "Hello", "start": 0.000, "end": 0.320, "conf_word": 0.95},
-        {"word": "world", "start": 0.340, "end": 0.640, "conf_word": 0.92},
-        {"word": ".", "start": 0.640, "end": 0.680}
-      ]
-    },
-    {
-      "start": 1.360,
-      "end": 2.500,
-      "text": "This is a test.",
-      "n_words": 5,
-      "words": [...]
-    }
-  ]
-}
-```
-
-**Python Client:**
-```python
-import requests
-
-pcm_data = open('audio.pcm', 'rb').read()
-text = "Hello world. This is a test."
-
-response = requests.post(
-    'http://localhost:8080/align',
-    files={'audio': ('audio.pcm', pcm_data, 'application/octet-stream')},
-    data={'text': text, 'language': 'english'}
-)
-
-result = response.json()
-for utt in result['utterances']:
-    print(f"{utt['start']:.3f} -> {utt['end']:.3f}: {utt['text']}")
-```
-
-### Audio Format for HTTP Servers
-
-HTTP servers accept raw PCM data, not WAV files:
-
-**PCM format:**
-- Format: int16 (2 bytes per sample)
-- Sample rate: 16kHz mono
-- No header (pure PCM bytes)
-
-**Extract PCM from WAV:**
-```bash
-# WAV has 44-byte header, skip it
-dd if=audio.wav bs=1 skip=44 of=audio.pcm
-```
-
-**Convert audio to PCM:**
-```bash
-# Convert any format to PCM
-ffmpeg -i input.mp3 -f s16le -acodec pcm_s16le -ar 16000 -ac 1 audio.pcm
-```
-
-## C API Library
-
-`libqwen3asr` provides a C-compatible API for integration with Python, Go, Rust, and other languages.
-
-**Basic Usage:**
-```c
-#include "qwen3asr_c_api.h"
-
-// Initialize handle
-qwen3asr_handle handle;
-qwen3asr_init(&handle);
-qwen3asr_load_model(handle, "model.gguf");
-
-// Transcribe
-qwen3asr_params params = {
-    .max_tokens = 1024,
-    .language = "english",
-    .n_threads = 4
-};
-qwen3asr_result result;
-qwen3asr_transcribe_pcm(handle, pcm_data, n_samples, &params, &result);
-
-// Use result
-printf("Text: %s\n", result.text);
-printf("Tokens: %d\n", result.n_tokens);
-
-// Cleanup
-qwen3asr_free_result(&result);
-qwen3asr_free(handle);
-```
-
-**Device Enumeration:**
-```c
-int n_devices = qwen3_get_device_count();
-for (int i = 0; i < n_devices; i++) {
-    qwen3_device_info info;
-    qwen3_get_device_info(i, &info);
-    printf("Device %d: %s\n", i, info.name);
-    qwen3_free_device_info(&info);
-}
-```
-
-**Alignment API:**
-```c
-qwen3aligner_handle aligner;
-qwen3aligner_init(&aligner);
-qwen3aligner_load_model(aligner, "aligner.gguf");
-
-qwen3alignment_result align_result;
-qwen3aligner_params align_params = {.language = "english"};
-qwen3aligner_align_pcm(aligner, pcm_data, n_samples, "text", &align_params, &align_result);
-
-// Process utterances
-for (int i = 0; i < align_result.n_utterances; i++) {
-    // ...
-}
-
-qwen3aligner_free_result(&align_result);
-qwen3aligner_free(aligner);
-```
-
-See header file: `src/qwen3asr_c_api.h`
-
-## Output Formats
-
-### ASR Output
-
-**Plain text (default):**
-```
-language English Hello world, this is a test.
-```
-
-**JSON format (`--json`):**
-```json
-{
-  "text": "language English Hello world, this is a test.",
-  "text_prefix": "language English",
-  "text_content": "Hello world, this is a test.",
-  "tokens": [{"id": ..., "string": "...", "confidence": ...}]
-}
-```
-
-### Alignment Output
-
-Utterance-level JSON with word-level timestamps:
-```json
-{
-  "utterances": [
-    {
-      "start": 0.000,
-      "end": 1.360,
-      "text": "Hello world.",
-      "words": [
-        {"word": "Hello", "start": 0.000, "end": 0.320, "conf_word": 0.95},
-        {"word": "world", "start": 0.340, "end": 0.640, "conf_word": 0.92}
-      ]
-    }
-  ]
-}
-```
-
-Sentences are split by: `.`, `!`, `?`, `。`, `！`, `？`
-
-## Performance
-
-Benchmark on 92-second Korean audio, Apple M2 Pro:
-
-| Stage | Time |
-|-------|------|
-| Mel spectrogram | 98 ms |
-| Audio encoding | 715 ms |
-| Text decoding (323 tokens) | 4,194 ms |
-| **ASR Total** | **5,007 ms** |
-| Forced alignment (183 words) | 12,998 ms |
-| **Combined Total** | **18,005 ms** |
-
-**Memory Usage:** ~247 MB RSS, ~294 MB Metal
-
-### Key Optimizations
-
-- **Flash Attention**: 3.7x decode speedup
-- **Metal GPU Dual Backend**: Automatic CPU/GPU scheduling
-- **mmap + Zero-Copy**: Fast model loading
-- **F16 KV Cache**: Half-precision cache
-- **vDSP Mel Spectrogram**: 45x speedup on Apple Silicon
-- **Korean Word Splitting**: LTokenizer with 18K-word dictionary
-
-## Model Conversion
-
-Convert HuggingFace models to GGUF:
+## Model Conversion (HF → GGUF)
 
 ```bash
 pip install -r scripts/requirements.txt
 
 # Convert ASR model
 python scripts/convert_hf_to_gguf.py \
-    --input /path/to/Qwen3-ASR-0.6B \
-    --output models/qwen3-asr-0.6b-f16.gguf \
-    --type f16
+  --input /path/to/Qwen3-ASR-1.7B \
+  --output models/qwen3-asr-1.7b-f16.gguf \
+  --type f16
 
-# Convert Aligner model
+# Convert aligner model
 python scripts/convert_hf_to_gguf.py \
-    --input /path/to/Qwen3-ForcedAligner-0.6B \
-    --output models/qwen3-forced-aligner-0.6b-f16.gguf \
-    --type f16
+  --input /path/to/Qwen3-ForcedAligner-0.6B \
+  --output models/qwen3-forced-aligner-0.6b-f16.gguf \
+  --type f16
 ```
 
-## Supported Languages
+## Performance
 
-30+ languages supported:
+### NVIDIA RTX 5080 (Blackwell), 120-second Chinese audio
+
+| Stage | F16 | NVFP4 | Ratio |
+|-------|-----|-------|-------|
+| ASR Init | 5950 ms | 1125 ms | 0.19x |
+| Audio encode | 352 ms | 313 ms | 0.89x |
+| Text decode (190 tokens) | 2028 ms | 1910 ms | 0.94x |
+| Aligner Init | 2342 ms | 327 ms | 0.14x |
+| Aligner encode | 176 ms | 139 ms | 0.79x |
+| Aligner decode (237 words) | 6059 ms | 5937 ms | 0.98x |
+
+**Memory**: ASR 4.48GB → 2.30GB (48.7%), Aligner 1.75GB → 0.81GB (53.7%)
+
+### Key Optimizations
+
+- **im2col+mul_mat Conv**: Quantized conv kernels compute via mul_mat directly — no dequant overhead
+- **Flash Attention** (F32 precision): Fast autoregressive decode
+- **F16 KV Cache**: Half-precision for reduced memory bandwidth
+- **mmap + Zero-Copy**: Fast model loading, GPU transfer without CPU copy
+- **GGUF key name fallback**: Supports both GGML (`blk.*`) and HF (`model.layers.*`) naming
+- **HF tokenizer JSON fallback**: Parses `tokenizer.huggingface.json` for vocab/merges when GGUF tokens absent
+
+## Inference Pipeline
+
+### ASR (Transcribe)
+
+1. **Audio load**: WAV/ffmpeg → float samples, 16kHz mono (`codec::decode_file`)
+2. **Mel spectrogram**: FFT → power spectrum → mel filter bank → log (`mel::compute`, n_fft=400, hop=160, n_mels=128)
+3. **Audio encode**: Conv frontend (3× Conv2d stride=2 via im2col+mul_mat) → 18-layer transformer → hidden=1024 (`transcribe::encoder::encode_batch`)
+4. **Text decode**: Chat template with audio_pad tokens → inject audio embeddings → prefill + autoregressive decode (Qwen2, 28 layers, GQA 32/8 heads, flash attention, F16 KV cache) → argmax → text (`transcribe::decoder::transcribe`)
+
+### Forced Alignment
+
+1. **Audio encode** (same mel + aligner encoder): 3× Conv2d → 24-layer transformer with **windowed attention** (window_aftercnn=104) → hidden=1024
+2. **Tokenize text**: CJK per-char / Korean LTokenizer / Latin per-word → each word + 2 `<|timestamp|>` tokens
+3. **Aligner decode**: Single forward pass (non-autoregressive, **causal attention**, classify_head 5000 classes) → argmax per timestamp token → class × 80ms = timestamp
+4. **Timestamp fix**: LIS-based monotonic correction → word start/end timestamps
+
+### Special Token IDs
+
+| Token | ID |
+|-------|----|
+| `<|audio_start|>` | 151669 |
+| `<|audio_end|>` | 151670 |
+| `<|AUDIO|>` (audio pad) | 151676 |
+| `<|timestamp|>` | 151705 |
+| `<|im_start|>` | 151644 |
+| `<|im_end|>` (EOS) | 151645 |
+
+## Supported Languages
 
 | Language | Code | Language | Code |
 |----------|------|----------|------|
@@ -474,47 +198,70 @@ python scripts/convert_hf_to_gguf.py \
 | Arabic | arabic | Hindi | hindi |
 | Thai | thai | Vietnamese | vietnamese |
 
+30+ languages total.
+
 ## Audio Requirements
 
-- **Format**: WAV (PCM) or raw PCM
+- **Format**: WAV (PCM) or ffmpeg-supported formats
 - **Sample rate**: 16 kHz
 - **Channels**: Mono
 - **Bit depth**: 16-bit signed integer
 
-Convert with ffmpeg:
 ```bash
 ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 ```
-
-## Documentation
-
-- [CLI Usage Guide](docs/usage.md) - Complete CLI documentation
-- [Mel Preprocessing](docs/mel_preprocessing.md) - Mel spectrogram details
 
 ## Project Structure
 
 ```
 qwen3-asr.cpp/
 ├── src/
-│   ├── main.cpp                 # CLI entry point
-│   ├── qwen3_asr.cpp/h          # High-level ASR API
-│   ├── forced_aligner.cpp/h     # Forced alignment
-│   ├── audio_encoder.cpp/h      # Audio feature encoder
-│   ├── text_decoder.cpp/h       # Text decoder
-│   ├── mel_spectrogram.cpp/h    # Mel spectrogram
-│   ├── audio_utils.cpp/h        # Audio utilities
-│   ├── http_server/             # HTTP servers
-│   │   ├── transcribe_server.*  # Transcription service
-│   │   ├── align_server.*       # Alignment service
-│   ├── qwen3asr_c_api.*         # C API
-│   └── logger.*                 # Logging (spdlog)
-├── tests/                       # Test programs
-├── scripts/                     # Conversion scripts
-├── assets/                      # Korean dictionary
-├── models/                      # Model files
-├── docs/                        # Documentation
-└── ggml/                        # GGML library
+│   ├── tools/
+│   │   ├── asr_cli.cpp              # CLI entry point
+│   │   └── quantize.cpp             # GGUF quantization tool
+│   ├── asr/
+│   │   ├── transcribe/
+│   │   │   ├── encoder.cpp/h        # ASR audio encoder (im2col+mul_mat conv, 18-layer transformer)
+│   │   │   ├── encoder_model.hpp    # Encoder hyperparams + model struct
+│   │   │   ├── decoder.cpp/h        # ASR text decoder (Qwen2, flash attention, KV cache)
+│   │   │   └── decoder_model.hpp    # Decoder hyperparams + model struct
+│   │   ├── aligner/
+│   │   │   ├── encoder.cpp/h        # Aligner encoder (im2col+mul_mat conv, 24-layer windowed attn)
+│   │   │   ├── encoder_model.hpp
+│   │   │   ├── decoder.cpp/h        # Aligner decoder (classify_head, causal attn, timestamps)
+│   │   │   └── decoder_model.hpp
+│   │   ├── mel/
+│   │   │   ├── mel.cpp/h            # Mel spectrogram computation
+│   │   ├── codec/
+│   │   │   ├── codec.cpp/h          # Audio loading (WAV + ffmpeg fallback)
+│   │   │   ├── wav_loader.cpp/h     # WAV parsing + normalization
+│   │   ├── common/
+│   │   │   ├── types.hpp            # MelSpectrum, AudioFeatures, AlignedWord, ErrorInfo
+│   │   │   ├── hf_tokenizer.hpp     # HF JSON tokenizer fallback (vocab/merges parsing)
+│   ├── logger.cpp/h                 # spdlog-based logging
+│   ├── timing.h                     # Timing instrumentation macros
+├── scripts/
+│   ├── convert_hf_to_gguf.py        # HF → GGUF model conversion
+│   └── requirements.txt
+├── assets/
+│   └── korean_dict_jieba.dict       # Korean word dictionary (17,968 words)
+├── models/                          # Model files (.gguf)
+├── tests/                           # Test programs
+├── docs/                            # Documentation
+└── ggml/                            # GGML library (submodule)
 ```
+
+## Important Caveats
+
+- **Don't use `ggml_conv_2d` directly** — always use `conv_2d_via_im2col` for quantized model support
+- **Don't quantize `attn_output.weight`** to NVFP4/Q4_0 — causes repetitive/infinite generation
+- **Aligner decoder must use causal attention** (model trained with `is_causal=True`)
+- **Aligner encoder uses windowed attention** (block-diagonal mask, window=104 frames)
+- **NVFP4 block_size=64**: tensors with ne[0] not divisible by 64 stay F16
+- **im2col output must be F16** (CUDA doesn't support Q8_0 im2col output)
+- **GGUF key names** vary: F16 uses GGML convention (`blk.*`), Q8_0 uses HF convention (`model.layers.*`)
+- **ASR output** starts with "language <Name>" prefix — must strip before alignment
+- **Audio must be 16kHz mono PCM/WAV**
 
 ## License
 
@@ -522,8 +269,6 @@ MIT License. See LICENSE for details.
 
 ## Acknowledgments
 
-- [GGML](https://github.com/ggerganov/ggml) - Tensor library
-- [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) - Original model
-- [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) - Aligner model
-
----
+- [GGML](https://github.com/ggerganov/ggml) — Tensor library
+- [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — Original ASR model
+- [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) — Aligner model
