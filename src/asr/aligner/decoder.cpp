@@ -344,9 +344,19 @@ static ggml_cgraph* build_decoder_graph(
     
     const float KQscale = 1.0f / sqrtf(float(head_dim));
     
-    struct ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_tokens, n_tokens);
+    struct ggml_tensor* mask_zero_scalar = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+    ggml_set_name(mask_zero_scalar, "mask_zero_scalar");
+    ggml_set_input(mask_zero_scalar);
+    
+    struct ggml_tensor* mask_shape_ref = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
+    ggml_set_name(mask_shape_ref, "mask_shape_ref");
+    
+    struct ggml_tensor* mask_base = ggml_repeat(ctx0, mask_zero_scalar, mask_shape_ref);
+    ggml_set_name(mask_base, "mask_base");
+    
+    struct ggml_tensor* causal_mask = ggml_diag_mask_inf(ctx0, mask_base, 0);
+    causal_mask = ggml_cast(ctx0, causal_mask, GGML_TYPE_F16);
     ggml_set_name(causal_mask, "causal_mask");
-    ggml_set_input(causal_mask);
     
     for (int il = 0; il < n_layer; ++il) {
         const auto& layer = state->model->layers[il];
@@ -410,10 +420,13 @@ static ggml_cgraph* build_decoder_graph(
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, state->model->output_norm);
     
-    cur = ggml_mul_mat(ctx0, state->model->classify_head_w, cur);
-    if (state->model->classify_head_b) cur = ggml_add(ctx0, cur, state->model->classify_head_b);
+    struct ggml_tensor* ts_hidden = ggml_get_rows(ctx0, cur, inp_ts_rows);
+    ggml_set_name(ts_hidden, "ts_hidden");
     
-    struct ggml_tensor* argmax_result = ggml_argmax(ctx0, cur);
+    struct ggml_tensor* ts_logits = ggml_mul_mat(ctx0, state->model->classify_head_w, ts_hidden);
+    if (state->model->classify_head_b) ts_logits = ggml_add(ctx0, ts_logits, state->model->classify_head_b);
+    
+    struct ggml_tensor* argmax_result = ggml_argmax(ctx0, ts_logits);
     ggml_set_name(argmax_result, "argmax_result");
     ggml_set_output(argmax_result);
     
@@ -455,6 +468,12 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
     }
     ggml_backend_tensor_set(inp_tokens, input.tokens, 0, input.n_tokens * sizeof(int32_t));
     
+    struct ggml_tensor* mask_zero_t = ggml_graph_get_tensor(gf, "mask_zero_scalar");
+    if (mask_zero_t) {
+        const float zero_val = 0.0f;
+        ggml_backend_tensor_set(mask_zero_t, &zero_val, 0, sizeof(float));
+    }
+    
     struct ggml_tensor* inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
     if (inp_pos) {
         std::vector<int32_t> positions(input.n_tokens);
@@ -465,19 +484,6 @@ bool decode(State* state, const Input& input, Output& output, ErrorInfo* error) 
     struct ggml_tensor* inp_ts_rows_t = ggml_graph_get_tensor(gf, "inp_ts_rows");
     if (inp_ts_rows_t && input.ts_rows && input.n_ts_tokens > 0) {
         ggml_backend_tensor_set(inp_ts_rows_t, input.ts_rows, 0, input.n_ts_tokens * sizeof(int32_t));
-    }
-    
-    struct ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "causal_mask");
-    if (mask_t) {
-        std::vector<ggml_fp16_t> mask_data((size_t)input.n_tokens * input.n_tokens);
-        const ggml_fp16_t zero_f16 = ggml_fp32_to_fp16(0.0f);
-        const ggml_fp16_t neginf_f16 = ggml_fp32_to_fp16(-INFINITY);
-        for (int q = 0; q < input.n_tokens; ++q) {
-            for (int k = 0; k < input.n_tokens; ++k) {
-                mask_data[k + q * input.n_tokens] = (k <= q) ? zero_f16 : neginf_f16;
-            }
-        }
-        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
     }
     
     if (input.audio_features && input.n_audio_frames > 0) {
@@ -503,8 +509,8 @@ struct ggml_tensor* argmax_t = ggml_graph_get_tensor(gf, "argmax_result");
     
     int64_t n_classes = argmax_t->ne[0];
     output.n_classes = n_classes;
-    output.timestamp_indices.resize(input.n_tokens);
-    ggml_backend_tensor_get(argmax_t, output.timestamp_indices.data(), 0, input.n_tokens * sizeof(int32_t));
+    output.timestamp_indices.resize(input.n_ts_tokens);
+    ggml_backend_tensor_get(argmax_t, output.timestamp_indices.data(), 0, input.n_ts_tokens * sizeof(int32_t));
     
     ggml_backend_sched_reset(state->sched);
     
@@ -832,14 +838,8 @@ std::vector<int32_t> build_token_sequence(State* state, int n_audio_pads, const 
     return tokens;
 }
 
-std::vector<int32_t> extract_timestamp_classes(const Output& output, const std::vector<int32_t>& tokens, int timestamp_token_id) {
-    std::vector<int32_t> classes;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i] == timestamp_token_id) {
-            classes.push_back(output.timestamp_indices[i]);
-        }
-    }
-    return classes;
+std::vector<int32_t> extract_timestamp_classes(const Output& output, const std::vector<int32_t>& /*tokens*/, int /*timestamp_token_id*/) {
+    return output.timestamp_indices;
 }
 
 std::vector<int32_t> fix_timestamp_classes(const std::vector<int32_t>& data) {
