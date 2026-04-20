@@ -130,6 +130,13 @@ static void fft_iterative(const float* in, int N, float* out, float* /*workspace
         return;
     }
 
+    int log2_N = 0;
+    for (int tmp = N; tmp > 1; tmp >>= 1) log2_N++;
+    if ((1 << log2_N) != N) {
+        dft(in, N, out);
+        return;
+    }
+
     for (int i = 0; i < N; i++) {
         out[2 * i + 0] = in[i];
         out[2 * i + 1] = 0.0f;
@@ -137,7 +144,7 @@ static void fft_iterative(const float* in, int N, float* out, float* /*workspace
 
     bit_reverse_permute(out, N);
 
-    for (int s = 1; s <= static_cast<int>(log2f(N)); s++) {
+    for (int s = 1; s <= log2_N; s++) {
         int m = 1 << s;
         int half_m = m >> 1;
         float wm_re = cosf(2.0f * M_PI / m);
