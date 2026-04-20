@@ -1,5 +1,6 @@
 # Build directories
 build/
+build-san/
 cmake-build-*/
 
 # Models (too large for git)
