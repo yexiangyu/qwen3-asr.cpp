@@ -373,82 +373,106 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
     int n_mel = m.hparams.n_mel_bins;
     int batch_size = input.batch_size();
     
-    // Process each item in the batch
     output.features.resize(batch_size);
+    
+    const int chunk_size = 100;
+    int max_out_w = compute_chunk_output_len(chunk_size);
+    
+    std::vector<int> clip_n_chunks(batch_size);
+    int total_chunks = 0;
+    std::vector<std::vector<int>> clip_chunk_lengths(batch_size);
+    std::vector<std::vector<int>> clip_chunk_out_lens(batch_size);
+    std::vector<int> clip_total_out_frames(batch_size, 0);
     
     for (int b = 0; b < batch_size; ++b) {
         int n_frames = input.n_frames[b];
-        const float* mel_data = input.mel_data[b];
-        
-        // Chunk processing: same as original (chunk_size = 100)
-        const int chunk_size = 100;
         int n_chunks = (n_frames + chunk_size - 1) / chunk_size;
+        clip_n_chunks[b] = n_chunks;
+        total_chunks += n_chunks;
         
-        std::vector<int> chunk_lengths(n_chunks);
-        std::vector<int> chunk_output_lengths(n_chunks);
-        int total_output_frames = 0;
-        
-        for (int i = 0; i < n_chunks; ++i) {
-            int start = i * chunk_size;
-            int end = std::min(start + chunk_size, n_frames);
-            chunk_lengths[i] = end - start;
-            chunk_output_lengths[i] = compute_chunk_output_len(chunk_lengths[i]);
-            total_output_frames += chunk_output_lengths[i];
+        clip_chunk_lengths[b].resize(n_chunks);
+        clip_chunk_out_lens[b].resize(n_chunks);
+        for (int c = 0; c < n_chunks; ++c) {
+            int start = c * chunk_size;
+            clip_chunk_lengths[b][c] = std::min(chunk_size, n_frames - start);
+            clip_chunk_out_lens[b][c] = compute_chunk_output_len(clip_chunk_lengths[b][c]);
+            clip_total_out_frames[b] += clip_chunk_out_lens[b][c];
         }
+    }
+    
+    // Batched conv: all chunks in single graph call
+    ggml_cgraph* gf_conv = build_graph_conv_batch(state, chunk_size, total_chunks);
+    if (!ggml_backend_sched_alloc_graph(state->sched, gf_conv)) {
+        if (error) error->message = "alloc conv batch failed";
+        return false;
+    }
+    
+    size_t mel_batch_sz = (size_t)chunk_size * n_mel * total_chunks;
+    std::vector<float> mel_batch_data(mel_batch_sz, 0.0f);
+    
+    int chunk_idx = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        const float* mel_data = input.mel_data[b];
+        int n_frames = input.n_frames[b];
+        int n_chunks = clip_n_chunks[b];
         
-        // Process chunks through conv
-        std::vector<float> all_conv_outputs;
-        all_conv_outputs.reserve(total_output_frames * n_state);
-        
-        for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
-            int chunk_len = chunk_lengths[chunk_idx];
-            int chunk_out_len = chunk_output_lengths[chunk_idx];
-            
-            // Build conv graph for this chunk
-            ggml_cgraph* gf_conv = build_graph_conv_batch(state, chunk_len, 1);
-            if (!ggml_backend_sched_alloc_graph(state->sched, gf_conv)) {
-                if (error) error->message = "alloc conv chunk failed";
-                return false;
-            }
-            
-            // Prepare mel data for this chunk [n_mel, chunk_len] -> [chunk_len, n_mel, 1, 1]
-            std::vector<float> chunk_mel(n_mel * chunk_len);
-            for (int fm = 0; fm < n_mel; ++fm) {
-                for (int f = 0; f < chunk_len; ++f) {
-                    chunk_mel[f + fm * chunk_len] = mel_data[fm * n_frames + chunk_idx * chunk_size + f];
+        for (int c = 0; c < n_chunks; ++c) {
+            int clen = clip_chunk_lengths[b][c];
+            int start_frame = c * chunk_size;
+            for (int mi = 0; mi < n_mel; ++mi) {
+                for (int f = 0; f < clen; ++f) {
+                    size_t idx = (size_t)f + (size_t)mi * chunk_size + (size_t)chunk_idx * chunk_size * n_mel;
+                    mel_batch_data[idx] = mel_data[mi * n_frames + start_frame + f];
                 }
             }
-            
-            ggml_tensor* mel_t = ggml_graph_get_tensor(gf_conv, "mel_batch");
-            ggml_backend_tensor_set(mel_t, chunk_mel.data(), 0, chunk_mel.size() * sizeof(float));
-            
-            if (ggml_backend_sched_graph_compute(state->sched, gf_conv) != GGML_STATUS_SUCCESS) {
-                if (error) error->message = "compute conv chunk failed";
-                ggml_backend_sched_reset(state->sched);
-                return false;
+            chunk_idx++;
+        }
+    }
+    
+    ggml_tensor* mel_t = ggml_graph_get_tensor(gf_conv, "mel_batch");
+    ggml_backend_tensor_set(mel_t, mel_batch_data.data(), 0, mel_batch_data.size() * sizeof(float));
+    
+    if (ggml_backend_sched_graph_compute(state->sched, gf_conv) != GGML_STATUS_SUCCESS) {
+        if (error) error->message = "compute conv batch failed";
+        ggml_backend_sched_reset(state->sched);
+        return false;
+    }
+    
+    ggml_tensor* embd_conv = ggml_graph_get_tensor(gf_conv, "embd_conv_batch");
+    int64_t feat_dim = embd_conv->ne[0];
+    std::vector<float> conv_all(feat_dim * max_out_w * total_chunks);
+    ggml_backend_tensor_get(embd_conv, conv_all.data(), 0, conv_all.size() * sizeof(float));
+    
+    ggml_backend_sched_reset(state->sched);
+    
+    // Pre-compute PE once for max_out_w positions
+    std::vector<float> pe_data(max_out_w * n_state);
+    compute_sinusoidal_pe(pe_data.data(), max_out_w, n_state);
+    
+    for (int b = 0; b < batch_size; ++b) {
+        int total_out_frames = clip_total_out_frames[b];
+        int n_chunks = clip_n_chunks[b];
+        
+        // Assemble conv outputs + PE for this batch item
+        std::vector<float> all_conv_outputs(total_out_frames * n_state);
+        
+        chunk_idx = 0;
+        for (int bb = 0; bb < b; ++bb) chunk_idx += clip_n_chunks[bb];
+        
+        int32_t dst_offset = 0;
+        for (int c = 0; c < n_chunks; ++c) {
+            int32_t valid = clip_chunk_out_lens[b][c];
+            for (int32_t t = 0; t < valid; ++t) {
+                for (int32_t d = 0; d < n_state; ++d) {
+                    all_conv_outputs[(dst_offset + t) * n_state + d] = conv_all[d + t * n_state + chunk_idx * n_state * max_out_w] + pe_data[t * n_state + d];
+                }
             }
-            
-            ggml_tensor* embd_conv = ggml_graph_get_tensor(gf_conv, "embd_conv_batch");
-            int64_t feat_dim = embd_conv->ne[0];
-            int64_t out_seq = embd_conv->ne[1];
-            
-            std::vector<float> chunk_out(feat_dim * out_seq);
-            ggml_backend_tensor_get(embd_conv, chunk_out.data(), 0, chunk_out.size() * sizeof(float));
-            
-            // Add per-chunk sinusoidal PE (starting from position 0 for each chunk)
-            std::vector<float> pe(out_seq * feat_dim);
-            compute_sinusoidal_pe(pe.data(), out_seq, feat_dim);
-            for (int64_t i = 0; i < out_seq * feat_dim; ++i) {
-                chunk_out[i] += pe[i];
-            }
-            
-            all_conv_outputs.insert(all_conv_outputs.end(), chunk_out.begin(), chunk_out.end());
-            
-            ggml_backend_sched_reset(state->sched);
+            dst_offset += valid;
+            chunk_idx++;
         }
         
-        // Run transformer encoder on concatenated chunk outputs
-        ggml_cgraph* gf_enc = build_graph_encoder_batch(state, total_output_frames);
+        // Run transformer encoder
+        ggml_cgraph* gf_enc = build_graph_encoder_batch(state, total_out_frames);
         if (!ggml_backend_sched_alloc_graph(state->sched, gf_enc)) {
             if (error) error->message = "alloc enc batch failed";
             return false;
@@ -466,11 +490,11 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
         ggml_tensor* embd_enc = ggml_graph_get_tensor(gf_enc, "embd_enc_batch");
         
         int out_hidden = m.hparams.hidden_size;
-        std::vector<float> enc_out(out_hidden * total_output_frames);
+        std::vector<float> enc_out(out_hidden * total_out_frames);
         ggml_backend_tensor_get(embd_enc, enc_out.data(), 0, enc_out.size() * sizeof(float));
         
         output.features[b].hidden_size = out_hidden;
-        output.features[b].n_frames = total_output_frames;
+        output.features[b].n_frames = total_out_frames;
         output.features[b].data = std::move(enc_out);
         
         ggml_backend_sched_reset(state->sched);

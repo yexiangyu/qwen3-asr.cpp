@@ -85,73 +85,39 @@ endif()
 set(GGML_BUILD_DIR "${GGML_DIR}/build")
 add_subdirectory(${GGML_DIR} ${GGML_BUILD_DIR} EXCLUDE_FROM_ALL)
 
-add_library(logger STATIC
-    src/logger.cpp
-)
-target_include_directories(logger PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(logger PUBLIC spdlog::spdlog_header_only)
-
-add_library(asr_common INTERFACE)
-target_include_directories(asr_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-add_library(asr_codec STATIC
+set(ASR_COMMON_SRC
     src/asr/codec/codec.cpp
     src/asr/codec/wav_loader.cpp
-)
-target_include_directories(asr_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(asr_codec PUBLIC asr_common Threads::Threads)
-
-add_library(asr_mel STATIC
     src/asr/mel/mel.cpp
+    src/logger.cpp
 )
-target_include_directories(asr_mel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(asr_mel PUBLIC asr_common asr_codec Threads::Threads)
 
-function(add_asr_module target_name src_file)
-    add_library(${target_name} STATIC ${src_file})
-    target_include_directories(${target_name} PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${GGML_DIR}/include
-    )
-    target_link_directories(${target_name} PUBLIC ${GGML_BUILD_DIR}/src)
-    target_link_libraries(${target_name} PUBLIC
-        asr_common
-        ggml
-        ggml-base
-        ggml-cpu
-        Threads::Threads
-    )
-    if(GGML_CUDA_FOUND)
-        target_link_directories(${target_name} PUBLIC ${GGML_BUILD_DIR}/src/ggml-cuda)
-        target_link_libraries(${target_name} PUBLIC ggml-cuda CUDA::cudart)
-        target_compile_definitions(${target_name} PUBLIC GGML_USE_CUDA)
-    endif()
-endfunction()
+set(ASR_TRANSCRIBE_SRC
+    src/asr/transcribe/encoder.cpp
+    src/asr/transcribe/decoder.cpp
+)
 
-add_asr_module(asr_transcribe_encoder src/asr/transcribe/encoder.cpp)
-target_link_libraries(asr_transcribe_encoder PUBLIC asr_mel)
+set(ASR_ALIGNER_SRC
+    src/asr/aligner/encoder.cpp
+    src/asr/aligner/decoder.cpp
+)
 
-add_asr_module(asr_transcribe_decoder src/asr/transcribe/decoder.cpp)
-
-add_asr_module(asr_aligner_encoder src/asr/aligner/encoder.cpp)
-target_link_libraries(asr_aligner_encoder PUBLIC asr_mel)
-
-add_asr_module(asr_aligner_decoder src/asr/aligner/decoder.cpp)
-
-add_executable(asr-cli src/tools/asr_cli.cpp)
-target_include_directories(asr-cli PRIVATE ${GGML_DIR}/include)
+add_executable(asr-cli
+    src/tools/asr_cli.cpp
+    ${ASR_COMMON_SRC}
+    ${ASR_TRANSCRIBE_SRC}
+    ${ASR_ALIGNER_SRC}
+)
+target_include_directories(asr-cli PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
 target_link_directories(asr-cli PRIVATE ${GGML_BUILD_DIR}/src)
 target_link_libraries(asr-cli PRIVATE
-    asr_codec
-    asr_mel
-    asr_transcribe_encoder
-    asr_transcribe_decoder
-    asr_aligner_encoder
-    asr_aligner_decoder
-    logger
     ggml
     ggml-base
     ggml-cpu
+    spdlog::spdlog_header_only
     Threads::Threads
 )
 if(GGML_CUDA_FOUND)
@@ -177,13 +143,17 @@ option(QWEN3_ASR_BUILD_TESTS "Build test executables" OFF)
 
 if(QWEN3_ASR_BUILD_TESTS)
     function(add_asr_test test_name src_file)
-        add_executable(${test_name} ${src_file})
-        target_include_directories(${test_name} PRIVATE ${GGML_DIR}/include)
+        add_executable(${test_name} ${src_file} ${ASR_COMMON_SRC} ${ASR_TRANSCRIBE_SRC} ${ASR_ALIGNER_SRC})
+        target_include_directories(${test_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${GGML_DIR}/include
+        )
         target_link_directories(${test_name} PRIVATE ${GGML_BUILD_DIR}/src)
         target_link_libraries(${test_name} PRIVATE
             ggml
             ggml-base
             ggml-cpu
+            spdlog::spdlog_header_only
             Threads::Threads
         )
         if(GGML_CUDA_FOUND)
@@ -193,52 +163,30 @@ if(QWEN3_ASR_BUILD_TESTS)
     endfunction()
 
     add_asr_test(test_codec tests/test_codec_module.cpp)
-    target_link_libraries(test_codec PRIVATE asr_codec)
-
     add_asr_test(test_mel tests/test_mel_module.cpp)
-    target_link_libraries(test_mel PRIVATE asr_mel asr_codec)
-
     add_asr_test(test_transcribe_encoder tests/test_transcribe_encoder.cpp)
-    target_link_libraries(test_transcribe_encoder PRIVATE asr_transcribe_encoder asr_mel asr_codec)
-
     add_asr_test(test_batch_encode tests/test_batch_encode.cpp)
-    target_link_libraries(test_batch_encode PRIVATE asr_transcribe_encoder asr_mel asr_codec)
-
     add_asr_test(test_transcribe_decoder tests/test_transcribe_decoder.cpp)
-    target_link_libraries(test_transcribe_decoder PRIVATE asr_transcribe_decoder)
-
     add_asr_test(test_batch_decode tests/test_batch_decode.cpp)
-    target_link_libraries(test_batch_decode PRIVATE asr_transcribe_decoder)
-
     add_asr_test(test_e2e_batch_transcribe tests/test_e2e_batch_transcribe.cpp)
-    target_link_libraries(test_e2e_batch_transcribe PRIVATE
-        asr_transcribe_encoder asr_transcribe_decoder asr_mel asr_codec)
-
     add_asr_test(test_batch_performance tests/test_batch_performance.cpp)
-    target_link_libraries(test_batch_performance PRIVATE
-        asr_transcribe_encoder asr_transcribe_decoder asr_mel asr_codec)
-
     add_asr_test(test_aligner_encoder tests/test_aligner_encoder.cpp)
-    target_link_libraries(test_aligner_encoder PRIVATE asr_aligner_encoder asr_mel asr_codec)
-
     add_asr_test(test_aligner_decoder tests/test_aligner_decoder.cpp)
-    target_link_libraries(test_aligner_decoder PRIVATE asr_aligner_decoder)
-
     add_asr_test(test_aligner_decoder_simple tests/test_aligner_decoder_simple.cpp)
-    target_link_libraries(test_aligner_decoder_simple PRIVATE asr_aligner_decoder)
-
     add_asr_test(test_batch_align tests/test_batch_align.cpp)
-    target_link_libraries(test_batch_align PRIVATE asr_aligner_encoder asr_aligner_decoder asr_mel asr_codec)
-
     add_asr_test(integration_test tests/integration_test.cpp)
-    target_link_libraries(integration_test PRIVATE
-        asr_transcribe_encoder asr_transcribe_decoder asr_mel asr_codec)
 
-    add_asr_test(test_conv2d tests/test_conv2d.cpp)
+    add_executable(test_conv2d tests/test_conv2d.cpp)
+    target_include_directories(test_conv2d PRIVATE ${GGML_DIR}/include)
+    target_link_libraries(test_conv2d PRIVATE ggml ggml-base ggml-cpu Threads::Threads)
 
-    add_asr_test(test_embedding tests/test_embedding.cpp)
+    add_executable(test_embedding tests/test_embedding.cpp)
+    target_include_directories(test_embedding PRIVATE ${GGML_DIR}/include)
+    target_link_libraries(test_embedding PRIVATE ggml ggml-base ggml-cpu Threads::Threads)
 
-    add_asr_test(test_mel_load tests/test_mel_load.cpp)
+    add_executable(test_mel_load tests/test_mel_load.cpp)
+    target_include_directories(test_mel_load PRIVATE ${GGML_DIR}/include)
+    target_link_libraries(test_mel_load PRIVATE ggml ggml-base ggml-cpu Threads::Threads)
 
     add_executable(test_tokenization tests/test_tokenization.cpp)
     target_link_libraries(test_tokenization PRIVATE Threads::Threads)
@@ -250,9 +198,3 @@ if(QWEN3_ASR_BUILD_TESTS)
     add_test(NAME transcribe_decoder_test COMMAND test_transcribe_decoder WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME integration_test COMMAND integration_test WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
-
-install(TARGETS asr-cli asr_codec asr_mel asr_transcribe_encoder asr_transcribe_decoder asr_aligner_encoder asr_aligner_decoder logger
-    LIBRARY DESTINATION lib
-    RUNTIME DESTINATION bin
-    ARCHIVE DESTINATION lib
-)
