@@ -32,7 +32,7 @@ struct Input {
 };
 
 struct Window {
-    std::vector<double> data;
+    std::vector<float> data;
     int length;
 };
 

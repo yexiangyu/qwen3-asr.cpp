@@ -658,7 +658,11 @@ static ggml_cgraph* build_prefill_graph(
     ggml_set_name(cur, "logits");
     ggml_set_output(cur);
     
-    ggml_build_forward_expand(gf, cur);
+    struct ggml_tensor* argmax_result = ggml_argmax(ctx0, cur);
+    ggml_set_name(argmax_result, "argmax_result");
+    ggml_set_output(argmax_result);
+    
+    ggml_build_forward_expand(gf, argmax_result);
     
     ggml_free(ctx0);
     
@@ -778,8 +782,9 @@ bool prefill(State* state, const PrefillInput& input, DecoderOutput& output, Err
     }
     
     struct ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits");
-    if (!logits) {
-        if (error) error->message = "Failed to find logits tensor";
+    struct ggml_tensor* argmax_t = ggml_graph_get_tensor(gf, "argmax_result");
+    if (!logits || !argmax_t) {
+        if (error) error->message = "Failed to find logits/argmax tensor";
         ggml_backend_sched_reset(state->sched);
         return false;
     }
@@ -789,6 +794,10 @@ bool prefill(State* state, const PrefillInput& input, DecoderOutput& output, Err
     output.logits.resize(n_logit_rows * vocab_size);
     output.vocab_size = vocab_size;
     ggml_backend_tensor_get(logits, output.logits.data(), 0, output.logits.size() * sizeof(float));
+    
+    int32_t argmax_val = -1;
+    ggml_backend_tensor_get(argmax_t, &argmax_val, 0, sizeof(int32_t));
+    output.next_token = argmax_val;
     
     state->kv_cache.n_used = n_past + input.n_tokens;
     
@@ -871,17 +880,18 @@ bool decode(State* state, const DecodeInput& input, DecoderOutput& output, Error
     }
     
     struct ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits");
-    if (!logits) {
-        if (error) error->message = "Failed to find logits tensor";
+    struct ggml_tensor* argmax_t = ggml_graph_get_tensor(gf, "argmax_result");
+    if (!logits || !argmax_t) {
+        if (error) error->message = "Failed to find logits/argmax tensor";
         ggml_backend_sched_reset(state->sched);
         return false;
     }
     
-    int64_t vocab_size = logits->ne[0];
-    int64_t n_logit_rows = logits->ne[1];
-    output.logits.resize(n_logit_rows * vocab_size);
-    output.vocab_size = vocab_size;
-    ggml_backend_tensor_get(logits, output.logits.data(), 0, output.logits.size() * sizeof(float));
+    int32_t next_token_id = -1;
+    ggml_backend_tensor_get(argmax_t, &next_token_id, 0, sizeof(int32_t));
+    
+    output.vocab_size = logits->ne[0];
+    output.next_token = next_token_id;
     
     state->kv_cache.n_used = input.n_past + input.n_tokens;
     
@@ -1069,7 +1079,7 @@ static std::string bytes_to_bpe_string(const std::string& text) {
     return result;
 }
 
-static std::vector<std::string> bpe_encode_word(const std::string& word, const std::map<std::string, int>& bpe_ranks) {
+static std::vector<std::string> bpe_encode_word(const std::string& word, const std::unordered_map<std::string, int>& bpe_ranks) {
     if (word.empty()) return {};
 
     std::vector<std::string> symbols;
@@ -1087,16 +1097,14 @@ static std::vector<std::string> bpe_encode_word(const std::string& word, const s
 
     if (symbols.size() == 1) return symbols;
 
-    std::map<std::string, int> ranks = bpe_ranks;
-
     while (symbols.size() > 1) {
         int min_rank = INT_MAX;
         size_t min_idx = 0;
 
         for (size_t j = 0; j < symbols.size() - 1; ++j) {
             std::string pair = symbols[j] + symbols[j + 1];
-            auto it = ranks.find(pair);
-            if (it != ranks.end() && it->second < min_rank) {
+            auto it = bpe_ranks.find(pair);
+            if (it != bpe_ranks.end() && it->second < min_rank) {
                 min_rank = it->second;
                 min_idx = j;
             }
@@ -1452,7 +1460,7 @@ bool transcribe(State* state,
     
     std::vector<int> generated_tokens;
     int n_past = tokens.size();
-    int next_token = argmax(prefill_out.logits);
+    int next_token = prefill_out.next_token >= 0 ? prefill_out.next_token : argmax(prefill_out.logits);
     
     if (next_token < 0) {
         if (error) error->message = "Invalid prefill output";
@@ -1473,7 +1481,7 @@ bool transcribe(State* state,
                 break;
             }
             
-            next_token = argmax(decode_out.logits);
+            next_token = decode_out.next_token;
             if (next_token < 0 || next_token == im_end) {
                 break;
             }

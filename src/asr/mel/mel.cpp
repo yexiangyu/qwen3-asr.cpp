@@ -83,7 +83,7 @@ bool create_hann_window(Window& window, int length, bool periodic) {
     
     int offset = periodic ? 0 : -1;
     for (int i = 0; i < length; i++) {
-        window.data[i] = 0.5 * (1.0 - cos((2.0 * M_PI * i) / (length + offset)));
+        window.data[i] = 0.5f * (1.0f - cosf((2.0f * M_PI * i) / (length + offset)));
     }
     
     return true;
@@ -190,23 +190,27 @@ bool compute(const Input& input, MelSpectrum& output, const Config& config, Erro
     
     std::vector<float> power_all(n_fft_bins * n_frames, 0.0f);
     
-    auto process_frame = [&](int frame_idx) {
-        int offset = frame_idx * frame_step;
-        
-        std::vector<float> fft_in(frame_size, 0.0f);
+    auto process_range = [&](int start, int end) {
+        std::vector<float> fft_in(frame_size);
         std::vector<float> fft_out(frame_size * 2);
         
-        int valid_len = std::min(frame_size, static_cast<int>(samples_padded.size()) - offset);
-        for (int j = 0; j < valid_len; j++) {
-            fft_in[j] = static_cast<float>(hann.data[j]) * samples_padded[offset + j];
-        }
-        
-        fft_recursive(fft_in.data(), frame_size, fft_out.data());
-        
-        for (int j = 0; j < n_fft_bins; j++) {
-            power_all[j * n_frames + frame_idx] = 
-                fft_out[2 * j + 0] * fft_out[2 * j + 0] + 
-                fft_out[2 * j + 1] * fft_out[2 * j + 1];
+        for (int frame_idx = start; frame_idx < end; frame_idx++) {
+            int offset = frame_idx * frame_step;
+            
+            std::fill(fft_in.begin(), fft_in.end(), 0.0f);
+            
+            int valid_len = std::min(frame_size, static_cast<int>(samples_padded.size()) - offset);
+            for (int j = 0; j < valid_len; j++) {
+                fft_in[j] = hann.data[j] * samples_padded[offset + j];
+            }
+            
+            fft_recursive(fft_in.data(), frame_size, fft_out.data());
+            
+            for (int j = 0; j < n_fft_bins; j++) {
+                power_all[j * n_frames + frame_idx] = 
+                    fft_out[2 * j + 0] * fft_out[2 * j + 0] + 
+                    fft_out[2 * j + 1] * fft_out[2 * j + 1];
+            }
         }
     };
     
@@ -217,11 +221,7 @@ bool compute(const Input& input, MelSpectrum& output, const Config& config, Erro
         int start = t * frames_per_thread;
         int end = std::min(start + frames_per_thread, n_frames);
         if (start < n_frames) {
-            threads.emplace_back([&, start, end]() {
-                for (int i = start; i < end; i++) {
-                    process_frame(i);
-                }
-            });
+            threads.emplace_back(process_range, start, end);
         }
     }
     

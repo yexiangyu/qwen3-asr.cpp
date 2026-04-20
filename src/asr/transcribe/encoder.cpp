@@ -237,6 +237,7 @@ static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, in
     EncoderModel& m = *state->model;
     int n_mel = m.hparams.n_mel_bins;
     int conv_ch = m.hparams.conv_channels;
+    int d_model = m.hparams.d_model;
     
     ggml_init_params params = { state->compute_meta.size(), state->compute_meta.data(), true };
     ggml_context* ctx = ggml_init(params);
@@ -268,6 +269,13 @@ static ggml_cgraph* build_graph_conv_batch(EncoderState* state, int n_frames, in
     cur = ggml_reshape_2d(ctx, cur, feat_dim, total_seq);
     
     if (m.conv_out_w) cur = ggml_mul_mat(ctx, m.conv_out_w, cur);
+    
+    // Add sinusoidal PE on GPU: PE tensor for max_out_w positions
+    // Instead of ggml_repeat which may cause issues, we use a pre-computed
+    // PE input tensor that matches the full output shape
+    ggml_tensor* pe_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, out_w * batch_size);
+    ggml_set_name(pe_tensor, "inp_pe"); ggml_set_input(pe_tensor);
+    cur = ggml_add(ctx, cur, pe_tensor);
     
     ggml_set_name(cur, "embd_conv_batch"); ggml_set_output(cur);
     state->embd_conv = cur;
@@ -432,6 +440,16 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
     ggml_tensor* mel_t = ggml_graph_get_tensor(gf_conv, "mel_batch");
     ggml_backend_tensor_set(mel_t, mel_batch_data.data(), 0, mel_batch_data.size() * sizeof(float));
     
+    // Upload PE tensor to GPU (PE for each chunk, repeated for total_chunks)
+    std::vector<float> pe_chunk(max_out_w * n_state);
+    compute_sinusoidal_pe(pe_chunk.data(), max_out_w, n_state);
+    std::vector<float> pe_full(max_out_w * n_state * total_chunks);
+    for (int c = 0; c < total_chunks; ++c) {
+        memcpy(pe_full.data() + c * max_out_w * n_state, pe_chunk.data(), max_out_w * n_state * sizeof(float));
+    }
+    ggml_tensor* pe_t = ggml_graph_get_tensor(gf_conv, "inp_pe");
+    ggml_backend_tensor_set(pe_t, pe_full.data(), 0, pe_full.size() * sizeof(float));
+    
     if (ggml_backend_sched_graph_compute(state->sched, gf_conv) != GGML_STATUS_SUCCESS) {
         if (error) error->message = "compute conv batch failed";
         ggml_backend_sched_reset(state->sched);
@@ -445,15 +463,11 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
     
     ggml_backend_sched_reset(state->sched);
     
-    // Pre-compute PE once for max_out_w positions
-    std::vector<float> pe_data(max_out_w * n_state);
-    compute_sinusoidal_pe(pe_data.data(), max_out_w, n_state);
-    
     for (int b = 0; b < batch_size; ++b) {
         int total_out_frames = clip_total_out_frames[b];
         int n_chunks = clip_n_chunks[b];
         
-        // Assemble conv outputs + PE for this batch item
+        // Rearrange conv outputs (PE already added on GPU)
         std::vector<float> all_conv_outputs(total_out_frames * n_state);
         
         chunk_idx = 0;
@@ -464,7 +478,7 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
             int32_t valid = clip_chunk_out_lens[b][c];
             for (int32_t t = 0; t < valid; ++t) {
                 for (int32_t d = 0; d < n_state; ++d) {
-                    all_conv_outputs[(dst_offset + t) * n_state + d] = conv_all[d + t * n_state + chunk_idx * n_state * max_out_w] + pe_data[t * n_state + d];
+                    all_conv_outputs[(dst_offset + t) * n_state + d] = conv_all[d + t * n_state + chunk_idx * n_state * max_out_w];
                 }
             }
             dst_offset += valid;

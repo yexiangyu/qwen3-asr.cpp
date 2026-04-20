@@ -53,6 +53,7 @@ struct DecodeInput {
 struct DecoderOutput {
     std::vector<float> logits;
     int vocab_size;
+    int32_t next_token = -1;
 };
 
 struct TranscribeInput {

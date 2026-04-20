@@ -849,20 +849,28 @@ std::vector<int32_t> fix_timestamp_classes(const std::vector<int32_t>& data) {
     const int n = static_cast<int>(data.size());
     if (n == 0) return {};
     
-    std::vector<int> dp(n, 1);
+    // O(n log n) LIS using patience sorting
+    std::vector<int> tails;
+    std::vector<int> tails_idx;
     std::vector<int> parent(n, -1);
     
-    for (int i = 1; i < n; ++i) {
-        for (int j = 0; j < i; ++j) {
-            if (data[j] <= data[i] && dp[j] + 1 > dp[i]) { dp[i] = dp[j] + 1; parent[i] = j; }
+    for (int i = 0; i < n; ++i) {
+        auto it = std::lower_bound(tails.begin(), tails.end(), data[i]);
+        int pos = static_cast<int>(it - tails.begin());
+        
+        if (it != tails.end()) {
+            *it = data[i];
+            tails_idx[pos] = i;
+        } else {
+            tails.push_back(data[i]);
+            tails_idx.push_back(i);
         }
+        
+        if (pos > 0) parent[i] = tails_idx[pos - 1];
     }
     
-    int max_len = 0, max_idx = 0;
-    for (int i = 0; i < n; ++i) { if (dp[i] > max_len) { max_len = dp[i]; max_idx = i; } }
-    
     std::vector<bool> is_normal(n, false);
-    { int idx = max_idx; while (idx != -1) { is_normal[idx] = true; idx = parent[idx]; } }
+    { int idx = tails_idx.empty() ? 0 : tails_idx.back(); while (idx != -1) { is_normal[idx] = true; idx = parent[idx]; } }
     
     std::vector<int32_t> result(data.begin(), data.end());
     int i = 0;

@@ -2,14 +2,14 @@
 
 #include <string>
 #include <vector>
-#include <map>
+#include <unordered_map>
 
 namespace asr {
 
 struct HfTokenizerData {
     std::vector<std::string> vocab;
-    std::map<std::string, int> token_to_id;
-    std::map<std::string, int> bpe_ranks;
+    std::unordered_map<std::string, int> token_to_id;
+    std::unordered_map<std::string, int> bpe_ranks;
 };
 
 inline std::string hf_json_extract_string(const std::string& json, size_t pos) {

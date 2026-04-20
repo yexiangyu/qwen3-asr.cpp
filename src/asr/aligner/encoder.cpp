@@ -264,7 +264,12 @@ static ggml_cgraph* build_conv_graph(EncoderState* state, int max_chunk_len, int
     if (m.conv_out_w) cur = ggml_mul_mat(ctx, m.conv_out_w, cur);
     
     int n_state = m.hparams.d_model;
-    cur = ggml_reshape_3d(ctx, cur, n_state, conv_out_w, n_chunks);
+    cur = ggml_reshape_2d(ctx, cur, n_state, conv_out_w * n_chunks);
+    
+    // Add sinusoidal PE on GPU
+    ggml_tensor* pe_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, conv_out_w * n_chunks);
+    ggml_set_name(pe_tensor, "inp_pe"); ggml_set_input(pe_tensor);
+    cur = ggml_add(ctx, cur, pe_tensor);
     
     ggml_set_name(cur, "conv_out");
     ggml_set_output(cur);
@@ -428,6 +433,16 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
     ggml_tensor* mel_t = ggml_graph_get_tensor(gf_conv, "mel_batch");
     ggml_backend_tensor_set(mel_t, mel_batch_data.data(), 0, mel_batch_data.size() * sizeof(float));
     
+    // Upload PE tensor to GPU (repeated for all chunks)
+    std::vector<float> pe_chunk(max_out_w * n_state);
+    compute_sinusoidal_pe(pe_chunk.data(), max_out_w, n_state);
+    std::vector<float> pe_full(max_out_w * n_state * total_chunks);
+    for (int c = 0; c < total_chunks; ++c) {
+        memcpy(pe_full.data() + c * max_out_w * n_state, pe_chunk.data(), max_out_w * n_state * sizeof(float));
+    }
+    ggml_tensor* pe_t = ggml_graph_get_tensor(gf_conv, "inp_pe");
+    ggml_backend_tensor_set(pe_t, pe_full.data(), 0, pe_full.size() * sizeof(float));
+    
     if (ggml_backend_sched_graph_compute(state->sched, gf_conv) != GGML_STATUS_SUCCESS) {
         if (error) error->message = "compute conv failed";
         ggml_backend_sched_reset(state->sched);
@@ -439,9 +454,6 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
     ggml_backend_tensor_get(conv_out_t, conv_all.data(), 0, conv_all.size() * sizeof(float));
     
     ggml_backend_sched_reset(state->sched);
-    
-    std::vector<float> pos_emb_data(max_out_w * n_state);
-    compute_sinusoidal_pe(pos_emb_data.data(), max_out_w, n_state);
     
     std::vector<std::vector<float>> clip_hidden(batch_size);
     std::vector<int> clip_n_ctx(batch_size);
@@ -457,9 +469,7 @@ bool encode_batch(EncoderState* state, const BatchInput& input, BatchOutput& out
             int32_t valid = clip_chunk_out_lens[b][c];
             for (int32_t t = 0; t < valid; ++t) {
                 for (int32_t d = 0; d < n_state; ++d) {
-                    float val = conv_all[d + t * n_state + chunk_idx * n_state * max_out_w];
-                    float pe = pos_emb_data[t * n_state + d];
-                    clip_hidden[b][(dst_offset + t) * n_state + d] = val + pe;
+                    clip_hidden[b][(dst_offset + t) * n_state + d] = conv_all[d + t * n_state + chunk_idx * n_state * max_out_w];
                 }
             }
             dst_offset += valid;

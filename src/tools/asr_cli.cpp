@@ -190,12 +190,16 @@ int main(int argc, char** argv) {
     mel::Config mel_config;
     mel_config.n_threads = config.threads;
     
+    auto mel_start = std::chrono::high_resolution_clock::now();
     mel::MelSpectrum mel_spec;
     if (!mel::compute_from_file(config.input_path.c_str(), mel_spec, mel_config, &error)) {
         fprintf(stderr, "Error: Failed to compute mel: %s\n", error.message.c_str());
         return 1;
     }
+    auto mel_end = std::chrono::high_resolution_clock::now();
+    double mel_ms = std::chrono::duration<double, std::milli>(mel_end - mel_start).count();
     printf("Mel: %d mels, %d frames\n", mel_spec.n_mels, mel_spec.n_frames);
+    printf("[Timing] Mel spectrogram: %.1f ms\n", mel_ms);
     
     std::string transcribe_text;
     std::string transcribe_lang;
